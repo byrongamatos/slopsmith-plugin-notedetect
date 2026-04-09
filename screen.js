@@ -678,71 +678,160 @@ function _ndSetMethod(method) {
     if (method === 'crepe') _ndLoadCrepe();
 }
 
-// ── Visual Feedback via Draw Hook ──────────────────────────────────────────
+// ── Visual Feedback ────────────────────────────────────────────────────────
+// Uses a DOM overlay HUD (works with both 2D and 3D highway) plus
+// draw hook indicators on the 2D highway when project()/fretX() are available.
 
-highway.addDrawHook(function(ctx, W, H) {
+let _ndHitFlash = 0;   // green flash alpha
+let _ndMissFlash = 0;  // red flash alpha
+let _ndLastHitCount = 0;
+let _ndLastMissCount = 0;
+
+// DOM HUD overlay — positioned over the player, works with any renderer
+function _ndCreateHUD() {
+    if (document.getElementById('nd-hud')) return;
+    const hud = document.createElement('div');
+    hud.id = 'nd-hud';
+    hud.className = 'fixed top-16 right-16 z-[50] pointer-events-none text-right';
+    hud.innerHTML = `
+        <div id="nd-hud-accuracy" class="text-xl font-bold" style="text-shadow:0 0 8px currentColor"></div>
+        <div id="nd-hud-streak" class="text-xs text-gray-400 mt-0.5"></div>
+        <div id="nd-hud-counts" class="text-[10px] text-gray-600 mt-0.5"></div>
+        <div id="nd-hud-detected" class="text-[10px] text-cyan-400 mt-1 font-mono"></div>
+    `;
+    document.body.appendChild(hud);
+}
+
+function _ndRemoveHUD() {
+    const hud = document.getElementById('nd-hud');
+    if (hud) hud.remove();
+    const flash = document.getElementById('nd-flash-overlay');
+    if (flash) flash.remove();
+}
+
+function _ndCreateFlashOverlay() {
+    if (document.getElementById('nd-flash-overlay')) return;
+    const flash = document.createElement('div');
+    flash.id = 'nd-flash-overlay';
+    flash.style.cssText = 'position:fixed;inset:0;z-index:49;pointer-events:none;border:3px solid transparent;border-radius:8px;transition:border-color 0.05s;';
+    document.body.appendChild(flash);
+}
+
+// Update DOM HUD at 30fps (lighter than rAF)
+let _ndHudInterval = null;
+
+function _ndStartHUD() {
+    _ndCreateHUD();
+    _ndCreateFlashOverlay();
+    _ndLastHitCount = 0;
+    _ndLastMissCount = 0;
+    if (_ndHudInterval) clearInterval(_ndHudInterval);
+    _ndHudInterval = setInterval(_ndUpdateHUD, 33);
+}
+
+function _ndStopHUD() {
+    if (_ndHudInterval) { clearInterval(_ndHudInterval); _ndHudInterval = null; }
+    _ndRemoveHUD();
+}
+
+function _ndUpdateHUD() {
     if (!_ndEnabled) return;
 
+    const total = _ndHits + _ndMisses;
+    const accEl = document.getElementById('nd-hud-accuracy');
+    const streakEl = document.getElementById('nd-hud-streak');
+    const countsEl = document.getElementById('nd-hud-counts');
+    const detectedEl = document.getElementById('nd-hud-detected');
+    const flashEl = document.getElementById('nd-flash-overlay');
+
+    if (accEl && total > 0) {
+        const accuracy = Math.round((_ndHits / total) * 100);
+        const color = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
+        accEl.textContent = accuracy + '%';
+        accEl.style.color = color;
+    } else if (accEl) {
+        accEl.textContent = '';
+    }
+
+    if (streakEl) {
+        let text = _ndStreak > 0 ? `${_ndStreak} streak` : '';
+        if (_ndBestStreak > 0) text += `  best: ${_ndBestStreak}`;
+        streakEl.textContent = text;
+    }
+
+    if (countsEl && total > 0) {
+        countsEl.textContent = `${_ndHits} / ${total}`;
+    }
+
+    if (detectedEl) {
+        if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.3) {
+            const names = ['E2','A2','D3','G3','B3','E4'];
+            detectedEl.textContent = `${names[_ndDetectedString] || '?'} fret ${_ndDetectedFret}`;
+        } else {
+            detectedEl.textContent = '';
+        }
+    }
+
+    // Edge flash on hit/miss
+    if (flashEl) {
+        if (_ndHits > _ndLastHitCount) {
+            flashEl.style.borderColor = 'rgba(0, 255, 136, 0.6)';
+            setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
+        } else if (_ndMisses > _ndLastMissCount) {
+            flashEl.style.borderColor = 'rgba(255, 50, 68, 0.4)';
+            setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
+        }
+        _ndLastHitCount = _ndHits;
+        _ndLastMissCount = _ndMisses;
+    }
+}
+
+// 2D highway draw hook — uses project()/fretX() for accurate positioning.
+// Only draws when the 2D highway is active (these APIs exist on the highway object).
+highway.addDrawHook(function(ctx, W, H) {
+    if (!_ndEnabled) return;
+    // Only draw note indicators if highway exposes projection (2D mode)
+    if (!highway.project || !highway.fretX) return;
+
     const t = highway.getTime();
-    const tolerance = _ndTimingTolerance;
     const notes = highway.getNotes();
     const chords = highway.getChords();
 
-    // Highway layout constants — match highway.js rendering
-    // The highway draws strings from left to right, notes scroll top to bottom
-    // Play line is near the bottom (~72% down)
-    const playLineY = H * 0.72;
-    const stringCount = 6;
-    const margin = W * 0.08;
-    const stringSpacing = (W - margin * 2) / (stringCount - 1);
-
-    // Time-to-Y mapping: notes at current time are at playLineY,
-    // future notes are above, past notes are below
-    const pixelsPerSecond = H * 0.5; // approximate from highway scroll speed
-
-    function noteToX(string) {
-        return margin + string * stringSpacing;
-    }
-
-    function timeToY(noteTime) {
-        return playLineY - (noteTime - t) * pixelsPerSecond;
-    }
-
-    // Draw hit/miss indicators on recent notes
     const drawIndicator = (s, f, noteTime, result) => {
-        const x = noteToX(s);
-        const y = timeToY(noteTime);
-        if (y < -50 || y > H + 50) return;
+        const tOff = noteTime - t;
+        const p = highway.project(tOff);
+        if (!p) return;
+        const x = highway.fretX(f, p.scale, W);
+        const y = p.y * H;
 
         const age = Math.abs(t - noteTime);
-        const fade = Math.max(0, 1 - age / 0.8);
+        const fade = Math.max(0, 1 - age / 0.6) * p.scale;
         if (fade <= 0) return;
 
         if (result === 'hit') {
-            // Green glow
             ctx.save();
-            ctx.globalAlpha = fade * 0.6;
+            ctx.globalAlpha = fade * 0.7;
             ctx.shadowColor = '#00ff88';
-            ctx.shadowBlur = 20;
+            ctx.shadowBlur = 20 * p.scale;
             ctx.strokeStyle = '#00ff88';
-            ctx.lineWidth = 3;
+            ctx.lineWidth = 3 * p.scale;
             ctx.beginPath();
-            ctx.arc(x, y, 14, 0, Math.PI * 2);
+            ctx.arc(x, y, 14 * p.scale, 0, Math.PI * 2);
             ctx.stroke();
             ctx.restore();
         } else if (result === 'miss') {
-            // Red glow
             ctx.save();
             ctx.globalAlpha = fade * 0.5;
             ctx.shadowColor = '#ff3344';
-            ctx.shadowBlur = 15;
+            ctx.shadowBlur = 12 * p.scale;
             ctx.strokeStyle = '#ff3344';
-            ctx.lineWidth = 2;
+            ctx.lineWidth = 2 * p.scale;
+            const sz = 8 * p.scale;
             ctx.beginPath();
-            ctx.moveTo(x - 8, y - 8);
-            ctx.lineTo(x + 8, y + 8);
-            ctx.moveTo(x + 8, y - 8);
-            ctx.lineTo(x - 8, y + 8);
+            ctx.moveTo(x - sz, y - sz);
+            ctx.lineTo(x + sz, y + sz);
+            ctx.moveTo(x + sz, y - sz);
+            ctx.lineTo(x - sz, y + sz);
             ctx.stroke();
             ctx.restore();
         }
@@ -751,8 +840,8 @@ highway.addDrawHook(function(ctx, W, H) {
     // Draw results for recent notes
     if (notes) {
         for (const n of notes) {
-            if (n.t < t - 1) continue;
-            if (n.t > t + 1) break;
+            if (n.t < t - 0.5) continue;
+            if (n.t > t + 3) break;
             if (n.mt) continue;
             const key = _ndNoteKey(n, n.t);
             const result = _ndNoteResults.get(key);
@@ -761,8 +850,8 @@ highway.addDrawHook(function(ctx, W, H) {
     }
     if (chords) {
         for (const c of chords) {
-            if (c.t < t - 1) continue;
-            if (c.t > t + 1) break;
+            if (c.t < t - 0.5) continue;
+            if (c.t > t + 3) break;
             for (const cn of (c.notes || [])) {
                 if (cn.mt) continue;
                 const key = _ndNoteKey(cn, c.t);
@@ -772,63 +861,27 @@ highway.addDrawHook(function(ctx, W, H) {
         }
     }
 
-    // Draw detected note indicator at play line
-    if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.5) {
-        const x = noteToX(_ndDetectedString);
-        const y = playLineY;
-
-        ctx.save();
-        ctx.globalAlpha = Math.min(1, _ndDetectedConfidence);
-        ctx.fillStyle = '#44ddff';
-        ctx.shadowColor = '#44ddff';
-        ctx.shadowBlur = 12;
-        ctx.beginPath();
-        ctx.arc(x, y, 6, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Show fret number
-        ctx.fillStyle = '#000';
-        ctx.font = 'bold 7px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(_ndDetectedFret, x, y);
-        ctx.restore();
-    }
-
-    // HUD — accuracy, streak (top right of highway canvas)
-    const total = _ndHits + _ndMisses;
-    if (total > 0) {
-        const accuracy = Math.round((_ndHits / total) * 100);
-        const hudX = W - 16;
-        const hudY = 20;
-
-        ctx.save();
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'top';
-
-        // Accuracy
-        const accColor = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
-        ctx.font = 'bold 18px sans-serif';
-        ctx.fillStyle = accColor;
-        ctx.shadowColor = accColor;
-        ctx.shadowBlur = 8;
-        ctx.fillText(`${accuracy}%`, hudX, hudY);
-
-        // Streak
-        ctx.shadowBlur = 0;
-        ctx.font = '11px sans-serif';
-        ctx.fillStyle = '#aaa';
-        ctx.fillText(`${_ndStreak} streak`, hudX, hudY + 22);
-        if (_ndBestStreak > 0) {
-            ctx.fillText(`best: ${_ndBestStreak}`, hudX, hudY + 36);
+    // Detected note indicator at the now line
+    if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.3) {
+        const p = highway.project(0); // now line
+        if (p) {
+            const x = highway.fretX(_ndDetectedFret, p.scale, W);
+            const y = p.y * H;
+            ctx.save();
+            ctx.globalAlpha = Math.min(1, _ndDetectedConfidence);
+            ctx.fillStyle = '#44ddff';
+            ctx.shadowColor = '#44ddff';
+            ctx.shadowBlur = 12;
+            ctx.beginPath();
+            ctx.arc(x, y, 6, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#000';
+            ctx.font = 'bold 7px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(_ndDetectedFret, x, y);
+            ctx.restore();
         }
-
-        // Hit/miss counts
-        ctx.font = '10px sans-serif';
-        ctx.fillStyle = '#666';
-        ctx.fillText(`${_ndHits} / ${total}`, hudX, hudY + 52);
-
-        ctx.restore();
     }
 });
 
@@ -896,12 +949,14 @@ async function _ndToggle() {
             return;
         }
 
-        // Start miss-check polling
+        // Start miss-check polling and HUD
         _ndMissCheckInterval = setInterval(_ndCheckMisses, 100);
+        _ndStartHUD();
 
         if (_ndDetectionMethod === 'crepe') _ndLoadCrepe();
     } else {
         _ndStopAudio();
+        _ndStopHUD();
         if (_ndMissCheckInterval) { clearInterval(_ndMissCheckInterval); _ndMissCheckInterval = null; }
 
         // Show summary if we had results
@@ -1045,6 +1100,7 @@ setInterval(() => {
         // Reset state on new song
         if (_ndEnabled) {
             _ndStopAudio();
+            _ndStopHUD();
             if (_ndMissCheckInterval) { clearInterval(_ndMissCheckInterval); _ndMissCheckInterval = null; }
             _ndEnabled = false;
         }
