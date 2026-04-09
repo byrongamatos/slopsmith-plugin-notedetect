@@ -12,11 +12,12 @@ let _ndModelLoading = false;
 let _ndDetectionMethod = 'yin'; // 'crepe' or 'yin' — start with YIN (instant), user can switch
 
 // Settings
-let _ndTimingTolerance = 0.100;  // seconds
+let _ndTimingTolerance = 0.150;  // seconds (wider default for real-world play)
 let _ndPitchTolerance = 50;      // cents
 let _ndInputGain = 1.0;
 let _ndSelectedDeviceId = '';
 let _ndSelectedChannel = 'mono'; // 'mono' | 'left' | 'right'
+let _ndLatencyOffset = 0.080;    // seconds — compensates for audio input latency
 
 // Audio level metering
 let _ndInputLevel = 0;       // current RMS level 0-1
@@ -44,10 +45,10 @@ const _ndStandardMidi = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
 let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
 let _ndCapo = 0;
 
-// Audio processing
-let _ndAudioBuffer = null;
-const _ndSampleRate = 16000; // CREPE expects 16kHz; YIN works at any rate
-const _ndFrameSize = 1024;
+// Audio processing — use native sample rate, accumulate samples for YIN
+let _ndAccumBuffer = new Float32Array(0);  // accumulates samples across frames
+const _ndMinYinSamples = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
+const _ndFrameSize = 2048;  // ScriptProcessor buffer size
 
 // ── localStorage Persistence ──────────────────────────────────────────────
 
@@ -62,6 +63,7 @@ function _ndSaveSettings() {
             timingTolerance: _ndTimingTolerance,
             pitchTolerance: _ndPitchTolerance,
             inputGain: _ndInputGain,
+            latencyOffset: _ndLatencyOffset,
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -77,6 +79,7 @@ function _ndLoadSettings() {
         if (s.timingTolerance !== undefined) _ndTimingTolerance = s.timingTolerance;
         if (s.pitchTolerance !== undefined) _ndPitchTolerance = s.pitchTolerance;
         if (s.inputGain !== undefined) _ndInputGain = s.inputGain;
+        if (s.latencyOffset !== undefined) _ndLatencyOffset = s.latencyOffset;
     } catch (e) { /* ignore */ }
 }
 
@@ -202,9 +205,9 @@ async function _ndStartAudio() {
         }
 
         _ndStream = await navigator.mediaDevices.getUserMedia(constraints);
-        _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)({
-            sampleRate: _ndSampleRate,
-        });
+        // Use native sample rate — browsers often ignore non-standard rates,
+        // and we need reliable timing for pitch detection
+        _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
         const source = _ndAudioCtx.createMediaStreamSource(_ndStream);
         const streamChannels = source.channelCount;
@@ -235,14 +238,27 @@ async function _ndStartAudio() {
         gainNode.connect(_ndLevelAnalyser);
 
         // ScriptProcessor for pitch detection
-        // 1024-sample frames at ~16kHz = ~60fps
         const processor = _ndAudioCtx.createScriptProcessor(_ndFrameSize, 1, 1);
         _ndWorklet = processor;
+        _ndAccumBuffer = new Float32Array(0);
 
         processor.onaudioprocess = (e) => {
             if (!_ndEnabled) return;
             const input = e.inputBuffer.getChannelData(0);
-            _ndProcessFrame(new Float32Array(input));
+            // Accumulate samples to ensure we have enough for low-frequency detection.
+            // At 48kHz we need ~4096 samples (halfLen 2048) to detect low E (82Hz, tau=585).
+            const prev = _ndAccumBuffer;
+            const combined = new Float32Array(prev.length + input.length);
+            combined.set(prev);
+            combined.set(input, prev.length);
+            if (combined.length >= _ndMinYinSamples) {
+                // Use the most recent _ndMinYinSamples for detection
+                const start = combined.length - _ndMinYinSamples;
+                _ndProcessFrame(combined.subarray(start));
+                _ndAccumBuffer = new Float32Array(0);
+            } else {
+                _ndAccumBuffer = combined;
+            }
         };
 
         gainNode.connect(processor);
@@ -279,6 +295,7 @@ function _ndStopAudio() {
     }
     _ndInputLevel = 0;
     _ndInputPeak = 0;
+    _ndAccumBuffer = new Float32Array(0);
 }
 
 // ── Input Level Metering ──────────────────────────────────────────────────
@@ -343,13 +360,14 @@ function _ndDrawSettingsVU() {
 
 async function _ndProcessFrame(buffer) {
     let result;
+    const sr = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
     if (_ndDetectionMethod === 'crepe' && _ndModel) {
         result = await _ndCrepeDetect(buffer);
     } else {
-        result = _ndYinDetect(buffer, _ndAudioCtx ? _ndAudioCtx.sampleRate : _ndSampleRate);
+        result = _ndYinDetect(buffer, sr);
     }
 
-    if (result.freq <= 0 || result.confidence < 0.5) {
+    if (result.freq <= 0 || result.confidence < 0.3) {
         _ndDetectedMidi = -1;
         _ndDetectedConfidence = 0;
         _ndDetectedString = -1;
@@ -405,8 +423,21 @@ function _ndNoteKey(note, time) {
     return `${time.toFixed(3)}_${note.s}_${note.f}`;
 }
 
+// Binary search: find index of first element with .t >= target
+function _ndBsearch(arr, target) {
+    let lo = 0, hi = arr.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid].t < target) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
 function _ndMatchNotes() {
-    const t = highway.getTime();
+    // Compensate for audio input latency: the detected pitch corresponds to
+    // what the player played ~latencyOffset ago, so shift the comparison window back.
+    const t = highway.getTime() - _ndLatencyOffset;
     if (_ndDetectedMidi < 0) return;
 
     const notes = highway.getNotes();
@@ -416,24 +447,24 @@ function _ndMatchNotes() {
 
     const candidateNotes = [];
 
-    // Gather notes in timing window
-    if (notes) {
-        for (const n of notes) {
+    // Use binary search to jump to the relevant time region
+    if (notes && notes.length > 0) {
+        const start = _ndBsearch(notes, t - tolerance);
+        for (let i = start; i < notes.length; i++) {
+            const n = notes[i];
             if (n.t > t + tolerance) break;
-            if (n.t >= t - tolerance && n.t <= t + tolerance) {
-                if (n.mt) continue; // skip muted notes
-                candidateNotes.push({ s: n.s, f: n.f, t: n.t });
-            }
+            if (n.mt) continue; // skip muted notes
+            candidateNotes.push({ s: n.s, f: n.f, t: n.t });
         }
     }
-    if (chords) {
-        for (const c of chords) {
+    if (chords && chords.length > 0) {
+        const start = _ndBsearch(chords, t - tolerance);
+        for (let i = start; i < chords.length; i++) {
+            const c = chords[i];
             if (c.t > t + tolerance) break;
-            if (c.t >= t - tolerance && c.t <= t + tolerance) {
-                for (const cn of (c.notes || [])) {
-                    if (cn.mt) continue;
-                    candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
-                }
+            for (const cn of (c.notes || [])) {
+                if (cn.mt) continue;
+                candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
             }
         }
     }
@@ -459,13 +490,14 @@ function _ndMatchNotes() {
 // Mark missed notes that have passed the timing window
 function _ndCheckMisses() {
     if (!_ndEnabled) return;
-    const t = highway.getTime();
+    const t = highway.getTime() - _ndLatencyOffset;
     const tolerance = _ndTimingTolerance;
+    const missDeadline = t - tolerance * 2; // notes older than this are missed
     const notes = highway.getNotes();
     const chords = highway.getChords();
 
     const checkNote = (s, f, noteTime) => {
-        if (noteTime > t - tolerance * 2) return; // not yet past window
+        if (noteTime > missDeadline) return; // not yet past window
         const key = _ndNoteKey({ s, f }, noteTime);
         if (!_ndNoteResults.has(key)) {
             _ndNoteResults.set(key, 'miss');
@@ -475,16 +507,22 @@ function _ndCheckMisses() {
         }
     };
 
-    if (notes) {
-        for (const n of notes) {
-            if (n.t > t) break;
+    // Use binary search — only check notes in the region that could be newly missed
+    // (between last check and current missDeadline)
+    if (notes && notes.length > 0) {
+        const start = _ndBsearch(notes, missDeadline - 1); // look back 1s
+        for (let i = start; i < notes.length; i++) {
+            const n = notes[i];
+            if (n.t > missDeadline) break;
             if (n.mt) continue;
             checkNote(n.s, n.f, n.t);
         }
     }
-    if (chords) {
-        for (const c of chords) {
-            if (c.t > t) break;
+    if (chords && chords.length > 0) {
+        const start = _ndBsearch(chords, missDeadline - 1);
+        for (let i = start; i < chords.length; i++) {
+            const c = chords[i];
+            if (c.t > missDeadline) break;
             for (const cn of (c.notes || [])) {
                 if (cn.mt) continue;
                 checkNote(cn.s, cn.f, c.t);
@@ -567,6 +605,14 @@ function _ndShowSettings() {
             <option value="yin" ${_ndDetectionMethod === 'yin' ? 'selected' : ''}>YIN (lightweight, clean signals)</option>
             <option value="crepe" ${_ndDetectionMethod === 'crepe' ? 'selected' : ''}>CREPE/SPICE (robust, ~20MB model)</option>
         </select>
+
+        <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span id="nd-latency-val">${Math.round(_ndLatencyOffset * 1000)}</span>ms</label>
+        <input type="range" min="0" max="250" value="${Math.round(_ndLatencyOffset * 1000)}"
+               class="w-full accent-green-400 mb-2"
+               oninput="_ndLatencyOffset=this.value/1000;document.getElementById('nd-latency-val').textContent=this.value;_ndSaveSettings()">
+        <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+            Compensates for USB/audio interface delay. Increase if notes register late.
+        </div>
 
         <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span id="nd-timing-val">${Math.round(_ndTimingTolerance * 1000)}</span>ms</label>
         <input type="range" min="30" max="300" value="${Math.round(_ndTimingTolerance * 1000)}"
