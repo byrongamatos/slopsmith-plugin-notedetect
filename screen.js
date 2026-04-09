@@ -277,29 +277,39 @@ async function _ndStartAudio() {
         _ndLevelAnalyser.smoothingTimeConstant = 0.8;
         gainNode.connect(_ndLevelAnalyser);
 
-        // ScriptProcessor for pitch detection
+        // ScriptProcessor only buffers audio — pitch detection runs off-thread
+        // via setTimeout to avoid blocking the highway render loop.
         const processor = _ndAudioCtx.createScriptProcessor(_ndFrameSize, 1, 1);
         _ndWorklet = processor;
         _ndAccumBuffer = new Float32Array(0);
+        _ndPendingBuffer = null; // latest ready buffer for detection
 
         processor.onaudioprocess = (e) => {
             if (!_ndEnabled) return;
             const input = e.inputBuffer.getChannelData(0);
-            // Accumulate samples to ensure we have enough for low-frequency detection.
-            // At 48kHz we need ~4096 samples (halfLen 2048) to detect low E (82Hz, tau=585).
+            // Accumulate samples for low-frequency detection (need 4096 at 48kHz for low E)
             const prev = _ndAccumBuffer;
             const combined = new Float32Array(prev.length + input.length);
             combined.set(prev);
             combined.set(input, prev.length);
             if (combined.length >= _ndMinYinSamples) {
-                // Use the most recent _ndMinYinSamples for detection
+                // Store ready buffer — detection timer will pick it up
                 const start = combined.length - _ndMinYinSamples;
-                _ndProcessFrame(combined.subarray(start));
+                _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
                 _ndAccumBuffer = new Float32Array(0);
             } else {
                 _ndAccumBuffer = combined;
             }
         };
+
+        // Detection runs on a timer, not in the audio callback
+        _ndDetectInterval = setInterval(() => {
+            if (_ndPendingBuffer) {
+                const buf = _ndPendingBuffer;
+                _ndPendingBuffer = null;
+                _ndProcessFrame(buf);
+            }
+        }, 50); // ~20fps detection — plenty for note matching
 
         gainNode.connect(processor);
         processor.connect(_ndAudioCtx.destination); // must connect to keep processing alive
@@ -318,8 +328,13 @@ async function _ndStartAudio() {
     }
 }
 
+let _ndDetectInterval = null;
+let _ndPendingBuffer = null;
+
 function _ndStopAudio() {
     _ndStopLevelMeter();
+    if (_ndDetectInterval) { clearInterval(_ndDetectInterval); _ndDetectInterval = null; }
+    _ndPendingBuffer = null;
     if (_ndWorklet) {
         _ndWorklet.disconnect();
         _ndWorklet = null;
