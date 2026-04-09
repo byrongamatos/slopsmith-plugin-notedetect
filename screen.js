@@ -143,16 +143,26 @@ async function _ndLoadCrepe() {
         if (!window.tf) {
             await _ndLoadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js');
         }
-        // Load CREPE model — using the "tiny" variant for speed
-        // CREPE model hosted on TFHub
-        _ndModel = await tf.loadLayersModel(
+        // CREPE "tiny" model — monophonic pitch detection, ~4MB
+        _ndModel = await tf.loadGraphModel(
             'https://tfhub.dev/google/tfjs-model/spice/2/default/1',
             { fromTFHub: true }
         );
-    } catch (e) {
-        console.warn('CREPE model load failed, falling back to YIN:', e);
-        _ndDetectionMethod = 'yin';
-        _ndModel = null;
+        console.log('CREPE/SPICE model loaded');
+    } catch (e1) {
+        console.warn('SPICE TFHub load failed, trying CREPE backup:', e1);
+        try {
+            // Fallback: try loading CREPE from alternative CDN
+            _ndModel = await tf.loadLayersModel(
+                'https://cdn.jsdelivr.net/gh/nicksherron/crepe-js@master/model/model.json'
+            );
+            console.log('CREPE model loaded (fallback)');
+        } catch (e2) {
+            console.warn('All model loads failed, using YIN for this session:', e2);
+            _ndModel = null;
+            // Don't overwrite _ndDetectionMethod — keep the user's preference
+            // so it retries next time. YIN is used as runtime fallback when _ndModel is null.
+        }
     }
     _ndModelLoading = false;
     _ndUpdateButton();
