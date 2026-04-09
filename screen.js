@@ -182,17 +182,47 @@ function _ndLoadScript(src) {
 async function _ndCrepeDetect(buffer) {
     if (!_ndModel) return { freq: -1, confidence: 0 };
     try {
-        const input = tf.tensor(buffer).reshape([1, -1]);
-        const output = _ndModel.predict(input);
-        const pitchData = await output.data();
-        input.dispose();
-        output.dispose();
+        const input = tf.tensor(buffer, [1, buffer.length]);
+        let outputs;
+        // GraphModel (from loadGraphModel/TFHub) vs LayersModel (from loadLayersModel)
+        if (_ndModel.execute) {
+            outputs = _ndModel.execute(input);
+        } else {
+            outputs = _ndModel.predict(input);
+        }
 
-        // SPICE model outputs pitch in [0,1] range mapped to Hz
-        const pitchHz = pitchData[0];
-        const confidence = pitchData.length > 1 ? pitchData[1] : 0.8;
-        if (pitchHz <= 0) return { freq: -1, confidence: 0 };
-        return { freq: pitchHz, confidence };
+        // SPICE returns two tensors: [pitches, uncertainties]
+        // Other CREPE models return a single tensor
+        let freq = -1, confidence = 0;
+        if (Array.isArray(outputs)) {
+            const pitchData = await outputs[0].data();
+            const uncData = outputs.length > 1 ? await outputs[1].data() : null;
+            // SPICE pitch is in log scale: Hz = 2^(pitch * some_range) * base
+            // The SPICE output is approximately: pitch_hz = 2^(5.661 * pitch_output + 4.0)
+            // where pitch_output is in [0,1]
+            const raw = pitchData[0];
+            if (raw > 0 && raw < 1) {
+                freq = Math.pow(2, 5.661 * raw + 4.0); // SPICE log-scale to Hz
+            } else if (raw > 20) {
+                freq = raw; // already Hz (some models output directly)
+            }
+            confidence = uncData ? Math.max(0, 1 - uncData[0]) : 0.8;
+            outputs.forEach(t => t.dispose());
+        } else {
+            const pitchData = await outputs.data();
+            const raw = pitchData[0];
+            if (raw > 0 && raw < 1) {
+                freq = Math.pow(2, 5.661 * raw + 4.0);
+            } else if (raw > 20) {
+                freq = raw;
+            }
+            confidence = pitchData.length > 1 ? Math.max(0, 1 - pitchData[1]) : 0.8;
+            outputs.dispose();
+        }
+        input.dispose();
+
+        if (freq < 20 || freq > 5000) return { freq: -1, confidence: 0 };
+        return { freq, confidence };
     } catch (e) {
         return { freq: -1, confidence: 0 };
     }
@@ -373,6 +403,10 @@ async function _ndProcessFrame(buffer) {
     const sr = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
     if (_ndDetectionMethod === 'crepe' && _ndModel) {
         result = await _ndCrepeDetect(buffer);
+        // Fall back to YIN if CREPE returned nothing useful
+        if (result.freq <= 0 || result.confidence < 0.3) {
+            result = _ndYinDetect(buffer, sr);
+        }
     } else {
         result = _ndYinDetect(buffer, sr);
     }
