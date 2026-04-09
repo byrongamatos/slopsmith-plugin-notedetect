@@ -692,14 +692,17 @@ function _ndCreateHUD() {
     if (document.getElementById('nd-hud')) return;
     const hud = document.createElement('div');
     hud.id = 'nd-hud';
-    hud.className = 'fixed top-16 right-16 z-[50] pointer-events-none text-right';
+    hud.className = 'absolute top-3 right-16 z-[20] pointer-events-none text-right';
+    // Append inside the player so it layers correctly (player is z-index:100 fixed)
+    const player = document.getElementById('player');
+    if (!player) return;
     hud.innerHTML = `
         <div id="nd-hud-accuracy" class="text-xl font-bold" style="text-shadow:0 0 8px currentColor"></div>
         <div id="nd-hud-streak" class="text-xs text-gray-400 mt-0.5"></div>
         <div id="nd-hud-counts" class="text-[10px] text-gray-600 mt-0.5"></div>
         <div id="nd-hud-detected" class="text-[10px] text-cyan-400 mt-1 font-mono"></div>
     `;
-    document.body.appendChild(hud);
+    player.appendChild(hud);
 }
 
 function _ndRemoveHUD() {
@@ -711,10 +714,12 @@ function _ndRemoveHUD() {
 
 function _ndCreateFlashOverlay() {
     if (document.getElementById('nd-flash-overlay')) return;
+    const player = document.getElementById('player');
+    if (!player) return;
     const flash = document.createElement('div');
     flash.id = 'nd-flash-overlay';
-    flash.style.cssText = 'position:fixed;inset:0;z-index:49;pointer-events:none;border:3px solid transparent;border-radius:8px;transition:border-color 0.05s;';
-    document.body.appendChild(flash);
+    flash.style.cssText = 'position:absolute;inset:0;z-index:20;pointer-events:none;border:4px solid transparent;transition:border-color 0.05s;';
+    player.appendChild(flash);
 }
 
 // Update DOM HUD at 30fps (lighter than rAF)
