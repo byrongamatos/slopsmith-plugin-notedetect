@@ -244,6 +244,13 @@ async function _ndStartAudio() {
             constraints.audio.deviceId = { exact: _ndSelectedDeviceId };
         }
 
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            const isHttp = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+            const msg = isHttp
+                ? 'Microphone access requires HTTPS. You are accessing Slopsmith over HTTP from a non-localhost address. Either:\n\n1. Use a reverse proxy with HTTPS (recommended)\n2. Access via localhost\n3. Add a self-signed certificate to the server'
+                : 'Microphone access is not available in this browser. Use Chrome or Edge.';
+            throw new Error(msg);
+        }
         _ndStream = await navigator.mediaDevices.getUserMedia(constraints);
         // Use native sample rate — browsers often ignore non-standard rates,
         // and we need reliable timing for pitch detection
