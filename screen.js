@@ -1,99 +1,43 @@
 // Note Detection plugin
 // Captures guitar audio, detects pitch via CREPE or YIN, scores against highway notes.
+// Factory pattern: createNoteDetector(options) returns an independent instance.
 
-// ── State ──────────────────────────────────────────────────────────────────
-let _ndEnabled = false;
-let _ndAudioCtx = null;
-let _ndStream = null;
-let _ndAnalyser = null;
-let _ndWorklet = null;
-let _ndModel = null;       // CREPE TF model
-let _ndModelLoading = false;
-let _ndDetectionMethod = 'yin'; // 'crepe' or 'yin' — start with YIN (instant), user can switch
+// ── Shared Constants ──────────────────────────────────────────────────────
+const ND_STANDARD_MIDI = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
+const ND_MIN_YIN_SAMPLES = 4096;
+const ND_FRAME_SIZE = 2048;
+const ND_STORAGE_KEY = 'slopsmith_notedetect';
 
-// Settings
-let _ndTimingTolerance = 0.150;  // seconds (wider default for real-world play)
-let _ndPitchTolerance = 50;      // cents
-let _ndInputGain = 1.0;
-let _ndSelectedDeviceId = '';
-let _ndSelectedChannel = 'mono'; // 'mono' | 'left' | 'right'
-let _ndLatencyOffset = 0.080;    // seconds — compensates for audio input latency
+// ── Shared State (expensive resources, load once) ─────────────────────────
+let _sharedModel = null;
+let _sharedModelLoading = false;
 
-// Audio level metering
-let _ndInputLevel = 0;       // current RMS level 0-1
-let _ndInputPeak = 0;        // peak hold level
-let _ndPeakDecay = 0;        // decay timer for peak hold
-let _ndLevelAnalyser = null;  // AnalyserNode for VU meter
+// ── Instance Registry ─────────────────────────────────────────────────────
+const _ndInstances = new Set();
 
-// Scoring
-let _ndHits = 0;
-let _ndMisses = 0;
-let _ndStreak = 0;
-let _ndBestStreak = 0;
-let _ndSectionStats = [];    // [{name, hits, misses}]
-let _ndCurrentSection = null;
+// ── Shared Settings Persistence ───────────────────────────────────────────
 
-// Note tracking
-let _ndNoteResults = new Map(); // key -> 'hit'|'miss'
-let _ndDetectedMidi = -1;
-let _ndDetectedConfidence = 0;
-let _ndDetectedString = -1;
-let _ndDetectedFret = -1;
-
-// Tuning — standard tuning MIDI base per string, adjusted by arrangement offsets
-const _ndStandardMidi = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
-let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
-let _ndCapo = 0;
-
-// Audio processing — use native sample rate, accumulate samples for YIN
-let _ndAccumBuffer = new Float32Array(0);  // accumulates samples across frames
-const _ndMinYinSamples = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
-const _ndFrameSize = 2048;  // ScriptProcessor buffer size
-
-// ── localStorage Persistence ──────────────────────────────────────────────
-
-const _ndStorageKey = 'slopsmith_notedetect';
-
-function _ndSaveSettings() {
+function _ndSaveSettings(s) {
     try {
-        localStorage.setItem(_ndStorageKey, JSON.stringify({
-            deviceId: _ndSelectedDeviceId,
-            channel: _ndSelectedChannel,
-            method: _ndDetectionMethod,
-            timingTolerance: _ndTimingTolerance,
-            pitchTolerance: _ndPitchTolerance,
-            inputGain: _ndInputGain,
-            latencyOffset: _ndLatencyOffset,
-        }));
+        localStorage.setItem(ND_STORAGE_KEY, JSON.stringify(s));
     } catch (e) { /* localStorage unavailable */ }
 }
 
 function _ndLoadSettings() {
     try {
-        const raw = localStorage.getItem(_ndStorageKey);
-        if (!raw) return;
-        const s = JSON.parse(raw);
-        if (s.deviceId !== undefined) _ndSelectedDeviceId = s.deviceId;
-        if (s.channel) _ndSelectedChannel = s.channel;
-        if (s.method) _ndDetectionMethod = s.method;
-        if (s.timingTolerance !== undefined) _ndTimingTolerance = s.timingTolerance;
-        if (s.pitchTolerance !== undefined) _ndPitchTolerance = s.pitchTolerance;
-        if (s.inputGain !== undefined) _ndInputGain = s.inputGain;
-        if (s.latencyOffset !== undefined) _ndLatencyOffset = s.latencyOffset;
-    } catch (e) { /* ignore */ }
+        const raw = localStorage.getItem(ND_STORAGE_KEY);
+        if (!raw) return {};
+        return JSON.parse(raw);
+    } catch (e) { return {}; }
 }
 
-_ndLoadSettings();
-
-// ── Pitch Detection: YIN ───────────────────────────────────────────────────
-// Lightweight monophonic pitch detector — works instantly, no model to load.
+// ── Pitch Detection: YIN (pure function) ──────────────────────────────────
 
 function _ndYinDetect(buffer, sampleRate) {
     const threshold = 0.15;
     const halfLen = Math.floor(buffer.length / 2);
     const yinBuffer = new Float32Array(halfLen);
 
-    // Difference function
     let runningSum = 0;
     yinBuffer[0] = 1;
     for (let tau = 1; tau < halfLen; tau++) {
@@ -104,10 +48,9 @@ function _ndYinDetect(buffer, sampleRate) {
         }
         yinBuffer[tau] = sum;
         runningSum += sum;
-        yinBuffer[tau] *= tau / runningSum; // cumulative mean normalized
+        yinBuffer[tau] *= tau / runningSum;
     }
 
-    // Absolute threshold
     let tau = 2;
     while (tau < halfLen) {
         if (yinBuffer[tau] < threshold) {
@@ -118,7 +61,6 @@ function _ndYinDetect(buffer, sampleRate) {
     }
     if (tau === halfLen) return { freq: -1, confidence: 0 };
 
-    // Parabolic interpolation
     const s0 = tau > 0 ? yinBuffer[tau - 1] : yinBuffer[tau];
     const s1 = yinBuffer[tau];
     const s2 = tau + 1 < halfLen ? yinBuffer[tau + 1] : yinBuffer[tau];
@@ -129,44 +71,7 @@ function _ndYinDetect(buffer, sampleRate) {
     return { freq, confidence: Math.max(0, confidence) };
 }
 
-// ── Pitch Detection: CREPE ─────────────────────────────────────────────────
-
-async function _ndLoadCrepe() {
-    if (_ndModel || _ndModelLoading) return;
-    _ndModelLoading = true;
-
-    const btn = document.getElementById('btn-notedetect');
-    if (btn) btn.textContent = 'Detect (loading model...)';
-
-    try {
-        // Load TF.js if not present
-        if (!window.tf) {
-            await _ndLoadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js');
-        }
-        // CREPE "tiny" model — monophonic pitch detection, ~4MB
-        _ndModel = await tf.loadGraphModel(
-            'https://tfhub.dev/google/tfjs-model/spice/2/default/1',
-            { fromTFHub: true }
-        );
-        console.log('CREPE/SPICE model loaded');
-    } catch (e1) {
-        console.warn('SPICE TFHub load failed, trying CREPE backup:', e1);
-        try {
-            // Fallback: try loading CREPE from alternative CDN
-            _ndModel = await tf.loadLayersModel(
-                'https://cdn.jsdelivr.net/gh/nicksherron/crepe-js@master/model/model.json'
-            );
-            console.log('CREPE model loaded (fallback)');
-        } catch (e2) {
-            console.warn('All model loads failed, using YIN for this session:', e2);
-            _ndModel = null;
-            // Don't overwrite _ndDetectionMethod — keep the user's preference
-            // so it retries next time. YIN is used as runtime fallback when _ndModel is null.
-        }
-    }
-    _ndModelLoading = false;
-    _ndUpdateButton();
-}
+// ── Pitch Detection: CREPE/SPICE (shared model) ──────────────────────────
 
 function _ndLoadScript(src) {
     return new Promise((resolve, reject) => {
@@ -179,32 +84,56 @@ function _ndLoadScript(src) {
     });
 }
 
+async function _ndLoadCrepe(updateBtnFn) {
+    if (_sharedModel || _sharedModelLoading) return;
+    _sharedModelLoading = true;
+
+    if (updateBtnFn) updateBtnFn('Detect (loading model...)');
+
+    try {
+        if (!window.tf) {
+            await _ndLoadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js');
+        }
+        _sharedModel = await tf.loadGraphModel(
+            'https://tfhub.dev/google/tfjs-model/spice/2/default/1',
+            { fromTFHub: true }
+        );
+        console.log('CREPE/SPICE model loaded');
+    } catch (e1) {
+        console.warn('SPICE TFHub load failed, trying CREPE backup:', e1);
+        try {
+            _sharedModel = await tf.loadLayersModel(
+                'https://cdn.jsdelivr.net/gh/nicksherron/crepe-js@master/model/model.json'
+            );
+            console.log('CREPE model loaded (fallback)');
+        } catch (e2) {
+            console.warn('All model loads failed, using YIN for this session:', e2);
+            _sharedModel = null;
+        }
+    }
+    _sharedModelLoading = false;
+}
+
 async function _ndCrepeDetect(buffer) {
-    if (!_ndModel) return { freq: -1, confidence: 0 };
+    if (!_sharedModel) return { freq: -1, confidence: 0 };
     try {
         const input = tf.tensor(buffer, [1, buffer.length]);
         let outputs;
-        // GraphModel (from loadGraphModel/TFHub) vs LayersModel (from loadLayersModel)
-        if (_ndModel.execute) {
-            outputs = _ndModel.execute(input);
+        if (_sharedModel.execute) {
+            outputs = _sharedModel.execute(input);
         } else {
-            outputs = _ndModel.predict(input);
+            outputs = _sharedModel.predict(input);
         }
 
-        // SPICE returns two tensors: [pitches, uncertainties]
-        // Other CREPE models return a single tensor
         let freq = -1, confidence = 0;
         if (Array.isArray(outputs)) {
             const pitchData = await outputs[0].data();
             const uncData = outputs.length > 1 ? await outputs[1].data() : null;
-            // SPICE pitch is in log scale: Hz = 2^(pitch * some_range) * base
-            // The SPICE output is approximately: pitch_hz = 2^(5.661 * pitch_output + 4.0)
-            // where pitch_output is in [0,1]
             const raw = pitchData[0];
             if (raw > 0 && raw < 1) {
-                freq = Math.pow(2, 5.661 * raw + 4.0); // SPICE log-scale to Hz
+                freq = Math.pow(2, 5.661 * raw + 4.0);
             } else if (raw > 20) {
-                freq = raw; // already Hz (some models output directly)
+                freq = raw;
             }
             confidence = uncData ? Math.max(0, 1 - uncData[0]) : 0.8;
             outputs.forEach(t => t.dispose());
@@ -228,268 +157,16 @@ async function _ndCrepeDetect(buffer) {
     }
 }
 
-// ── Audio Capture ──────────────────────────────────────────────────────────
-
-async function _ndStartAudio() {
-    try {
-        const constraints = {
-            audio: {
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false,
-                channelCount: 2,  // request stereo for channel selection
-            }
-        };
-        if (_ndSelectedDeviceId) {
-            constraints.audio.deviceId = { exact: _ndSelectedDeviceId };
-        }
-
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            const isHttp = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
-            const msg = isHttp
-                ? 'Microphone access requires HTTPS. You are accessing Slopsmith over HTTP from a non-localhost address. Either:\n\n1. Use a reverse proxy with HTTPS (recommended)\n2. Access via localhost\n3. Add a self-signed certificate to the server'
-                : 'Microphone access is not available in this browser. Use Chrome or Edge.';
-            throw new Error(msg);
-        }
-        _ndStream = await navigator.mediaDevices.getUserMedia(constraints);
-        // Use native sample rate — browsers often ignore non-standard rates,
-        // and we need reliable timing for pitch detection
-        _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-        const source = _ndAudioCtx.createMediaStreamSource(_ndStream);
-        const streamChannels = source.channelCount;
-
-        // Gain node for sensitivity control
-        const gainNode = _ndAudioCtx.createGain();
-        gainNode.gain.value = _ndInputGain;
-
-        // Channel routing: split stereo into individual channels
-        if (streamChannels >= 2 && _ndSelectedChannel !== 'mono') {
-            const splitter = _ndAudioCtx.createChannelSplitter(2);
-            source.connect(splitter);
-
-            // Merge the selected channel back into mono for processing
-            const merger = _ndAudioCtx.createChannelMerger(1);
-            const chIdx = _ndSelectedChannel === 'left' ? 0 : 1;
-            splitter.connect(merger, chIdx, 0);
-            merger.connect(gainNode);
-        } else {
-            // Mono mix (default) — just connect directly
-            source.connect(gainNode);
-        }
-
-        // AnalyserNode for VU meter (taps the signal after gain)
-        _ndLevelAnalyser = _ndAudioCtx.createAnalyser();
-        _ndLevelAnalyser.fftSize = 512;
-        _ndLevelAnalyser.smoothingTimeConstant = 0.8;
-        gainNode.connect(_ndLevelAnalyser);
-
-        // ScriptProcessor only buffers audio — pitch detection runs off-thread
-        // via setTimeout to avoid blocking the highway render loop.
-        const processor = _ndAudioCtx.createScriptProcessor(_ndFrameSize, 1, 1);
-        _ndWorklet = processor;
-        _ndAccumBuffer = new Float32Array(0);
-        _ndPendingBuffer = null; // latest ready buffer for detection
-
-        processor.onaudioprocess = (e) => {
-            if (!_ndEnabled) return;
-            const input = e.inputBuffer.getChannelData(0);
-            // Accumulate samples for low-frequency detection (need 4096 at 48kHz for low E)
-            const prev = _ndAccumBuffer;
-            const combined = new Float32Array(prev.length + input.length);
-            combined.set(prev);
-            combined.set(input, prev.length);
-            if (combined.length >= _ndMinYinSamples) {
-                // Store ready buffer — detection timer will pick it up
-                const start = combined.length - _ndMinYinSamples;
-                _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
-                _ndAccumBuffer = new Float32Array(0);
-            } else {
-                _ndAccumBuffer = combined;
-            }
-        };
-
-        // Detection runs on a timer, not in the audio callback
-        _ndDetectInterval = setInterval(() => {
-            if (_ndPendingBuffer) {
-                const buf = _ndPendingBuffer;
-                _ndPendingBuffer = null;
-                _ndProcessFrame(buf);
-            }
-        }, 50); // ~20fps detection — plenty for note matching
-
-        gainNode.connect(processor);
-        processor.connect(_ndAudioCtx.destination); // must connect to keep processing alive
-
-        // Start VU meter polling
-        _ndStartLevelMeter();
-
-        // Populate device selector
-        _ndPopulateDevices();
-
-        return true;
-    } catch (e) {
-        console.error('Note detect: mic access denied or failed:', e);
-        alert('Note Detection: Could not access audio input.\n\n' + e.message);
-        return false;
-    }
-}
-
-let _ndDetectInterval = null;
-let _ndPendingBuffer = null;
-
-function _ndStopAudio() {
-    _ndStopLevelMeter();
-    if (_ndDetectInterval) { clearInterval(_ndDetectInterval); _ndDetectInterval = null; }
-    _ndPendingBuffer = null;
-    if (_ndWorklet) {
-        _ndWorklet.disconnect();
-        _ndWorklet = null;
-    }
-    _ndLevelAnalyser = null;
-    if (_ndStream) {
-        _ndStream.getTracks().forEach(t => t.stop());
-        _ndStream = null;
-    }
-    if (_ndAudioCtx) {
-        _ndAudioCtx.close();
-        _ndAudioCtx = null;
-    }
-    _ndInputLevel = 0;
-    _ndInputPeak = 0;
-    _ndAccumBuffer = new Float32Array(0);
-}
-
-// ── Input Level Metering ──────────────────────────────────────────────────
-
-let _ndLevelRaf = null;
-
-function _ndStartLevelMeter() {
-    _ndStopLevelMeter();
-    const tick = () => {
-        if (!_ndLevelAnalyser) return;
-        const buf = new Float32Array(_ndLevelAnalyser.fftSize);
-        _ndLevelAnalyser.getFloatTimeDomainData(buf);
-
-        // RMS level
-        let sum = 0;
-        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-        const rms = Math.sqrt(sum / buf.length);
-        _ndInputLevel = Math.min(1, rms * 5); // scale up for visibility
-
-        // Peak hold with decay
-        if (_ndInputLevel > _ndInputPeak) {
-            _ndInputPeak = _ndInputLevel;
-            _ndPeakDecay = 30; // hold for ~30 frames
-        } else if (_ndPeakDecay > 0) {
-            _ndPeakDecay--;
-        } else {
-            _ndInputPeak *= 0.95;
-        }
-
-        // Update VU meter in settings panel if visible
-        _ndDrawSettingsVU();
-
-        _ndLevelRaf = requestAnimationFrame(tick);
-    };
-    _ndLevelRaf = requestAnimationFrame(tick);
-}
-
-function _ndStopLevelMeter() {
-    if (_ndLevelRaf) {
-        cancelAnimationFrame(_ndLevelRaf);
-        _ndLevelRaf = null;
-    }
-}
-
-function _ndDrawSettingsVU() {
-    const bar = document.getElementById('nd-vu-bar');
-    const peak = document.getElementById('nd-vu-peak');
-    if (!bar) return;
-    const pct = Math.round(_ndInputLevel * 100);
-    bar.style.width = pct + '%';
-    // Color: green < 60%, yellow 60-85%, red > 85%
-    bar.className = pct > 85 ? 'h-full rounded transition-all duration-75 bg-red-500'
-        : pct > 60 ? 'h-full rounded transition-all duration-75 bg-yellow-500'
-        : 'h-full rounded transition-all duration-75 bg-green-500';
-    if (peak) {
-        const peakPct = Math.round(_ndInputPeak * 100);
-        peak.style.left = Math.min(peakPct, 100) + '%';
-    }
-}
-
-// ── Frame Processing ───────────────────────────────────────────────────────
-
-async function _ndProcessFrame(buffer) {
-    let result;
-    const sr = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
-    if (_ndDetectionMethod === 'crepe' && _ndModel) {
-        result = await _ndCrepeDetect(buffer);
-        // Fall back to YIN if CREPE returned nothing useful
-        if (result.freq <= 0 || result.confidence < 0.3) {
-            result = _ndYinDetect(buffer, sr);
-        }
-    } else {
-        result = _ndYinDetect(buffer, sr);
-    }
-
-    if (result.freq <= 0 || result.confidence < 0.3) {
-        _ndDetectedMidi = -1;
-        _ndDetectedConfidence = 0;
-        _ndDetectedString = -1;
-        _ndDetectedFret = -1;
-        return;
-    }
-
-    _ndDetectedMidi = _ndFreqToMidi(result.freq);
-    _ndDetectedConfidence = result.confidence;
-
-    // Find best string/fret match
-    const sf = _ndMidiToStringFret(_ndDetectedMidi);
-    _ndDetectedString = sf.string;
-    _ndDetectedFret = sf.fret;
-
-    // Match against expected notes
-    _ndMatchNotes();
-}
-
-// ── Frequency / MIDI Conversion ────────────────────────────────────────────
+// ── Frequency / MIDI Conversion (pure functions) ──────────────────────────
 
 function _ndFreqToMidi(freq) {
     return 12 * Math.log2(freq / 440) + 69;
 }
 
-function _ndMidiFromStringFret(string, fret) {
-    return _ndStandardMidi[string] + _ndTuningOffsets[string] + _ndCapo + fret;
-}
-
-function _ndMidiToStringFret(midiNote) {
-    // Find the string/fret combo closest to the detected pitch
-    let bestDist = Infinity;
-    let bestString = -1;
-    let bestFret = -1;
-    for (let s = 0; s < 6; s++) {
-        const openMidi = _ndStandardMidi[s] + _ndTuningOffsets[s] + _ndCapo;
-        const fret = Math.round(midiNote - openMidi);
-        if (fret < 0 || fret > 24) continue;
-        const dist = Math.abs(midiNote - (openMidi + fret));
-        if (dist < bestDist) {
-            bestDist = dist;
-            bestString = s;
-            bestFret = fret;
-        }
-    }
-    return { string: bestString, fret: bestFret };
-}
-
-// ── Note Matching ──────────────────────────────────────────────────────────
-
 function _ndNoteKey(note, time) {
-    // Unique key for a note event
     return `${time.toFixed(3)}_${note.s}_${note.f}`;
 }
 
-// Binary search: find index of first element with .t >= target
 function _ndBsearch(arr, target) {
     let lo = 0, hi = arr.length;
     while (lo < hi) {
@@ -500,692 +177,1071 @@ function _ndBsearch(arr, target) {
     return lo;
 }
 
-function _ndMatchNotes() {
-    // Compensate for audio input latency: the detected pitch corresponds to
-    // what the player played ~latencyOffset ago, so shift the comparison window back.
-    const t = highway.getTime() - _ndLatencyOffset;
-    if (_ndDetectedMidi < 0) return;
+// ── Factory ───────────────────────────────────────────────────────────────
 
-    const notes = highway.getNotes();
-    const chords = highway.getChords();
-    const tolerance = _ndTimingTolerance;
-    const centsTolerance = _ndPitchTolerance;
+function createNoteDetector(options) {
+    options = options || {};
+    const hw = options.highway || window.highway;
+    const container = options.container || null;
+    const channelIndex = options.channel != null ? options.channel : -1;
+    const externalStream = options.audioStream || null;
+    const externalAudioCtx = options.audioCtx || null;
 
-    const candidateNotes = [];
+    // ── Instance State ────────────────────────────────────────────────────
+    let enabled = false;
+    let audioCtx = null;
+    let stream = null;
+    let worklet = null;
+    let levelAnalyser = null;
+    let gainNode = null;
 
-    // Use binary search to jump to the relevant time region
-    if (notes && notes.length > 0) {
-        const start = _ndBsearch(notes, t - tolerance);
-        for (let i = start; i < notes.length; i++) {
-            const n = notes[i];
-            if (n.t > t + tolerance) break;
-            if (n.mt) continue; // skip muted notes
-            candidateNotes.push({ s: n.s, f: n.f, t: n.t });
-        }
+    // Settings (loaded from shared localStorage)
+    const saved = _ndLoadSettings();
+    let detectionMethod = saved.method || 'yin';
+    let timingTolerance = saved.timingTolerance != null ? saved.timingTolerance : 0.150;
+    let pitchTolerance = saved.pitchTolerance != null ? saved.pitchTolerance : 50;
+    let inputGain = saved.inputGain != null ? saved.inputGain : 1.0;
+    let selectedDeviceId = saved.deviceId || '';
+    let selectedChannel = saved.channel || 'mono';
+    let latencyOffset = saved.latencyOffset != null ? saved.latencyOffset : 0.080;
+
+    // Audio level metering
+    let inputLevel = 0;
+    let inputPeak = 0;
+    let peakDecay = 0;
+
+    // Scoring
+    let hits = 0;
+    let misses = 0;
+    let streak = 0;
+    let bestStreak = 0;
+    let sectionStats = [];
+    let currentSection = null;
+
+    // Note tracking
+    let noteResults = new Map();
+    let detectedMidi = -1;
+    let detectedConfidence = 0;
+    let detectedString = -1;
+    let detectedFret = -1;
+
+    // Tuning
+    let tuningOffsets = [0, 0, 0, 0, 0, 0];
+    let capo = 0;
+
+    // Audio processing
+    let accumBuffer = new Float32Array(0);
+    let pendingBuffer = null;
+
+    // Timers
+    let detectInterval = null;
+    let levelRaf = null;
+    let hudInterval = null;
+    let missCheckInterval = null;
+    let gcInterval = null;
+    const flashTimeouts = [];
+
+    // Visual state
+    let hitFlash = 0;
+    let missFlash = 0;
+    let lastHitCount = 0;
+    let lastMissCount = 0;
+
+    // DOM
+    let instanceRoot = null;
+    let detectBtn = null;
+    let gearBtn = null;
+
+    // Draw hook reference (for cleanup)
+    let drawHookFn = null;
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    function saveSettings() {
+        _ndSaveSettings({
+            deviceId: selectedDeviceId,
+            channel: selectedChannel,
+            method: detectionMethod,
+            timingTolerance: timingTolerance,
+            pitchTolerance: pitchTolerance,
+            inputGain: inputGain,
+            latencyOffset: latencyOffset,
+        });
     }
-    if (chords && chords.length > 0) {
-        const start = _ndBsearch(chords, t - tolerance);
-        for (let i = start; i < chords.length; i++) {
-            const c = chords[i];
-            if (c.t > t + tolerance) break;
-            for (const cn of (c.notes || [])) {
-                if (cn.mt) continue;
-                candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
+
+    function midiFromStringFret(string, fret) {
+        return ND_STANDARD_MIDI[string] + tuningOffsets[string] + capo + fret;
+    }
+
+    function midiToStringFret(midiNote) {
+        let bestDist = Infinity;
+        let bestString = -1;
+        let bestFret = -1;
+        for (let s = 0; s < 6; s++) {
+            const openMidi = ND_STANDARD_MIDI[s] + tuningOffsets[s] + capo;
+            const fret = Math.round(midiNote - openMidi);
+            if (fret < 0 || fret > 24) continue;
+            const dist = Math.abs(midiNote - (openMidi + fret));
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestString = s;
+                bestFret = fret;
             }
         }
+        return { string: bestString, fret: bestFret };
     }
 
-    // Check each candidate
-    for (const cn of candidateNotes) {
-        const key = _ndNoteKey(cn, cn.t);
-        if (_ndNoteResults.has(key)) continue; // already judged
+    // ── Audio Capture ─────────────────────────────────────────────────────
 
-        const expectedMidi = _ndMidiFromStringFret(cn.s, cn.f);
-        const detectedCents = (_ndDetectedMidi - expectedMidi) * 100;
+    async function startAudio() {
+        try {
+            if (externalStream) {
+                // Shared stream mode — splitscreen passes a MediaStream + AudioContext
+                audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
+                stream = externalStream;
+            } else {
+                // Standalone mode — call getUserMedia ourselves
+                const constraints = {
+                    audio: {
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false,
+                        channelCount: 2,
+                    }
+                };
+                if (selectedDeviceId) {
+                    constraints.audio.deviceId = { exact: selectedDeviceId };
+                }
 
-        if (Math.abs(detectedCents) <= centsTolerance) {
-            _ndNoteResults.set(key, 'hit');
-            _ndHits++;
-            _ndStreak++;
-            if (_ndStreak > _ndBestStreak) _ndBestStreak = _ndStreak;
-            _ndUpdateSectionStat('hit');
-        }
-    }
-}
-
-// Mark missed notes that have passed the timing window
-function _ndCheckMisses() {
-    if (!_ndEnabled) return;
-    const t = highway.getTime() - _ndLatencyOffset;
-    const tolerance = _ndTimingTolerance;
-    const missDeadline = t - tolerance * 2; // notes older than this are missed
-    const notes = highway.getNotes();
-    const chords = highway.getChords();
-
-    const checkNote = (s, f, noteTime) => {
-        if (noteTime > missDeadline) return; // not yet past window
-        const key = _ndNoteKey({ s, f }, noteTime);
-        if (!_ndNoteResults.has(key)) {
-            _ndNoteResults.set(key, 'miss');
-            _ndMisses++;
-            _ndStreak = 0;
-            _ndUpdateSectionStat('miss');
-        }
-    };
-
-    // Use binary search — only check notes in the region that could be newly missed
-    // (between last check and current missDeadline)
-    if (notes && notes.length > 0) {
-        const start = _ndBsearch(notes, missDeadline - 1); // look back 1s
-        for (let i = start; i < notes.length; i++) {
-            const n = notes[i];
-            if (n.t > missDeadline) break;
-            if (n.mt) continue;
-            checkNote(n.s, n.f, n.t);
-        }
-    }
-    if (chords && chords.length > 0) {
-        const start = _ndBsearch(chords, missDeadline - 1);
-        for (let i = start; i < chords.length; i++) {
-            const c = chords[i];
-            if (c.t > missDeadline) break;
-            for (const cn of (c.notes || [])) {
-                if (cn.mt) continue;
-                checkNote(cn.s, cn.f, c.t);
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    const isHttp = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+                    const msg = isHttp
+                        ? 'Microphone access requires HTTPS. You are accessing Slopsmith over HTTP from a non-localhost address. Either:\n\n1. Use a reverse proxy with HTTPS (recommended)\n2. Access via localhost\n3. Add a self-signed certificate to the server'
+                        : 'Microphone access is not available in this browser. Use Chrome or Edge.';
+                    throw new Error(msg);
+                }
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             }
-        }
-    }
 
-    // Track current section
-    const sections = highway.getSections();
-    if (sections) {
-        let current = null;
-        for (const sec of sections) {
-            if (sec.time <= t) current = sec.name;
-            else break;
-        }
-        if (current && current !== _ndCurrentSection) {
-            _ndCurrentSection = current;
-            // Ensure section stats entry exists
-            if (!_ndSectionStats.find(s => s.name === current)) {
-                _ndSectionStats.push({ name: current, hits: 0, misses: 0 });
+            const source = audioCtx.createMediaStreamSource(stream);
+            const streamChannels = source.channelCount;
+
+            gainNode = audioCtx.createGain();
+            gainNode.gain.value = inputGain;
+
+            // Channel routing
+            if (channelIndex >= 0 && streamChannels > channelIndex) {
+                // Explicit channel index (for multi-channel interfaces)
+                const splitter = audioCtx.createChannelSplitter(streamChannels);
+                source.connect(splitter);
+                const merger = audioCtx.createChannelMerger(1);
+                splitter.connect(merger, channelIndex, 0);
+                merger.connect(gainNode);
+            } else if (streamChannels >= 2 && selectedChannel !== 'mono') {
+                // Legacy left/right selection
+                const splitter = audioCtx.createChannelSplitter(2);
+                source.connect(splitter);
+                const merger = audioCtx.createChannelMerger(1);
+                const chIdx = selectedChannel === 'left' ? 0 : 1;
+                splitter.connect(merger, chIdx, 0);
+                merger.connect(gainNode);
+            } else {
+                source.connect(gainNode);
             }
+
+            // AnalyserNode for VU meter
+            levelAnalyser = audioCtx.createAnalyser();
+            levelAnalyser.fftSize = 512;
+            levelAnalyser.smoothingTimeConstant = 0.8;
+            gainNode.connect(levelAnalyser);
+
+            // ScriptProcessor for sample accumulation
+            const processor = audioCtx.createScriptProcessor(ND_FRAME_SIZE, 1, 1);
+            worklet = processor;
+            accumBuffer = new Float32Array(0);
+            pendingBuffer = null;
+
+            processor.onaudioprocess = (e) => {
+                if (!enabled) return;
+                const input = e.inputBuffer.getChannelData(0);
+                const prev = accumBuffer;
+                const combined = new Float32Array(prev.length + input.length);
+                combined.set(prev);
+                combined.set(input, prev.length);
+                if (combined.length >= ND_MIN_YIN_SAMPLES) {
+                    const start = combined.length - ND_MIN_YIN_SAMPLES;
+                    pendingBuffer = combined.slice(start, start + ND_MIN_YIN_SAMPLES);
+                    accumBuffer = new Float32Array(0);
+                } else {
+                    accumBuffer = combined;
+                }
+            };
+
+            detectInterval = setInterval(() => {
+                if (pendingBuffer) {
+                    const buf = pendingBuffer;
+                    pendingBuffer = null;
+                    processFrame(buf);
+                }
+            }, 50);
+
+            gainNode.connect(processor);
+            processor.connect(audioCtx.destination);
+
+            startLevelMeter();
+            populateDevices();
+
+            return true;
+        } catch (e) {
+            console.error('Note detect: mic access denied or failed:', e);
+            alert('Note Detection: Could not access audio input.\n\n' + e.message);
+            return false;
         }
     }
-}
 
-function _ndUpdateSectionStat(type) {
-    if (!_ndCurrentSection) return;
-    let sec = _ndSectionStats.find(s => s.name === _ndCurrentSection);
-    if (!sec) {
-        sec = { name: _ndCurrentSection, hits: 0, misses: 0 };
-        _ndSectionStats.push(sec);
-    }
-    if (type === 'hit') sec.hits++;
-    else sec.misses++;
-}
-
-// ── Settings Panel ─────────────────────────────────────────────────────────
-
-function _ndShowSettings() {
-    let panel = document.getElementById('nd-settings-panel');
-    if (panel) { panel.remove(); return; }
-
-    const channelLabels = { mono: 'Mono (mix)', left: 'Left (Ch 1 — dry/DI)', right: 'Right (Ch 2 — wet)' };
-
-    panel = document.createElement('div');
-    panel.id = 'nd-settings-panel';
-    panel.className = 'fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 shadow-2xl text-sm';
-    panel.innerHTML = `
-        <div class="flex justify-between items-center mb-3">
-            <span class="text-gray-200 font-semibold">Note Detection Settings</span>
-            <button onclick="document.getElementById('nd-settings-panel').remove()" class="text-gray-500 hover:text-white">&times;</button>
-        </div>
-
-        <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
-        <select id="nd-device-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2"
-                onchange="_ndOnDeviceChange(this.value)">
-            <option value="">Default</option>
-        </select>
-
-        <label class="block text-gray-400 text-xs mb-1">Input Channel</label>
-        <select id="nd-channel-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2"
-                onchange="_ndOnChannelChange(this.value)">
-            <option value="mono" ${_ndSelectedChannel === 'mono' ? 'selected' : ''}>Mono (mix both channels)</option>
-            <option value="left" ${_ndSelectedChannel === 'left' ? 'selected' : ''}>Left (Ch 1) — typically dry/DI</option>
-            <option value="right" ${_ndSelectedChannel === 'right' ? 'selected' : ''}>Right (Ch 2) — typically wet/FX</option>
-        </select>
-
-        <label class="block text-gray-400 text-xs mb-1">Input Level</label>
-        <div class="relative h-3 bg-dark-600 rounded overflow-hidden mb-1">
-            <div id="nd-vu-bar" class="h-full rounded transition-all duration-75 bg-green-500" style="width:0%"></div>
-            <div id="nd-vu-peak" class="absolute top-0 w-0.5 h-full bg-white/70" style="left:0%"></div>
-        </div>
-        <div class="flex justify-between text-[9px] text-gray-600 mb-3">
-            <span>-inf</span><span>-18dB</span><span>-6dB</span><span>0dB</span>
-        </div>
-
-        <label class="block text-gray-400 text-xs mb-1">Detection Method</label>
-        <select id="nd-method-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-3"
-                onchange="_ndSetMethod(this.value)">
-            <option value="yin" ${_ndDetectionMethod === 'yin' ? 'selected' : ''}>YIN (lightweight, clean signals)</option>
-            <option value="crepe" ${_ndDetectionMethod === 'crepe' ? 'selected' : ''}>CREPE/SPICE (robust, ~20MB model)</option>
-        </select>
-
-        <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span id="nd-latency-val">${Math.round(_ndLatencyOffset * 1000)}</span>ms</label>
-        <input type="range" min="0" max="250" value="${Math.round(_ndLatencyOffset * 1000)}"
-               class="w-full accent-green-400 mb-2"
-               oninput="_ndLatencyOffset=this.value/1000;document.getElementById('nd-latency-val').textContent=this.value;_ndSaveSettings()">
-        <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-            Compensates for USB/audio interface delay. Increase if notes register late.
-        </div>
-
-        <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span id="nd-timing-val">${Math.round(_ndTimingTolerance * 1000)}</span>ms</label>
-        <input type="range" min="30" max="300" value="${Math.round(_ndTimingTolerance * 1000)}"
-               class="w-full accent-green-400 mb-3"
-               oninput="_ndTimingTolerance=this.value/1000;document.getElementById('nd-timing-val').textContent=this.value;_ndSaveSettings()">
-
-        <label class="block text-gray-400 text-xs mb-1">Pitch Tolerance: <span id="nd-pitch-val">${_ndPitchTolerance}</span> cents</label>
-        <input type="range" min="10" max="100" value="${_ndPitchTolerance}"
-               class="w-full accent-green-400 mb-3"
-               oninput="_ndPitchTolerance=+this.value;document.getElementById('nd-pitch-val').textContent=this.value;_ndSaveSettings()">
-
-        <label class="block text-gray-400 text-xs mb-1">Input Gain: <span id="nd-gain-val">${_ndInputGain.toFixed(1)}</span>x</label>
-        <input type="range" min="1" max="50" value="${Math.round(_ndInputGain * 10)}"
-               class="w-full accent-green-400 mb-3"
-               oninput="_ndInputGain=this.value/10;document.getElementById('nd-gain-val').textContent=_ndInputGain.toFixed(1);_ndSaveSettings()">
-
-        <div class="text-[10px] text-gray-600 mt-1 leading-tight">
-            Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
-        </div>
-    `;
-
-    document.body.appendChild(panel);
-    _ndPopulateDevices();
-}
-
-function _ndOnDeviceChange(deviceId) {
-    _ndSelectedDeviceId = deviceId;
-    _ndSaveSettings();
-    _ndRestartAudio();
-}
-
-function _ndOnChannelChange(channel) {
-    _ndSelectedChannel = channel;
-    _ndSaveSettings();
-    _ndRestartAudio();
-}
-
-async function _ndPopulateDevices() {
-    try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const sel = document.getElementById('nd-device-select');
-        if (!sel) return;
-        sel.innerHTML = '<option value="">Default</option>';
-        for (const d of devices) {
-            if (d.kind !== 'audioinput') continue;
-            const opt = document.createElement('option');
-            opt.value = d.deviceId;
-            opt.textContent = d.label || `Input ${d.deviceId.slice(0, 8)}`;
-            if (d.deviceId === _ndSelectedDeviceId) opt.selected = true;
-            sel.appendChild(opt);
+    function stopAudio() {
+        stopLevelMeter();
+        if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
+        pendingBuffer = null;
+        if (worklet) {
+            worklet.disconnect();
+            worklet.onaudioprocess = null;
+            worklet = null;
         }
-    } catch (e) { /* permission not yet granted */ }
-}
-
-async function _ndRestartAudio() {
-    _ndStopAudio();
-    if (_ndEnabled) await _ndStartAudio();
-}
-
-function _ndSetMethod(method) {
-    _ndDetectionMethod = method;
-    _ndSaveSettings();
-    if (method === 'crepe') _ndLoadCrepe();
-}
-
-// ── Visual Feedback ────────────────────────────────────────────────────────
-// Uses a DOM overlay HUD (works with both 2D and 3D highway) plus
-// draw hook indicators on the 2D highway when project()/fretX() are available.
-
-let _ndHitFlash = 0;   // green flash alpha
-let _ndMissFlash = 0;  // red flash alpha
-let _ndLastHitCount = 0;
-let _ndLastMissCount = 0;
-
-// DOM HUD overlay — positioned over the player, works with any renderer
-function _ndCreateHUD() {
-    if (document.getElementById('nd-hud')) return;
-    const hud = document.createElement('div');
-    hud.id = 'nd-hud';
-    hud.className = 'absolute top-3 right-16 z-[20] pointer-events-none text-right';
-    // Append inside the player so it layers correctly (player is z-index:100 fixed)
-    const player = document.getElementById('player');
-    if (!player) return;
-    hud.innerHTML = `
-        <div id="nd-hud-accuracy" class="text-xl font-bold" style="text-shadow:0 0 8px currentColor"></div>
-        <div id="nd-hud-streak" class="text-xs text-gray-400 mt-0.5"></div>
-        <div id="nd-hud-counts" class="text-[10px] text-gray-600 mt-0.5"></div>
-        <div id="nd-hud-detected" class="text-[10px] text-cyan-400 mt-1 font-mono"></div>
-    `;
-    player.appendChild(hud);
-}
-
-function _ndRemoveHUD() {
-    const hud = document.getElementById('nd-hud');
-    if (hud) hud.remove();
-    const flash = document.getElementById('nd-flash-overlay');
-    if (flash) flash.remove();
-}
-
-function _ndCreateFlashOverlay() {
-    if (document.getElementById('nd-flash-overlay')) return;
-    const player = document.getElementById('player');
-    if (!player) return;
-    const flash = document.createElement('div');
-    flash.id = 'nd-flash-overlay';
-    flash.style.cssText = 'position:absolute;inset:0;z-index:20;pointer-events:none;border:4px solid transparent;transition:border-color 0.05s;';
-    player.appendChild(flash);
-}
-
-// Update DOM HUD at 30fps (lighter than rAF)
-let _ndHudInterval = null;
-
-function _ndStartHUD() {
-    _ndCreateHUD();
-    _ndCreateFlashOverlay();
-    _ndLastHitCount = 0;
-    _ndLastMissCount = 0;
-    if (_ndHudInterval) clearInterval(_ndHudInterval);
-    _ndHudInterval = setInterval(_ndUpdateHUD, 33);
-}
-
-function _ndStopHUD() {
-    if (_ndHudInterval) { clearInterval(_ndHudInterval); _ndHudInterval = null; }
-    _ndRemoveHUD();
-}
-
-function _ndUpdateHUD() {
-    if (!_ndEnabled) return;
-
-    const total = _ndHits + _ndMisses;
-    const accEl = document.getElementById('nd-hud-accuracy');
-    const streakEl = document.getElementById('nd-hud-streak');
-    const countsEl = document.getElementById('nd-hud-counts');
-    const detectedEl = document.getElementById('nd-hud-detected');
-    const flashEl = document.getElementById('nd-flash-overlay');
-
-    if (accEl && total > 0) {
-        const accuracy = Math.round((_ndHits / total) * 100);
-        const color = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
-        accEl.textContent = accuracy + '%';
-        accEl.style.color = color;
-    } else if (accEl) {
-        accEl.textContent = '';
+        if (gainNode) { gainNode.disconnect(); gainNode = null; }
+        levelAnalyser = null;
+        if (!externalStream && stream) {
+            stream.getTracks().forEach(t => t.stop());
+        }
+        stream = null;
+        if (!externalAudioCtx && audioCtx) {
+            audioCtx.close();
+        }
+        audioCtx = null;
+        inputLevel = 0;
+        inputPeak = 0;
+        accumBuffer = new Float32Array(0);
     }
 
-    if (streakEl) {
-        let text = _ndStreak > 0 ? `${_ndStreak} streak` : '';
-        if (_ndBestStreak > 0) text += `  best: ${_ndBestStreak}`;
-        streakEl.textContent = text;
+    // ── Level Metering ────────────────────────────────────────────────────
+
+    function startLevelMeter() {
+        stopLevelMeter();
+        const tick = () => {
+            if (!levelAnalyser) return;
+            const buf = new Float32Array(levelAnalyser.fftSize);
+            levelAnalyser.getFloatTimeDomainData(buf);
+            let sum = 0;
+            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+            const rms = Math.sqrt(sum / buf.length);
+            inputLevel = Math.min(1, rms * 5);
+
+            if (inputLevel > inputPeak) {
+                inputPeak = inputLevel;
+                peakDecay = 30;
+            } else if (peakDecay > 0) {
+                peakDecay--;
+            } else {
+                inputPeak *= 0.95;
+            }
+
+            drawSettingsVU();
+            levelRaf = requestAnimationFrame(tick);
+        };
+        levelRaf = requestAnimationFrame(tick);
     }
 
-    if (countsEl && total > 0) {
-        countsEl.textContent = `${_ndHits} / ${total}`;
+    function stopLevelMeter() {
+        if (levelRaf) { cancelAnimationFrame(levelRaf); levelRaf = null; }
     }
 
-    if (detectedEl) {
-        if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.3) {
-            const names = ['E2','A2','D3','G3','B3','E4'];
-            detectedEl.textContent = `${names[_ndDetectedString] || '?'} fret ${_ndDetectedFret}`;
+    function drawSettingsVU() {
+        if (!instanceRoot) return;
+        const bar = instanceRoot.querySelector('.nd-vu-bar');
+        const peak = instanceRoot.querySelector('.nd-vu-peak');
+        if (!bar) return;
+        const pct = Math.round(inputLevel * 100);
+        bar.style.width = pct + '%';
+        bar.className = 'nd-vu-bar h-full rounded transition-all duration-75 ' +
+            (pct > 85 ? 'bg-red-500' : pct > 60 ? 'bg-yellow-500' : 'bg-green-500');
+        if (peak) {
+            peak.style.left = Math.min(Math.round(inputPeak * 100), 100) + '%';
+        }
+    }
+
+    // ── Frame Processing ──────────────────────────────────────────────────
+
+    async function processFrame(buffer) {
+        let result;
+        const sr = audioCtx ? audioCtx.sampleRate : 48000;
+        if (detectionMethod === 'crepe' && _sharedModel) {
+            result = await _ndCrepeDetect(buffer);
+            if (result.freq <= 0 || result.confidence < 0.3) {
+                result = _ndYinDetect(buffer, sr);
+            }
         } else {
-            detectedEl.textContent = '';
-        }
-    }
-
-    // Edge flash on hit/miss
-    if (flashEl) {
-        if (_ndHits > _ndLastHitCount) {
-            flashEl.style.borderColor = 'rgba(0, 255, 136, 0.6)';
-            setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
-        } else if (_ndMisses > _ndLastMissCount) {
-            flashEl.style.borderColor = 'rgba(255, 50, 68, 0.4)';
-            setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
-        }
-        _ndLastHitCount = _ndHits;
-        _ndLastMissCount = _ndMisses;
-    }
-}
-
-// 2D highway draw hook — uses project()/fretX() for accurate positioning.
-// Only draws when the 2D highway is active (these APIs exist on the highway object).
-highway.addDrawHook(function(ctx, W, H) {
-    if (!_ndEnabled) return;
-    // Only draw note indicators if highway exposes projection (2D mode)
-    if (!highway.project || !highway.fretX) return;
-
-    const t = highway.getTime();
-    const notes = highway.getNotes();
-    const chords = highway.getChords();
-
-    const drawIndicator = (s, f, noteTime, result) => {
-        const tOff = noteTime - t;
-        const p = highway.project(tOff);
-        if (!p) return;
-        const x = highway.fretX(f, p.scale, W);
-        const y = p.y * H;
-
-        const age = Math.abs(t - noteTime);
-        const fade = Math.max(0, 1 - age / 0.6) * p.scale;
-        if (fade <= 0) return;
-
-        if (result === 'hit') {
-            ctx.save();
-            ctx.globalAlpha = fade * 0.7;
-            ctx.shadowColor = '#00ff88';
-            ctx.shadowBlur = 20 * p.scale;
-            ctx.strokeStyle = '#00ff88';
-            ctx.lineWidth = 3 * p.scale;
-            ctx.beginPath();
-            ctx.arc(x, y, 14 * p.scale, 0, Math.PI * 2);
-            ctx.stroke();
-            ctx.restore();
-        } else if (result === 'miss') {
-            ctx.save();
-            ctx.globalAlpha = fade * 0.5;
-            ctx.shadowColor = '#ff3344';
-            ctx.shadowBlur = 12 * p.scale;
-            ctx.strokeStyle = '#ff3344';
-            ctx.lineWidth = 2 * p.scale;
-            const sz = 8 * p.scale;
-            ctx.beginPath();
-            ctx.moveTo(x - sz, y - sz);
-            ctx.lineTo(x + sz, y + sz);
-            ctx.moveTo(x + sz, y - sz);
-            ctx.lineTo(x - sz, y + sz);
-            ctx.stroke();
-            ctx.restore();
-        }
-    };
-
-    // Draw results for recent notes
-    if (notes) {
-        for (const n of notes) {
-            if (n.t < t - 0.5) continue;
-            if (n.t > t + 3) break;
-            if (n.mt) continue;
-            const key = _ndNoteKey(n, n.t);
-            const result = _ndNoteResults.get(key);
-            if (result) drawIndicator(n.s, n.f, n.t, result);
-        }
-    }
-    if (chords) {
-        for (const c of chords) {
-            if (c.t < t - 0.5) continue;
-            if (c.t > t + 3) break;
-            for (const cn of (c.notes || [])) {
-                if (cn.mt) continue;
-                const key = _ndNoteKey(cn, c.t);
-                const result = _ndNoteResults.get(key);
-                if (result) drawIndicator(cn.s, cn.f, c.t, result);
-            }
-        }
-    }
-
-    // Detected note indicator at the now line
-    if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.3) {
-        const p = highway.project(0); // now line
-        if (p) {
-            const x = highway.fretX(_ndDetectedFret, p.scale, W);
-            const y = p.y * H;
-            ctx.save();
-            ctx.globalAlpha = Math.min(1, _ndDetectedConfidence);
-            ctx.fillStyle = '#44ddff';
-            ctx.shadowColor = '#44ddff';
-            ctx.shadowBlur = 12;
-            ctx.beginPath();
-            ctx.arc(x, y, 6, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.fillStyle = '#000';
-            ctx.font = 'bold 7px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(_ndDetectedFret, x, y);
-            ctx.restore();
-        }
-    }
-});
-
-// ── Toggle Button ──────────────────────────────────────────────────────────
-
-function _ndInjectButton() {
-    const controls = document.getElementById('player-controls');
-    if (!controls || document.getElementById('btn-notedetect')) return;
-
-    const closeBtn = controls.querySelector('button:last-child');
-
-    const btn = document.createElement('button');
-    btn.id = 'btn-notedetect';
-    btn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
-    btn.textContent = 'Detect';
-    btn.title = 'Toggle real-time note detection & scoring';
-    btn.onclick = _ndToggle;
-    controls.insertBefore(btn, closeBtn);
-
-    // Settings gear button
-    const gear = document.createElement('button');
-    gear.id = 'btn-notedetect-settings';
-    gear.className = 'px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
-    gear.textContent = '\u2699';
-    gear.title = 'Note detection settings';
-    gear.onclick = _ndShowSettings;
-    controls.insertBefore(gear, closeBtn);
-}
-
-function _ndUpdateButton() {
-    const btn = document.getElementById('btn-notedetect');
-    if (!btn) return;
-    if (_ndEnabled) {
-        btn.className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
-        btn.textContent = 'Detect \u2713';
-    } else {
-        btn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
-        btn.textContent = 'Detect';
-    }
-    const gear = document.getElementById('btn-notedetect-settings');
-    if (gear) gear.classList.toggle('hidden', !_ndEnabled);
-}
-
-async function _ndToggle() {
-    _ndEnabled = !_ndEnabled;
-    _ndUpdateButton();
-
-    if (_ndEnabled) {
-        // Read tuning from song info
-        const info = highway.getSongInfo();
-        if (info && info.tuning) {
-            _ndTuningOffsets = info.tuning;
-        }
-        if (info && info.capo !== undefined) {
-            _ndCapo = info.capo;
+            result = _ndYinDetect(buffer, sr);
         }
 
-        // Reset scoring
-        _ndResetScoring();
-
-        const ok = await _ndStartAudio();
-        if (!ok) {
-            _ndEnabled = false;
-            _ndUpdateButton();
+        if (result.freq <= 0 || result.confidence < 0.3) {
+            detectedMidi = -1;
+            detectedConfidence = 0;
+            detectedString = -1;
+            detectedFret = -1;
             return;
         }
 
-        // Start miss-check polling and HUD
-        _ndMissCheckInterval = setInterval(_ndCheckMisses, 100);
-        _ndStartHUD();
+        detectedMidi = _ndFreqToMidi(result.freq);
+        detectedConfidence = result.confidence;
 
-        if (_ndDetectionMethod === 'crepe') _ndLoadCrepe();
-    } else {
-        _ndStopAudio();
-        _ndStopHUD();
-        if (_ndMissCheckInterval) { clearInterval(_ndMissCheckInterval); _ndMissCheckInterval = null; }
+        const sf = midiToStringFret(detectedMidi);
+        detectedString = sf.string;
+        detectedFret = sf.fret;
 
-        // Show summary if we had results
-        _ndShowSummary();
-
-        // Close settings panel
-        const panel = document.getElementById('nd-settings-panel');
-        if (panel) panel.remove();
-    }
-}
-
-let _ndMissCheckInterval = null;
-
-function _ndResetScoring() {
-    _ndHits = 0;
-    _ndMisses = 0;
-    _ndStreak = 0;
-    _ndBestStreak = 0;
-    _ndNoteResults.clear();
-    _ndSectionStats = [];
-    _ndCurrentSection = null;
-    _ndDetectedMidi = -1;
-    _ndDetectedConfidence = 0;
-    _ndDetectedString = -1;
-    _ndDetectedFret = -1;
-}
-
-// ── End-of-song Summary ────────────────────────────────────────────────────
-
-function _ndShowSummary() {
-    const total = _ndHits + _ndMisses;
-    if (total < 5) return; // not enough data
-
-    let overlay = document.getElementById('nd-summary-overlay');
-    if (overlay) overlay.remove();
-
-    const accuracy = Math.round((_ndHits / total) * 100);
-
-    let sectionHtml = '';
-    if (_ndSectionStats.length > 0) {
-        sectionHtml = '<div class="mt-3 text-xs"><div class="text-gray-400 mb-1">Per Section:</div>';
-        for (const sec of _ndSectionStats) {
-            const secTotal = sec.hits + sec.misses;
-            const secAcc = secTotal > 0 ? Math.round((sec.hits / secTotal) * 100) : 0;
-            const barColor = secAcc >= 90 ? 'bg-green-500' : secAcc >= 70 ? 'bg-yellow-500' : 'bg-red-500';
-            sectionHtml += `
-                <div class="flex items-center gap-2 mb-1">
-                    <span class="w-24 truncate text-gray-300">${sec.name}</span>
-                    <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
-                        <div class="${barColor} h-full rounded" style="width:${secAcc}%"></div>
-                    </div>
-                    <span class="w-10 text-right text-gray-400">${secAcc}%</span>
-                </div>
-            `;
-        }
-        sectionHtml += '</div>';
+        matchNotes();
     }
 
-    overlay = document.createElement('div');
-    overlay.id = 'nd-summary-overlay';
-    overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
-    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    overlay.innerHTML = `
-        <div class="bg-dark-700 border border-gray-600 rounded-2xl p-6 w-80 shadow-2xl">
-            <div class="text-center mb-4">
-                <div class="text-3xl font-bold ${accuracy >= 90 ? 'text-green-400' : accuracy >= 70 ? 'text-yellow-400' : 'text-red-400'}">${accuracy}%</div>
-                <div class="text-gray-400 text-sm">Accuracy</div>
-            </div>
-            <div class="grid grid-cols-3 gap-3 text-center text-sm mb-3">
-                <div>
-                    <div class="text-green-400 font-bold">${_ndHits}</div>
-                    <div class="text-gray-500 text-xs">Hits</div>
-                </div>
-                <div>
-                    <div class="text-red-400 font-bold">${_ndMisses}</div>
-                    <div class="text-gray-500 text-xs">Misses</div>
-                </div>
-                <div>
-                    <div class="text-blue-400 font-bold">${_ndBestStreak}</div>
-                    <div class="text-gray-500 text-xs">Best Streak</div>
-                </div>
-            </div>
-            ${sectionHtml}
-            <button onclick="this.parentElement.parentElement.remove()"
-                    class="mt-4 w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
-                Close
-            </button>
-        </div>
-    `;
-    document.body.appendChild(overlay);
+    // ── Note Matching ─────────────────────────────────────────────────────
 
-    // Publish to Practice Journal if installed
-    _ndPublishToJournal(accuracy);
-}
+    function matchNotes() {
+        const t = hw.getTime() - latencyOffset;
+        if (detectedMidi < 0) return;
 
-// ── Practice Journal Integration ───────────────────────────────────────────
+        const notes = hw.getNotes();
+        const chords = hw.getChords();
+        const tolerance = timingTolerance;
+        const centsTol = pitchTolerance;
 
-function _ndPublishToJournal(accuracy) {
-    // Check if practice_journal plugin exists by looking for its API
-    const info = highway.getSongInfo();
-    if (!info) return;
+        const candidates = [];
 
-    try {
-        // Fire a custom event that the practice journal plugin can listen for
-        window.dispatchEvent(new CustomEvent('notedetect:session', {
-            detail: {
-                title: info.title,
-                artist: info.artist,
-                arrangement: info.arrangement,
-                accuracy: accuracy,
-                hits: _ndHits,
-                misses: _ndMisses,
-                bestStreak: _ndBestStreak,
-                sections: _ndSectionStats.map(s => ({
-                    name: s.name,
-                    accuracy: (s.hits + s.misses) > 0 ? Math.round(s.hits / (s.hits + s.misses) * 100) : 0,
-                })),
-                timestamp: new Date().toISOString(),
+        if (notes && notes.length > 0) {
+            const start = _ndBsearch(notes, t - tolerance);
+            for (let i = start; i < notes.length; i++) {
+                const n = notes[i];
+                if (n.t > t + tolerance) break;
+                if (n.mt) continue;
+                candidates.push({ s: n.s, f: n.f, t: n.t });
             }
-        }));
-    } catch (e) { /* journal not installed, ignore */ }
+        }
+        if (chords && chords.length > 0) {
+            const start = _ndBsearch(chords, t - tolerance);
+            for (let i = start; i < chords.length; i++) {
+                const c = chords[i];
+                if (c.t > t + tolerance) break;
+                for (const cn of (c.notes || [])) {
+                    if (cn.mt) continue;
+                    candidates.push({ s: cn.s, f: cn.f, t: c.t });
+                }
+            }
+        }
+
+        for (const cn of candidates) {
+            const key = _ndNoteKey(cn, cn.t);
+            if (noteResults.has(key)) continue;
+
+            const expectedMidi = midiFromStringFret(cn.s, cn.f);
+            const detectedCents = (detectedMidi - expectedMidi) * 100;
+
+            if (Math.abs(detectedCents) <= centsTol) {
+                noteResults.set(key, 'hit');
+                hits++;
+                streak++;
+                if (streak > bestStreak) bestStreak = streak;
+                updateSectionStat('hit');
+            }
+        }
+    }
+
+    function checkMisses() {
+        if (!enabled) return;
+        const t = hw.getTime() - latencyOffset;
+        const tolerance = timingTolerance;
+        const missDeadline = t - tolerance * 2;
+        const notes = hw.getNotes();
+        const chords = hw.getChords();
+
+        const checkNote = (s, f, noteTime) => {
+            if (noteTime > missDeadline) return;
+            const key = _ndNoteKey({ s, f }, noteTime);
+            if (!noteResults.has(key)) {
+                noteResults.set(key, 'miss');
+                misses++;
+                streak = 0;
+                updateSectionStat('miss');
+            }
+        };
+
+        if (notes && notes.length > 0) {
+            const start = _ndBsearch(notes, missDeadline - 1);
+            for (let i = start; i < notes.length; i++) {
+                const n = notes[i];
+                if (n.t > missDeadline) break;
+                if (n.mt) continue;
+                checkNote(n.s, n.f, n.t);
+            }
+        }
+        if (chords && chords.length > 0) {
+            const start = _ndBsearch(chords, missDeadline - 1);
+            for (let i = start; i < chords.length; i++) {
+                const c = chords[i];
+                if (c.t > missDeadline) break;
+                for (const cn of (c.notes || [])) {
+                    if (cn.mt) continue;
+                    checkNote(cn.s, cn.f, c.t);
+                }
+            }
+        }
+
+        const sections = hw.getSections();
+        if (sections) {
+            let current = null;
+            for (const sec of sections) {
+                if (sec.time <= t) current = sec.name;
+                else break;
+            }
+            if (current && current !== currentSection) {
+                currentSection = current;
+                if (!sectionStats.find(s => s.name === current)) {
+                    sectionStats.push({ name: current, hits: 0, misses: 0 });
+                }
+            }
+        }
+    }
+
+    function updateSectionStat(type) {
+        if (!currentSection) return;
+        let sec = sectionStats.find(s => s.name === currentSection);
+        if (!sec) {
+            sec = { name: currentSection, hits: 0, misses: 0 };
+            sectionStats.push(sec);
+        }
+        if (type === 'hit') sec.hits++;
+        else sec.misses++;
+    }
+
+    function resetScoring() {
+        hits = 0;
+        misses = 0;
+        streak = 0;
+        bestStreak = 0;
+        noteResults.clear();
+        sectionStats = [];
+        currentSection = null;
+        detectedMidi = -1;
+        detectedConfidence = 0;
+        detectedString = -1;
+        detectedFret = -1;
+    }
+
+    // ── Settings Panel ────────────────────────────────────────────────────
+
+    function showSettings() {
+        if (!instanceRoot) return;
+        let panel = instanceRoot.querySelector('.nd-settings-panel');
+        if (panel) { panel.remove(); return; }
+
+        panel = document.createElement('div');
+        panel.className = 'nd-settings-panel fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 shadow-2xl text-sm';
+        panel.innerHTML = `
+            <div class="flex justify-between items-center mb-3">
+                <span class="text-gray-200 font-semibold">Note Detection Settings</span>
+                <button class="nd-close-settings text-gray-500 hover:text-white">&times;</button>
+            </div>
+
+            <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
+            <select class="nd-device-select w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2">
+                <option value="">Default</option>
+            </select>
+
+            <label class="block text-gray-400 text-xs mb-1">Input Channel</label>
+            <select class="nd-channel-select w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2">
+                <option value="mono" ${selectedChannel === 'mono' ? 'selected' : ''}>Mono (mix both channels)</option>
+                <option value="left" ${selectedChannel === 'left' ? 'selected' : ''}>Left (Ch 1) — typically dry/DI</option>
+                <option value="right" ${selectedChannel === 'right' ? 'selected' : ''}>Right (Ch 2) — typically wet/FX</option>
+            </select>
+
+            <label class="block text-gray-400 text-xs mb-1">Input Level</label>
+            <div class="relative h-3 bg-dark-600 rounded overflow-hidden mb-1">
+                <div class="nd-vu-bar h-full rounded transition-all duration-75 bg-green-500" style="width:0%"></div>
+                <div class="nd-vu-peak absolute top-0 w-0.5 h-full bg-white/70" style="left:0%"></div>
+            </div>
+            <div class="flex justify-between text-[9px] text-gray-600 mb-3">
+                <span>-inf</span><span>-18dB</span><span>-6dB</span><span>0dB</span>
+            </div>
+
+            <label class="block text-gray-400 text-xs mb-1">Detection Method</label>
+            <select class="nd-method-select w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-3">
+                <option value="yin" ${detectionMethod === 'yin' ? 'selected' : ''}>YIN (lightweight, clean signals)</option>
+                <option value="crepe" ${detectionMethod === 'crepe' ? 'selected' : ''}>CREPE/SPICE (robust, ~20MB model)</option>
+            </select>
+
+            <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span class="nd-latency-val">${Math.round(latencyOffset * 1000)}</span>ms</label>
+            <input type="range" min="0" max="250" value="${Math.round(latencyOffset * 1000)}"
+                   class="nd-latency-slider w-full accent-green-400 mb-2">
+            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+                Compensates for USB/audio interface delay. Increase if notes register late.
+            </div>
+
+            <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span class="nd-timing-val">${Math.round(timingTolerance * 1000)}</span>ms</label>
+            <input type="range" min="30" max="300" value="${Math.round(timingTolerance * 1000)}"
+                   class="nd-timing-slider w-full accent-green-400 mb-3">
+
+            <label class="block text-gray-400 text-xs mb-1">Pitch Tolerance: <span class="nd-pitch-val">${pitchTolerance}</span> cents</label>
+            <input type="range" min="10" max="100" value="${pitchTolerance}"
+                   class="nd-pitch-slider w-full accent-green-400 mb-3">
+
+            <label class="block text-gray-400 text-xs mb-1">Input Gain: <span class="nd-gain-val">${inputGain.toFixed(1)}</span>x</label>
+            <input type="range" min="1" max="50" value="${Math.round(inputGain * 10)}"
+                   class="nd-gain-slider w-full accent-green-400 mb-3">
+
+            <div class="text-[10px] text-gray-600 mt-1 leading-tight">
+                Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
+            </div>
+        `;
+
+        // Wire up event handlers
+        panel.querySelector('.nd-close-settings').onclick = () => panel.remove();
+        panel.querySelector('.nd-device-select').onchange = function() { onDeviceChange(this.value); };
+        panel.querySelector('.nd-channel-select').onchange = function() { onChannelChange(this.value); };
+        panel.querySelector('.nd-method-select').onchange = function() { setMethod(this.value); };
+        panel.querySelector('.nd-latency-slider').oninput = function() {
+            latencyOffset = this.value / 1000;
+            panel.querySelector('.nd-latency-val').textContent = this.value;
+            saveSettings();
+        };
+        panel.querySelector('.nd-timing-slider').oninput = function() {
+            timingTolerance = this.value / 1000;
+            panel.querySelector('.nd-timing-val').textContent = this.value;
+            saveSettings();
+        };
+        panel.querySelector('.nd-pitch-slider').oninput = function() {
+            pitchTolerance = +this.value;
+            panel.querySelector('.nd-pitch-val').textContent = this.value;
+            saveSettings();
+        };
+        panel.querySelector('.nd-gain-slider').oninput = function() {
+            inputGain = this.value / 10;
+            panel.querySelector('.nd-gain-val').textContent = inputGain.toFixed(1);
+            if (gainNode) gainNode.gain.value = inputGain;
+            saveSettings();
+        };
+
+        instanceRoot.appendChild(panel);
+        populateDevices();
+    }
+
+    function onDeviceChange(deviceId) {
+        selectedDeviceId = deviceId;
+        saveSettings();
+        restartAudio();
+    }
+
+    function onChannelChange(channel) {
+        selectedChannel = channel;
+        saveSettings();
+        restartAudio();
+    }
+
+    async function populateDevices() {
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            if (!instanceRoot) return;
+            const sel = instanceRoot.querySelector('.nd-device-select');
+            if (!sel) return;
+            sel.innerHTML = '<option value="">Default</option>';
+            for (const d of devices) {
+                if (d.kind !== 'audioinput') continue;
+                const opt = document.createElement('option');
+                opt.value = d.deviceId;
+                opt.textContent = d.label || `Input ${d.deviceId.slice(0, 8)}`;
+                if (d.deviceId === selectedDeviceId) opt.selected = true;
+                sel.appendChild(opt);
+            }
+        } catch (e) { /* permission not yet granted */ }
+    }
+
+    async function restartAudio() {
+        stopAudio();
+        if (enabled) await startAudio();
+    }
+
+    function setMethod(method) {
+        detectionMethod = method;
+        saveSettings();
+        if (method === 'crepe') _ndLoadCrepe(updateButtonText);
+    }
+
+    // ── Visual Feedback ───────────────────────────────────────────────────
+
+    function createHUD() {
+        if (!instanceRoot) return;
+        if (instanceRoot.querySelector('.nd-hud')) return;
+        const hud = document.createElement('div');
+        hud.className = 'nd-hud absolute top-3 right-16 z-[20] pointer-events-none text-right';
+        const target = container || document.getElementById('player');
+        if (!target) return;
+        hud.innerHTML = `
+            <div class="nd-hud-accuracy text-xl font-bold" style="text-shadow:0 0 8px currentColor"></div>
+            <div class="nd-hud-streak text-xs text-gray-400 mt-0.5"></div>
+            <div class="nd-hud-counts text-[10px] text-gray-600 mt-0.5"></div>
+            <div class="nd-hud-detected text-[10px] text-cyan-400 mt-1 font-mono"></div>
+        `;
+        target.appendChild(hud);
+    }
+
+    function removeHUD() {
+        if (!instanceRoot) return;
+        const hud = instanceRoot.querySelector('.nd-hud');
+        if (hud) hud.remove();
+        const flash = instanceRoot.querySelector('.nd-flash-overlay');
+        if (flash) flash.remove();
+    }
+
+    function createFlashOverlay() {
+        if (!instanceRoot) return;
+        if (instanceRoot.querySelector('.nd-flash-overlay')) return;
+        const target = container || document.getElementById('player');
+        if (!target) return;
+        const flash = document.createElement('div');
+        flash.className = 'nd-flash-overlay';
+        flash.style.cssText = 'position:absolute;inset:0;z-index:20;pointer-events:none;border:4px solid transparent;transition:border-color 0.05s;';
+        target.appendChild(flash);
+    }
+
+    function startHUD() {
+        createHUD();
+        createFlashOverlay();
+        lastHitCount = 0;
+        lastMissCount = 0;
+        if (hudInterval) clearInterval(hudInterval);
+        hudInterval = setInterval(updateHUD, 33);
+    }
+
+    function stopHUD() {
+        if (hudInterval) { clearInterval(hudInterval); hudInterval = null; }
+        removeHUD();
+    }
+
+    function updateHUD() {
+        if (!enabled || !instanceRoot) return;
+
+        const total = hits + misses;
+        const accEl = instanceRoot.querySelector('.nd-hud-accuracy');
+        const streakEl = instanceRoot.querySelector('.nd-hud-streak');
+        const countsEl = instanceRoot.querySelector('.nd-hud-counts');
+        const detectedEl = instanceRoot.querySelector('.nd-hud-detected');
+        const flashEl = instanceRoot.querySelector('.nd-flash-overlay');
+
+        if (accEl && total > 0) {
+            const accuracy = Math.round((hits / total) * 100);
+            const color = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
+            accEl.textContent = accuracy + '%';
+            accEl.style.color = color;
+        } else if (accEl) {
+            accEl.textContent = '';
+        }
+
+        if (streakEl) {
+            let text = streak > 0 ? `${streak} streak` : '';
+            if (bestStreak > 0) text += `  best: ${bestStreak}`;
+            streakEl.textContent = text;
+        }
+
+        if (countsEl && total > 0) {
+            countsEl.textContent = `${hits} / ${total}`;
+        }
+
+        if (detectedEl) {
+            if (detectedString >= 0 && detectedConfidence > 0.3) {
+                const names = ['E2','A2','D3','G3','B3','E4'];
+                detectedEl.textContent = `${names[detectedString] || '?'} fret ${detectedFret}`;
+            } else {
+                detectedEl.textContent = '';
+            }
+        }
+
+        if (flashEl) {
+            if (hits > lastHitCount) {
+                flashEl.style.borderColor = 'rgba(0, 255, 136, 0.6)';
+                const t = setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
+                flashTimeouts.push(t);
+            } else if (misses > lastMissCount) {
+                flashEl.style.borderColor = 'rgba(255, 50, 68, 0.4)';
+                const t = setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
+                flashTimeouts.push(t);
+            }
+            lastHitCount = hits;
+            lastMissCount = misses;
+        }
+    }
+
+    // ── 2D Draw Hook ──────────────────────────────────────────────────────
+
+    function registerDrawHook() {
+        if (drawHookFn) return;
+        drawHookFn = function(ctx, W, H) {
+            if (!enabled) return;
+            if (!hw.project || !hw.fretX) return;
+
+            const t = hw.getTime();
+            const notes = hw.getNotes();
+            const chords = hw.getChords();
+
+            const drawIndicator = (s, f, noteTime, result) => {
+                const tOff = noteTime - t;
+                const p = hw.project(tOff);
+                if (!p) return;
+                const x = hw.fretX(f, p.scale, W);
+                const y = p.y * H;
+
+                const age = Math.abs(t - noteTime);
+                const fade = Math.max(0, 1 - age / 0.6) * p.scale;
+                if (fade <= 0) return;
+
+                if (result === 'hit') {
+                    ctx.save();
+                    ctx.globalAlpha = fade * 0.7;
+                    ctx.shadowColor = '#00ff88';
+                    ctx.shadowBlur = 20 * p.scale;
+                    ctx.strokeStyle = '#00ff88';
+                    ctx.lineWidth = 3 * p.scale;
+                    ctx.beginPath();
+                    ctx.arc(x, y, 14 * p.scale, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.restore();
+                } else if (result === 'miss') {
+                    ctx.save();
+                    ctx.globalAlpha = fade * 0.5;
+                    ctx.shadowColor = '#ff3344';
+                    ctx.shadowBlur = 12 * p.scale;
+                    ctx.strokeStyle = '#ff3344';
+                    ctx.lineWidth = 2 * p.scale;
+                    const sz = 8 * p.scale;
+                    ctx.beginPath();
+                    ctx.moveTo(x - sz, y - sz);
+                    ctx.lineTo(x + sz, y + sz);
+                    ctx.moveTo(x + sz, y - sz);
+                    ctx.lineTo(x - sz, y + sz);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            };
+
+            if (notes) {
+                for (const n of notes) {
+                    if (n.t < t - 0.5) continue;
+                    if (n.t > t + 3) break;
+                    if (n.mt) continue;
+                    const key = _ndNoteKey(n, n.t);
+                    const result = noteResults.get(key);
+                    if (result) drawIndicator(n.s, n.f, n.t, result);
+                }
+            }
+            if (chords) {
+                for (const c of chords) {
+                    if (c.t < t - 0.5) continue;
+                    if (c.t > t + 3) break;
+                    for (const cn of (c.notes || [])) {
+                        if (cn.mt) continue;
+                        const key = _ndNoteKey(cn, c.t);
+                        const result = noteResults.get(key);
+                        if (result) drawIndicator(cn.s, cn.f, c.t, result);
+                    }
+                }
+            }
+
+            // Detected note indicator at now line
+            if (detectedString >= 0 && detectedConfidence > 0.3) {
+                const p = hw.project(0);
+                if (p) {
+                    const x = hw.fretX(detectedFret, p.scale, W);
+                    const y = p.y * H;
+                    ctx.save();
+                    ctx.globalAlpha = Math.min(1, detectedConfidence);
+                    ctx.fillStyle = '#44ddff';
+                    ctx.shadowColor = '#44ddff';
+                    ctx.shadowBlur = 12;
+                    ctx.beginPath();
+                    ctx.arc(x, y, 6, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.fillStyle = '#000';
+                    ctx.font = 'bold 7px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(detectedFret, x, y);
+                    ctx.restore();
+                }
+            }
+        };
+        hw.addDrawHook(drawHookFn);
+    }
+
+    // ── Button Injection ──────────────────────────────────────────────────
+
+    function updateButtonText(text) {
+        if (detectBtn) detectBtn.textContent = text;
+    }
+
+    function updateButton() {
+        if (!detectBtn) return;
+        if (enabled) {
+            detectBtn.className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+            detectBtn.textContent = 'Detect \u2713';
+        } else {
+            detectBtn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
+            detectBtn.textContent = 'Detect';
+        }
+        if (gearBtn) gearBtn.classList.toggle('hidden', !enabled);
+    }
+
+    // ── Summary ───────────────────────────────────────────────────────────
+
+    function showSummary() {
+        const total = hits + misses;
+        if (total < 5) return;
+
+        const existing = instanceRoot ? instanceRoot.querySelector('.nd-summary-overlay') : null;
+        if (existing) existing.remove();
+
+        const accuracy = Math.round((hits / total) * 100);
+
+        let sectionHtml = '';
+        if (sectionStats.length > 0) {
+            sectionHtml = '<div class="mt-3 text-xs"><div class="text-gray-400 mb-1">Per Section:</div>';
+            for (const sec of sectionStats) {
+                const secTotal = sec.hits + sec.misses;
+                const secAcc = secTotal > 0 ? Math.round((sec.hits / secTotal) * 100) : 0;
+                const barColor = secAcc >= 90 ? 'bg-green-500' : secAcc >= 70 ? 'bg-yellow-500' : 'bg-red-500';
+                sectionHtml += `
+                    <div class="flex items-center gap-2 mb-1">
+                        <span class="w-24 truncate text-gray-300">${sec.name}</span>
+                        <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
+                            <div class="${barColor} h-full rounded" style="width:${secAcc}%"></div>
+                        </div>
+                        <span class="w-10 text-right text-gray-400">${secAcc}%</span>
+                    </div>
+                `;
+            }
+            sectionHtml += '</div>';
+        }
+
+        const overlay = document.createElement('div');
+        overlay.className = 'nd-summary-overlay fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+        overlay.innerHTML = `
+            <div class="bg-dark-700 border border-gray-600 rounded-2xl p-6 w-80 shadow-2xl">
+                <div class="text-center mb-4">
+                    <div class="text-3xl font-bold ${accuracy >= 90 ? 'text-green-400' : accuracy >= 70 ? 'text-yellow-400' : 'text-red-400'}">${accuracy}%</div>
+                    <div class="text-gray-400 text-sm">Accuracy</div>
+                </div>
+                <div class="grid grid-cols-3 gap-3 text-center text-sm mb-3">
+                    <div>
+                        <div class="text-green-400 font-bold">${hits}</div>
+                        <div class="text-gray-500 text-xs">Hits</div>
+                    </div>
+                    <div>
+                        <div class="text-red-400 font-bold">${misses}</div>
+                        <div class="text-gray-500 text-xs">Misses</div>
+                    </div>
+                    <div>
+                        <div class="text-blue-400 font-bold">${bestStreak}</div>
+                        <div class="text-gray-500 text-xs">Best Streak</div>
+                    </div>
+                </div>
+                ${sectionHtml}
+                <button class="nd-close-summary mt-4 w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
+                    Close
+                </button>
+            </div>
+        `;
+        overlay.querySelector('.nd-close-summary').onclick = () => overlay.remove();
+        document.body.appendChild(overlay);
+
+        publishToJournal(accuracy);
+    }
+
+    function publishToJournal(accuracy) {
+        const info = hw.getSongInfo();
+        if (!info) return;
+        try {
+            window.dispatchEvent(new CustomEvent('notedetect:session', {
+                detail: {
+                    title: info.title,
+                    artist: info.artist,
+                    arrangement: info.arrangement,
+                    accuracy: accuracy,
+                    hits: hits,
+                    misses: misses,
+                    bestStreak: bestStreak,
+                    sections: sectionStats.map(s => ({
+                        name: s.name,
+                        accuracy: (s.hits + s.misses) > 0 ? Math.round(s.hits / (s.hits + s.misses) * 100) : 0,
+                    })),
+                    timestamp: new Date().toISOString(),
+                }
+            }));
+        } catch (e) { /* journal not installed */ }
+    }
+
+    // ── Enable / Disable ──────────────────────────────────────────────────
+
+    async function enable() {
+        if (enabled) return;
+        enabled = true;
+        updateButton();
+
+        const info = hw.getSongInfo();
+        if (info && info.tuning) tuningOffsets = info.tuning;
+        if (info && info.capo !== undefined) capo = info.capo;
+
+        resetScoring();
+
+        const ok = await startAudio();
+        if (!ok) {
+            enabled = false;
+            updateButton();
+            return;
+        }
+
+        missCheckInterval = setInterval(checkMisses, 100);
+        startHUD();
+        registerDrawHook();
+
+        // GC interval
+        gcInterval = setInterval(() => {
+            if (!enabled || noteResults.size < 500) return;
+            const t = hw.getTime();
+            for (const [key] of noteResults) {
+                const noteTime = parseFloat(key.split('_')[0]);
+                if (noteTime < t - 5) noteResults.delete(key);
+            }
+        }, 5000);
+
+        if (detectionMethod === 'crepe') _ndLoadCrepe(updateButtonText);
+    }
+
+    function disable() {
+        if (!enabled) return;
+        enabled = false;
+        updateButton();
+        stopAudio();
+        stopHUD();
+        if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
+        if (gcInterval) { clearInterval(gcInterval); gcInterval = null; }
+        flashTimeouts.forEach(clearTimeout);
+        flashTimeouts.length = 0;
+
+        showSummary();
+
+        if (instanceRoot) {
+            const panel = instanceRoot.querySelector('.nd-settings-panel');
+            if (panel) panel.remove();
+        }
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────
+
+    // Instance root container
+    instanceRoot = document.createElement('div');
+    instanceRoot.className = 'nd-instance';
+
+    const api = {
+        enable: enable,
+        disable: disable,
+
+        destroy() {
+            if (enabled) {
+                enabled = false;
+                stopAudio();
+                stopHUD();
+            }
+            if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
+            if (gcInterval) { clearInterval(gcInterval); gcInterval = null; }
+            flashTimeouts.forEach(clearTimeout);
+            flashTimeouts.length = 0;
+            if (drawHookFn && hw.removeDrawHook) {
+                hw.removeDrawHook(drawHookFn);
+                drawHookFn = null;
+            }
+            if (instanceRoot) { instanceRoot.remove(); instanceRoot = null; }
+            if (detectBtn) { detectBtn.remove(); detectBtn = null; }
+            if (gearBtn) { gearBtn.remove(); gearBtn = null; }
+            _ndInstances.delete(api);
+        },
+
+        isEnabled() { return enabled; },
+
+        getStats() {
+            const total = hits + misses;
+            return {
+                hits, misses, streak, bestStreak,
+                accuracy: total > 0 ? Math.round((hits / total) * 100) : 0,
+                sectionStats: sectionStats.slice(),
+            };
+        },
+
+        setChannel(idx) {
+            selectedChannel = idx === 0 ? 'left' : idx === 1 ? 'right' : 'mono';
+            saveSettings();
+            restartAudio();
+        },
+
+        injectButton(bar) {
+            const controls = bar || document.getElementById('player-controls');
+            if (!controls) return;
+            if (detectBtn && controls.contains(detectBtn)) return;
+
+            const closeBtn = controls.querySelector('button:last-child');
+
+            detectBtn = document.createElement('button');
+            detectBtn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
+            detectBtn.textContent = 'Detect';
+            detectBtn.title = 'Toggle real-time note detection & scoring';
+            detectBtn.onclick = async () => {
+                if (enabled) disable();
+                else await enable();
+            };
+            controls.insertBefore(detectBtn, closeBtn);
+
+            gearBtn = document.createElement('button');
+            gearBtn.className = 'px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
+            gearBtn.textContent = '\u2699';
+            gearBtn.title = 'Note detection settings';
+            gearBtn.onclick = showSettings;
+            controls.insertBefore(gearBtn, closeBtn);
+
+            // Attach instance root near the controls for scoped DOM queries
+            const target = container || document.getElementById('player');
+            if (target && !target.contains(instanceRoot)) {
+                target.appendChild(instanceRoot);
+            }
+        },
+
+        showSummary: showSummary,
+    };
+
+    _ndInstances.add(api);
+    return api;
 }
 
-// ── Garbage Collection ─────────────────────────────────────────────────────
-// Prune old note results to prevent unbounded memory growth
+// ── Default Singleton ─────────────────────────────────────────────────────
+const noteDetect = createNoteDetector();
+window.noteDetect = noteDetect;
+window.createNoteDetector = createNoteDetector;
 
-setInterval(() => {
-    if (!_ndEnabled || _ndNoteResults.size < 500) return;
-    const t = highway.getTime();
-    for (const [key, _] of _ndNoteResults) {
-        const noteTime = parseFloat(key.split('_')[0]);
-        if (noteTime < t - 5) _ndNoteResults.delete(key);
-    }
-}, 5000);
-
-// ── Hook into playSong ─────────────────────────────────────────────────────
-
+// ── Hook into playSong ────────────────────────────────────────────────────
 (function() {
     const origPlaySong = window.playSong;
     window.playSong = async function(filename, arrangement) {
-        // Reset state on new song
-        if (_ndEnabled) {
-            _ndStopAudio();
-            _ndStopHUD();
-            if (_ndMissCheckInterval) { clearInterval(_ndMissCheckInterval); _ndMissCheckInterval = null; }
-            _ndEnabled = false;
+        // Disable all active instances
+        for (const inst of _ndInstances) {
+            if (inst.isEnabled()) {
+                inst.disable();
+            }
         }
-        _ndResetScoring();
+        // Reset default singleton scoring
         await origPlaySong(filename, arrangement);
-        _ndInjectButton();
-
-        // Read tuning from newly loaded song
-        const info = highway.getSongInfo();
-        if (info && info.tuning) {
-            _ndTuningOffsets = info.tuning;
-        }
-        if (info && info.capo !== undefined) {
-            _ndCapo = info.capo;
-        }
+        noteDetect.injectButton();
     };
 })();
