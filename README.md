@@ -1,6 +1,6 @@
 # Slopsmith Note Detection Plugin
 
-Real-time guitar pitch detection and scoring for [Slopsmith](https://github.com/byrongamatos/slopsmith). Captures audio from your browser's audio input, detects the pitch being played, compares it against the notes on the highway, and shows hit/miss feedback with accuracy scoring.
+Real-time pitch detection and scoring for [Slopsmith](https://github.com/byrongamatos/slopsmith) — works on both **guitar** (6-string) and **bass** (4-string) arrangements. The active tuning base is selected automatically from the loaded arrangement. Captures audio from your browser's audio input, detects the pitch being played, compares it against the notes on the highway, and shows hit/miss feedback with accuracy scoring.
 
 ## Install
 
@@ -67,6 +67,20 @@ TensorFlow.js neural network model (~20MB, loaded lazily on first use). More rob
 - Browser with `getUserMedia` support (all modern browsers)
 - Audio input device (built-in mic, USB audio interface, or USB multi-effects pedal)
 - Slopsmith core with `highway.getSongInfo()` tuning data (v1.x+)
+
+## Tests
+
+    npm test
+
+Runs a Node `vm`-based harness (Node 18+, no dependencies) that loads the shipped
+`screen.js` against DOM stubs and exercises its real pitch-detection and mapping
+functions with synthetic signals. Tests cover YIN detection at guitar/bass
+frequencies, the arrangement-aware string/fret mapping, the chart-context-aware
+display fingering resolver, and noise-tolerance regression guards.
+
+See `test/README.md` for the full rationale. Adding tests when changing
+detection or mapping logic is encouraged — the `vm` loader means tests
+exercise the actual shipping code, not a parallel copy.
 
 ## License
 
