@@ -558,7 +558,13 @@ function _ndBsearch(arr, target) {
 function _ndMatchNotes() {
     // Compensate for audio input latency: the detected pitch corresponds to
     // what the player played ~latencyOffset ago, so shift the comparison window back.
-    const t = highway.getTime() - _ndLatencyOffset;
+    // Also add the core's A/V render offset so we match against the chart time
+    // the user was visually aiming at (the highway's rendered time = getTime() +
+    // avOffset). Without this, a non-zero A/V offset makes every detection miss
+    // by exactly that offset, since getTime() returns the audio-aligned chart
+    // time while the player is playing to the visually-shifted strum bar.
+    const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+    const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
     if (_ndDetectedMidi < 0) return;
 
     const notes = highway.getNotes();
@@ -618,7 +624,10 @@ function _ndMatchNotes() {
 // Mark missed notes that have passed the timing window
 function _ndCheckMisses() {
     if (!_ndEnabled) return;
-    const t = highway.getTime() - _ndLatencyOffset;
+    // Mirror _ndMatchNotes's time derivation so hit/miss are measured on the
+    // same clock (visual-target time the player is actually aiming at).
+    const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+    const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
     const tolerance = _ndTimingTolerance;
     const missDeadline = t - tolerance * 2; // notes older than this are missed
     const notes = highway.getNotes();
