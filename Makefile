@@ -3,16 +3,21 @@
 # Point SLOPSMITH_DIR at your slopsmith checkout (default: ../slopsmith).
 # `make dev` brings up slopsmith with this plugin mounted via a compose overlay;
 # edits to screen.js are live on the next page load.
+#
+# Put your per-machine settings (DLC_PATH, SLOPSMITH_PORT, SLOPSMITH_DIR) in
+# a .env file next to this Makefile. It's gitignored and auto-loaded by both
+# Make and Docker Compose, so `make dev` works without inline env vars.
+# See .env.example for the full list.
+
+# Load .env if present and export every variable it defines to the child
+# processes Make spawns (compose needs them visible in its env, not just Make's).
+-include .env
+export
 
 SLOPSMITH_DIR  ?= $(abspath ../slopsmith)
 SLOPSMITH_PORT ?= 8000
 PLUGIN_DIR     := $(abspath .)
 OVERLAY        := $(PLUGIN_DIR)/docker-compose.slopsmith.yml
-# PLUGIN_DIR is exported so the overlay's ${PLUGIN_DIR} resolves to this repo.
-# Compose resolves relative volume paths from the first -f file's dir, not
-# the overlay's, which is why an absolute path is required.
-export PLUGIN_DIR
-export SLOPSMITH_PORT
 COMPOSE        := docker compose -f $(SLOPSMITH_DIR)/docker-compose.yml -f $(OVERLAY)
 
 # PipeWire software monitor — routes your instrument input to speakers so you

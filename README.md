@@ -75,23 +75,45 @@ running Slopsmith container via `SLOPSMITH_PLUGINS_DIR` (upstream
 `slopsmith@b65a08c`). You edit `screen.js` here; the browser reload picks
 it up.
 
-Prereqs: a Slopsmith checkout with a working `docker-compose.yml` (`DLC_PATH`
-already set, etc.), Docker Compose v2.
+Prereqs: a Slopsmith checkout (`../slopsmith` by default) and Docker
+Compose v2.
+
+### Two workflows
+
+| What you're doing | Where | How |
+|---|---|---|
+| Running Slopsmith without touching this plugin | `~/src/slopsmith` | `DLC_PATH=... docker compose up -d` |
+| **Developing this plugin** (live-mounted into Slopsmith) | This repo | `make dev` |
+
+`make dev` is not a competing launcher — it uses `slopsmith/docker-compose.yml`
+plus `docker-compose.slopsmith.yml` (the overlay in this repo) to add the
+bind mount and the `SLOPSMITH_PLUGINS_DIR` env var. Edits to `screen.js`
+here are live on the next browser reload.
+
+### One-time setup
+
+Copy `.env.example` to `.env` and fill in your paths:
 
 ```bash
-# From this repo root:
-make help                        # list targets
-make test                        # run the node:test suite (no deps)
+cp .env.example .env
+# then edit — typical entries:
+#   SLOPSMITH_PORT=8088
+#   DLC_PATH=/home/you/slopsmith-dlc
+```
 
-# Assumes slopsmith is at ../slopsmith. Override if not:
-SLOPSMITH_DIR=~/code/slopsmith make dev
+`.env` is gitignored. The Makefile auto-loads it and exports each variable
+to Docker Compose; Compose also reads the file directly for `${…}`
+substitutions in the overlay.
 
-# If host port 8000 is taken:
-SLOPSMITH_PORT=8088 make dev
+### Daily use
 
-make logs                        # tail slopsmith container logs
-make verify-mount                # confirm the plugin is visible in the container
-make down                        # stop slopsmith
+```bash
+make help              # list targets
+make test              # run the node:test suite (no deps)
+make dev               # start slopsmith with this plugin mounted
+make logs              # tail the container
+make verify-mount      # confirm the plugin is visible inside
+make down              # stop slopsmith
 ```
 
 `make dev` launches Slopsmith at `http://localhost:$SLOPSMITH_PORT` with this
