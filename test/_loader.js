@@ -81,17 +81,34 @@ function loadDetectionCore() {
         if (process.env.TEST_DEBUG) console.error('[loader] screen.js threw:', err.message);
     }
 
-    const required = ['_ndYinDetect', '_ndFreqToMidi', '_ndMidiFromStringFret', '_ndMidiToStringFret'];
+    const required = [
+        '_ndYinDetect', '_ndFreqToMidi',
+        '_ndMidiFromStringFret', '_ndMidiToStringFret',
+        '_ndResolveDisplayFingering',
+    ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
         throw new Error(`Could not extract functions from screen.js: ${missing.join(', ')}`);
     }
 
+    // Objects created inside the vm sandbox have the sandbox's Object.prototype,
+    // so node:assert's deepEqual sees them as structurally-equal-but-not-reference-equal.
+    // Rewrap returned {string, fret} objects as plain main-realm literals.
+    const rewrapSf = (fn) => (...args) => {
+        const r = fn(...args);
+        return { string: r.string, fret: r.fret };
+    };
+    const rewrapYin = (fn) => (...args) => {
+        const r = fn(...args);
+        return { freq: r.freq, confidence: r.confidence, underBuffered: r.underBuffered };
+    };
+
     return {
-        yinDetect: sandbox._ndYinDetect,
+        yinDetect: rewrapYin(sandbox._ndYinDetect),
         freqToMidi: sandbox._ndFreqToMidi,
         midiFromStringFret: sandbox._ndMidiFromStringFret,
-        midiToStringFret: sandbox._ndMidiToStringFret,
+        midiToStringFret: rewrapSf(sandbox._ndMidiToStringFret),
+        resolveDisplayFingering: rewrapSf(sandbox._ndResolveDisplayFingering),
     };
 }
 

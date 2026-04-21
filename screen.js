@@ -477,12 +477,9 @@ async function _ndProcessFrame(buffer) {
     _ndDetectedMidi = _ndFreqToMidi(result.freq);
     _ndDetectedConfidence = result.confidence;
 
-    // Find best string/fret match
-    const sf = _ndMidiToStringFret(_ndDetectedMidi);
-    _ndDetectedString = sf.string;
-    _ndDetectedFret = sf.fret;
-
-    // Match against expected notes
+    // _ndMatchNotes walks the chart candidates and assigns
+    // _ndDetectedString/_ndDetectedFret via _ndResolveDisplayFingering
+    // (chart-aware, with geometric fallback).
     _ndMatchNotes();
 }
 
@@ -498,26 +495,46 @@ function _ndMidiFromStringFret(string, fret, arrangement = _ndCurrentArrangement
 }
 
 function _ndMidiToStringFret(midiNote, arrangement = _ndCurrentArrangement) {
-    // Find the string/fret combo closest to the detected pitch for the given
-    // arrangement. When multiple strings match at equal pitch distance, prefer
-    // the one with the lowest fret (open strings before fretted notes) — this
-    // is the fingering a player is most likely using on an open chart note.
+    // Pure geometric fallback: walk strings 0..N and return the first position
+    // that matches the pitch. Used when there is no chart context available
+    // (player noodling between chart notes). When a chart note is in play,
+    // _ndResolveDisplayFingering picks the chart's (s, f) instead — see the
+    // research notes in mapping-bass.test.js.
     const base = _ndStandardMidiFor(arrangement);
     let bestDist = Infinity;
-    let bestFret = Infinity;
     let bestString = -1;
+    let bestFret = -1;
     for (let s = 0; s < base.length; s++) {
         const openMidi = base[s] + _ndTuningOffsets[s] + _ndCapo;
         const fret = Math.round(midiNote - openMidi);
         if (fret < 0 || fret > 24) continue;
         const dist = Math.abs(midiNote - (openMidi + fret));
-        if (dist < bestDist || (dist === bestDist && fret < bestFret)) {
+        if (dist < bestDist) {
             bestDist = dist;
-            bestFret = fret;
             bestString = s;
+            bestFret = fret;
         }
     }
-    return { string: bestString, fret: bestFret === Infinity ? -1 : bestFret };
+    return { string: bestString, fret: bestFret };
+}
+
+// Chart-context-aware fingering resolver. If any candidate chart note's
+// expected pitch is within the pitch tolerance of the detected MIDI, return
+// that note's (string, fret) — the player is hitting the charted fingering.
+// Otherwise fall back to the geometric first-match on the arrangement's
+// tuning. This mirrors what score-follower apps (e.g. Rocksmith) do: trust
+// the chart for display when the player is on-pitch, only guess when they
+// aren't.
+function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement = _ndCurrentArrangement, pitchToleranceCents = _ndPitchTolerance) {
+    if (candidateNotes && candidateNotes.length > 0) {
+        for (const cn of candidateNotes) {
+            const expected = _ndMidiFromStringFret(cn.s, cn.f, arrangement);
+            if (Math.abs(detectedMidi - expected) * 100 <= pitchToleranceCents) {
+                return { string: cn.s, fret: cn.f };
+            }
+        }
+    }
+    return _ndMidiToStringFret(detectedMidi, arrangement);
 }
 
 // ── Note Matching ──────────────────────────────────────────────────────────
@@ -572,6 +589,13 @@ function _ndMatchNotes() {
             }
         }
     }
+
+    // Resolve HUD/overlay fingering — prefer the chart's (s, f) when the
+    // player is hitting a candidate pitch, otherwise fall back to the
+    // geometric first-match on the arrangement's tuning.
+    const disp = _ndResolveDisplayFingering(_ndDetectedMidi, candidateNotes, _ndCurrentArrangement, centsTolerance);
+    _ndDetectedString = disp.string;
+    _ndDetectedFret = disp.fret;
 
     // Check each candidate
     for (const cn of candidateNotes) {
