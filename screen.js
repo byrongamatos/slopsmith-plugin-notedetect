@@ -40,10 +40,27 @@ let _ndDetectedConfidence = 0;
 let _ndDetectedString = -1;
 let _ndDetectedFret = -1;
 
-// Tuning — standard tuning MIDI base per string, adjusted by arrangement offsets
-const _ndStandardMidi = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
+// Tuning — standard tuning MIDI base per string, adjusted by arrangement offsets.
+// Guitar: 6 strings, low E2 to high E4. Bass: 4 strings, low E1 to high G2
+// (one octave below guitar low-4 minus the top two). Arrangement type is
+// derived from song_info.arrangement name; see _ndSetArrangement.
+const _ndStandardMidiGuitar = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
+const _ndStandardMidiBass = [28, 33, 38, 43];           // E1 A1 D2 G2
+let _ndCurrentArrangement = 'guitar';                   // 'guitar' | 'bass'
 let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
 let _ndCapo = 0;
+
+function _ndArrangementKindFromName(name) {
+    return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
+}
+
+function _ndSetArrangement(name) {
+    _ndCurrentArrangement = _ndArrangementKindFromName(name);
+}
+
+function _ndStandardMidiFor(arrangement) {
+    return arrangement === 'bass' ? _ndStandardMidiBass : _ndStandardMidiGuitar;
+}
 
 // Audio processing — use native sample rate, accumulate samples for YIN
 let _ndAccumBuffer = new Float32Array(0);  // accumulates samples across frames
@@ -459,27 +476,32 @@ function _ndFreqToMidi(freq) {
     return 12 * Math.log2(freq / 440) + 69;
 }
 
-function _ndMidiFromStringFret(string, fret) {
-    return _ndStandardMidi[string] + _ndTuningOffsets[string] + _ndCapo + fret;
+function _ndMidiFromStringFret(string, fret, arrangement = _ndCurrentArrangement) {
+    const base = _ndStandardMidiFor(arrangement);
+    return base[string] + _ndTuningOffsets[string] + _ndCapo + fret;
 }
 
-function _ndMidiToStringFret(midiNote) {
-    // Find the string/fret combo closest to the detected pitch
+function _ndMidiToStringFret(midiNote, arrangement = _ndCurrentArrangement) {
+    // Find the string/fret combo closest to the detected pitch for the given
+    // arrangement. When multiple strings match at equal pitch distance, prefer
+    // the one with the lowest fret (open strings before fretted notes) — this
+    // is the fingering a player is most likely using on an open chart note.
+    const base = _ndStandardMidiFor(arrangement);
     let bestDist = Infinity;
+    let bestFret = Infinity;
     let bestString = -1;
-    let bestFret = -1;
-    for (let s = 0; s < 6; s++) {
-        const openMidi = _ndStandardMidi[s] + _ndTuningOffsets[s] + _ndCapo;
+    for (let s = 0; s < base.length; s++) {
+        const openMidi = base[s] + _ndTuningOffsets[s] + _ndCapo;
         const fret = Math.round(midiNote - openMidi);
         if (fret < 0 || fret > 24) continue;
         const dist = Math.abs(midiNote - (openMidi + fret));
-        if (dist < bestDist) {
+        if (dist < bestDist || (dist === bestDist && fret < bestFret)) {
             bestDist = dist;
-            bestString = s;
             bestFret = fret;
+            bestString = s;
         }
     }
-    return { string: bestString, fret: bestFret };
+    return { string: bestString, fret: bestFret === Infinity ? -1 : bestFret };
 }
 
 // ── Note Matching ──────────────────────────────────────────────────────────
@@ -1009,6 +1031,9 @@ async function _ndToggle() {
         if (info && info.capo !== undefined) {
             _ndCapo = info.capo;
         }
+        if (info && info.arrangement) {
+            _ndSetArrangement(info.arrangement);
+        }
 
         // Reset scoring
         _ndResetScoring();
@@ -1186,6 +1211,9 @@ setInterval(() => {
         }
         if (info && info.capo !== undefined) {
             _ndCapo = info.capo;
+        }
+        if (info && info.arrangement) {
+            _ndSetArrangement(info.arrangement);
         }
     };
 })();
