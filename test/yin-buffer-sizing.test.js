@@ -1,18 +1,16 @@
-// Proves: YIN silently fails for low bass frequencies when given an
-// undersized buffer.
+// Verifies: YIN surfaces "buffer too small for requested min frequency" as a
+// distinct state (result.underBuffered = true) rather than a silent -1.
 //
-// The plugin's Web Audio ScriptProcessor delivers 2048-sample frames
-// (_ndFrameSize = 2048). screen.js accumulates frames until at least
-// _ndMinYinSamples = 4096 before calling _ndYinDetect — but any bug in the
-// accumulation path, a timing edge case at song start, or a shorter frame
-// from a different input device would route an undersized buffer to YIN
-// and it returns {freq: -1} for low frequencies without any diagnostic.
+// Mathematically YIN cannot detect a period longer than its halfLen; at 48 kHz
+// a 41.2 Hz fundamental needs tau ~1165 samples, which requires halfLen > 1165,
+// i.e. buffer.length >= ~2400. A 2048-sample buffer (halfLen 1024) is strictly
+// incapable of detecting bass E1 — that's physics, not a bug. What WAS a bug:
+// the "no detection" result was indistinguishable from "true silence", so any
+// break in the frame-accumulation path would drop every bass note with no
+// diagnostic. The fix: return {underBuffered: true} when halfLen is below the
+// configured minimum frequency, and have the caller log once.
 //
-// YIN's halfLen = buffer.length / 2 caps the maximum detectable period to
-// halfLen samples; at 48 kHz a 41.2 Hz period needs ~1165 samples, so a
-// buffer of 2048 (halfLen 1024) cannot detect it. The plugin should either
-// reject undersized buffers explicitly, signal a diagnostic, or detect
-// adaptively. These tests document the current silent-fail behavior.
+// Tests accept either a valid detection OR an explicit underBuffered flag.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -29,20 +27,28 @@ test('YIN detects guitar E2 (82 Hz) with a single 2048-sample frame — baseline
     assert.ok(Math.abs(r.freq - 82.4) < 2, `expected ~82.4, got ${r.freq}`);
 });
 
-test('YIN detects bass E1 (41 Hz) with a single 2048-sample frame — CURRENTLY FAILS SILENTLY', () => {
+test('YIN signals underBuffered (not silent -1) for bass E1 with a 2048-sample frame', () => {
     const buf = sine(41.2, SR, 2048 / SR);
     const r = core.yinDetect(buf, SR);
     assert.ok(
-        r.freq > 0,
-        `bass E1 with 2048-sample buffer returned ${r.freq} (silent miss). ` +
-        `Plugin should either adaptively enlarge the buffer or surface a "buffer too small" state.`
+        r.freq > 0 || r.underBuffered === true,
+        `expected either detection or underBuffered flag; got ${JSON.stringify(r)}`
     );
 });
 
-test('YIN detects 5-string bass low B (31 Hz) with a single 2048-sample frame — CURRENTLY FAILS SILENTLY', () => {
+test('YIN signals underBuffered for 5-string low B with a 2048-sample frame', () => {
     const buf = sine(30.87, SR, 2048 / SR);
     const r = core.yinDetect(buf, SR);
-    assert.ok(r.freq > 0, `low-B returned ${r.freq} (silent miss)`);
+    assert.ok(
+        r.freq > 0 || r.underBuffered === true,
+        `expected either detection or underBuffered flag; got ${JSON.stringify(r)}`
+    );
+});
+
+test('YIN does NOT flag underBuffered at 4096 samples (enough for 30 Hz min)', () => {
+    const buf = sine(41.2, SR, 4096 / SR);
+    const r = core.yinDetect(buf, SR);
+    assert.equal(r.underBuffered, false);
 });
 
 test('YIN detects bass E1 (41 Hz) with 4096-sample buffer — the accumulated path works', () => {

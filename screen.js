@@ -49,6 +49,7 @@ const _ndStandardMidiBass = [28, 33, 38, 43];           // E1 A1 D2 G2
 let _ndCurrentArrangement = 'guitar';                   // 'guitar' | 'bass'
 let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
 let _ndCapo = 0;
+let _ndUnderBufferWarned = false;
 
 function _ndArrangementKindFromName(name) {
     return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
@@ -105,10 +106,21 @@ _ndLoadSettings();
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
 // Lightweight monophonic pitch detector — works instantly, no model to load.
 
-function _ndYinDetect(buffer, sampleRate) {
+// Lowest frequency we claim to detect. Below this and YIN's autocorrelation
+// window needs to be longer than the input — at 48 kHz a 30 Hz period is
+// ~1600 samples, so halfLen must exceed that, i.e. buffer must exceed ~3200.
+const _ND_MIN_DETECTABLE_HZ = 30;
+
+function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     const threshold = 0.15;
     const halfLen = Math.floor(buffer.length / 2);
     const yinBuffer = new Float32Array(halfLen);
+
+    // Surface "too-small buffer" as a distinct state from "no note detected"
+    // so callers (and tests) can tell the two apart. Without this, a broken
+    // accumulation path silently drops every bass note.
+    const minHalfLenForFreq = Math.ceil(sampleRate / minFreqHz);
+    const underBuffered = halfLen < minHalfLenForFreq;
 
     // Difference function
     let runningSum = 0;
@@ -133,7 +145,7 @@ function _ndYinDetect(buffer, sampleRate) {
         }
         tau++;
     }
-    if (tau === halfLen) return { freq: -1, confidence: 0 };
+    if (tau === halfLen) return { freq: -1, confidence: 0, underBuffered };
 
     // Parabolic interpolation
     const s0 = tau > 0 ? yinBuffer[tau - 1] : yinBuffer[tau];
@@ -143,7 +155,7 @@ function _ndYinDetect(buffer, sampleRate) {
 
     const freq = sampleRate / betterTau;
     const confidence = 1 - yinBuffer[tau];
-    return { freq, confidence: Math.max(0, confidence) };
+    return { freq, confidence: Math.max(0, confidence), underBuffered };
 }
 
 // ── Pitch Detection: CREPE ─────────────────────────────────────────────────
@@ -451,6 +463,10 @@ async function _ndProcessFrame(buffer) {
     }
 
     if (result.freq <= 0 || result.confidence < 0.3) {
+        if (result.underBuffered && !_ndUnderBufferWarned) {
+            console.warn('[note_detect] YIN received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.');
+            _ndUnderBufferWarned = true;
+        }
         _ndDetectedMidi = -1;
         _ndDetectedConfidence = 0;
         _ndDetectedString = -1;
