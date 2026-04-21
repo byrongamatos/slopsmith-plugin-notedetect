@@ -68,6 +68,47 @@ TensorFlow.js neural network model (~20MB, loaded lazily on first use). More rob
 - Audio input device (built-in mic, USB audio interface, or USB multi-effects pedal)
 - Slopsmith core with `highway.getSongInfo()` tuning data (v1.x+)
 
+## Develop locally
+
+The repo ships a `Makefile` + compose overlay that mounts this plugin into a
+running Slopsmith container via `SLOPSMITH_PLUGINS_DIR` (upstream
+`slopsmith@b65a08c`). You edit `screen.js` here; the browser reload picks
+it up.
+
+Prereqs: a Slopsmith checkout with a working `docker-compose.yml` (`DLC_PATH`
+already set, etc.), Docker Compose v2.
+
+```bash
+# From this repo root:
+make help                        # list targets
+make test                        # run the node:test suite (no deps)
+
+# Assumes slopsmith is at ../slopsmith. Override if not:
+SLOPSMITH_DIR=~/code/slopsmith make dev
+
+# If host port 8000 is taken:
+SLOPSMITH_PORT=8088 make dev
+
+make logs                        # tail slopsmith container logs
+make verify-mount                # confirm the plugin is visible in the container
+make down                        # stop slopsmith
+```
+
+`make dev` launches Slopsmith at `http://localhost:$SLOPSMITH_PORT` with this
+plugin mounted read-only at `/opt/user-plugins/note_detect`. The built-in
+`plugins/` directory still loads as usual; this plugin's `plugin.json.id` wins
+on the duplicate-id check so a previously-installed copy is safely shadowed.
+
+### Why not clone into `slopsmith/plugins/` directly?
+
+You can (the README's "Install" section describes that). The overlay approach
+is better for development because:
+
+- Your edits live in a git-tracked repo separate from the Slopsmith tree
+- No manual sync or symlinks
+- Swap branches without touching Slopsmith's working tree
+- `make down` cleans up; no leftovers in `slopsmith/plugins/`
+
 ## Tests
 
     npm test
