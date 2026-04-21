@@ -40,10 +40,28 @@ let _ndDetectedConfidence = 0;
 let _ndDetectedString = -1;
 let _ndDetectedFret = -1;
 
-// Tuning — standard tuning MIDI base per string, adjusted by arrangement offsets
-const _ndStandardMidi = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
+// Tuning — standard tuning MIDI base per string, adjusted by arrangement offsets.
+// Guitar: 6 strings, low E2 to high E4. Bass: 4 strings, low E1 to high G2
+// (one octave below guitar low-4 minus the top two). Arrangement type is
+// derived from song_info.arrangement name; see _ndSetArrangement.
+const _ndStandardMidiGuitar = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
+const _ndStandardMidiBass = [28, 33, 38, 43];           // E1 A1 D2 G2
+let _ndCurrentArrangement = 'guitar';                   // 'guitar' | 'bass'
 let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
 let _ndCapo = 0;
+let _ndUnderBufferWarned = false;
+
+function _ndArrangementKindFromName(name) {
+    return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
+}
+
+function _ndSetArrangement(name) {
+    _ndCurrentArrangement = _ndArrangementKindFromName(name);
+}
+
+function _ndStandardMidiFor(arrangement) {
+    return arrangement === 'bass' ? _ndStandardMidiBass : _ndStandardMidiGuitar;
+}
 
 // Audio processing — use native sample rate, accumulate samples for YIN
 let _ndAccumBuffer = new Float32Array(0);  // accumulates samples across frames
@@ -88,10 +106,21 @@ _ndLoadSettings();
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
 // Lightweight monophonic pitch detector — works instantly, no model to load.
 
-function _ndYinDetect(buffer, sampleRate) {
+// Lowest frequency we claim to detect. Below this and YIN's autocorrelation
+// window needs to be longer than the input — at 48 kHz a 30 Hz period is
+// ~1600 samples, so halfLen must exceed that, i.e. buffer must exceed ~3200.
+const _ND_MIN_DETECTABLE_HZ = 30;
+
+function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     const threshold = 0.15;
     const halfLen = Math.floor(buffer.length / 2);
     const yinBuffer = new Float32Array(halfLen);
+
+    // Surface "too-small buffer" as a distinct state from "no note detected"
+    // so callers (and tests) can tell the two apart. Without this, a broken
+    // accumulation path silently drops every bass note.
+    const minHalfLenForFreq = Math.ceil(sampleRate / minFreqHz);
+    const underBuffered = halfLen < minHalfLenForFreq;
 
     // Difference function
     let runningSum = 0;
@@ -116,7 +145,7 @@ function _ndYinDetect(buffer, sampleRate) {
         }
         tau++;
     }
-    if (tau === halfLen) return { freq: -1, confidence: 0 };
+    if (tau === halfLen) return { freq: -1, confidence: 0, underBuffered };
 
     // Parabolic interpolation
     const s0 = tau > 0 ? yinBuffer[tau - 1] : yinBuffer[tau];
@@ -126,7 +155,7 @@ function _ndYinDetect(buffer, sampleRate) {
 
     const freq = sampleRate / betterTau;
     const confidence = 1 - yinBuffer[tau];
-    return { freq, confidence: Math.max(0, confidence) };
+    return { freq, confidence: Math.max(0, confidence), underBuffered };
 }
 
 // ── Pitch Detection: CREPE ─────────────────────────────────────────────────
@@ -434,6 +463,10 @@ async function _ndProcessFrame(buffer) {
     }
 
     if (result.freq <= 0 || result.confidence < 0.3) {
+        if (result.underBuffered && !_ndUnderBufferWarned) {
+            console.warn('[note_detect] YIN received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.');
+            _ndUnderBufferWarned = true;
+        }
         _ndDetectedMidi = -1;
         _ndDetectedConfidence = 0;
         _ndDetectedString = -1;
@@ -444,12 +477,9 @@ async function _ndProcessFrame(buffer) {
     _ndDetectedMidi = _ndFreqToMidi(result.freq);
     _ndDetectedConfidence = result.confidence;
 
-    // Find best string/fret match
-    const sf = _ndMidiToStringFret(_ndDetectedMidi);
-    _ndDetectedString = sf.string;
-    _ndDetectedFret = sf.fret;
-
-    // Match against expected notes
+    // _ndMatchNotes walks the chart candidates and assigns
+    // _ndDetectedString/_ndDetectedFret via _ndResolveDisplayFingering
+    // (chart-aware, with geometric fallback).
     _ndMatchNotes();
 }
 
@@ -459,17 +489,23 @@ function _ndFreqToMidi(freq) {
     return 12 * Math.log2(freq / 440) + 69;
 }
 
-function _ndMidiFromStringFret(string, fret) {
-    return _ndStandardMidi[string] + _ndTuningOffsets[string] + _ndCapo + fret;
+function _ndMidiFromStringFret(string, fret, arrangement = _ndCurrentArrangement) {
+    const base = _ndStandardMidiFor(arrangement);
+    return base[string] + _ndTuningOffsets[string] + _ndCapo + fret;
 }
 
-function _ndMidiToStringFret(midiNote) {
-    // Find the string/fret combo closest to the detected pitch
+function _ndMidiToStringFret(midiNote, arrangement = _ndCurrentArrangement) {
+    // Pure geometric fallback: walk strings 0..N and return the first position
+    // that matches the pitch. Used when there is no chart context available
+    // (player noodling between chart notes). When a chart note is in play,
+    // _ndResolveDisplayFingering picks the chart's (s, f) instead — see the
+    // research notes in mapping-bass.test.js.
+    const base = _ndStandardMidiFor(arrangement);
     let bestDist = Infinity;
     let bestString = -1;
     let bestFret = -1;
-    for (let s = 0; s < 6; s++) {
-        const openMidi = _ndStandardMidi[s] + _ndTuningOffsets[s] + _ndCapo;
+    for (let s = 0; s < base.length; s++) {
+        const openMidi = base[s] + _ndTuningOffsets[s] + _ndCapo;
         const fret = Math.round(midiNote - openMidi);
         if (fret < 0 || fret > 24) continue;
         const dist = Math.abs(midiNote - (openMidi + fret));
@@ -480,6 +516,25 @@ function _ndMidiToStringFret(midiNote) {
         }
     }
     return { string: bestString, fret: bestFret };
+}
+
+// Chart-context-aware fingering resolver. If any candidate chart note's
+// expected pitch is within the pitch tolerance of the detected MIDI, return
+// that note's (string, fret) — the player is hitting the charted fingering.
+// Otherwise fall back to the geometric first-match on the arrangement's
+// tuning. This mirrors what score-follower apps (e.g. Rocksmith) do: trust
+// the chart for display when the player is on-pitch, only guess when they
+// aren't.
+function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement = _ndCurrentArrangement, pitchToleranceCents = _ndPitchTolerance) {
+    if (candidateNotes && candidateNotes.length > 0) {
+        for (const cn of candidateNotes) {
+            const expected = _ndMidiFromStringFret(cn.s, cn.f, arrangement);
+            if (Math.abs(detectedMidi - expected) * 100 <= pitchToleranceCents) {
+                return { string: cn.s, fret: cn.f };
+            }
+        }
+    }
+    return _ndMidiToStringFret(detectedMidi, arrangement);
 }
 
 // ── Note Matching ──────────────────────────────────────────────────────────
@@ -503,7 +558,13 @@ function _ndBsearch(arr, target) {
 function _ndMatchNotes() {
     // Compensate for audio input latency: the detected pitch corresponds to
     // what the player played ~latencyOffset ago, so shift the comparison window back.
-    const t = highway.getTime() - _ndLatencyOffset;
+    // Also add the core's A/V render offset so we match against the chart time
+    // the user was visually aiming at (the highway's rendered time = getTime() +
+    // avOffset). Without this, a non-zero A/V offset makes every detection miss
+    // by exactly that offset, since getTime() returns the audio-aligned chart
+    // time while the player is playing to the visually-shifted strum bar.
+    const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+    const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
     if (_ndDetectedMidi < 0) return;
 
     const notes = highway.getNotes();
@@ -535,6 +596,13 @@ function _ndMatchNotes() {
         }
     }
 
+    // Resolve HUD/overlay fingering — prefer the chart's (s, f) when the
+    // player is hitting a candidate pitch, otherwise fall back to the
+    // geometric first-match on the arrangement's tuning.
+    const disp = _ndResolveDisplayFingering(_ndDetectedMidi, candidateNotes, _ndCurrentArrangement, centsTolerance);
+    _ndDetectedString = disp.string;
+    _ndDetectedFret = disp.fret;
+
     // Check each candidate
     for (const cn of candidateNotes) {
         const key = _ndNoteKey(cn, cn.t);
@@ -556,7 +624,10 @@ function _ndMatchNotes() {
 // Mark missed notes that have passed the timing window
 function _ndCheckMisses() {
     if (!_ndEnabled) return;
-    const t = highway.getTime() - _ndLatencyOffset;
+    // Mirror _ndMatchNotes's time derivation so hit/miss are measured on the
+    // same clock (visual-target time the player is actually aiming at).
+    const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+    const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
     const tolerance = _ndTimingTolerance;
     const missDeadline = t - tolerance * 2; // notes older than this are missed
     const notes = highway.getNotes();
@@ -1009,6 +1080,9 @@ async function _ndToggle() {
         if (info && info.capo !== undefined) {
             _ndCapo = info.capo;
         }
+        if (info && info.arrangement) {
+            _ndSetArrangement(info.arrangement);
+        }
 
         // Reset scoring
         _ndResetScoring();
@@ -1186,6 +1260,9 @@ setInterval(() => {
         }
         if (info && info.capo !== undefined) {
             _ndCapo = info.capo;
+        }
+        if (info && info.arrangement) {
+            _ndSetArrangement(info.arrangement);
         }
     };
 })();

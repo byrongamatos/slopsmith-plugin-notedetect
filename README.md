@@ -1,6 +1,6 @@
 # Slopsmith Note Detection Plugin
 
-Real-time guitar pitch detection and scoring for [Slopsmith](https://github.com/byrongamatos/slopsmith). Captures audio from your browser's audio input, detects the pitch being played, compares it against the notes on the highway, and shows hit/miss feedback with accuracy scoring.
+Real-time pitch detection and scoring for [Slopsmith](https://github.com/byrongamatos/slopsmith) — works on both **guitar** (6-string) and **bass** (4-string) arrangements. The active tuning base is selected automatically from the loaded arrangement. Captures audio from your browser's audio input, detects the pitch being played, compares it against the notes on the highway, and shows hit/miss feedback with accuracy scoring.
 
 ## Install
 
@@ -67,6 +67,83 @@ TensorFlow.js neural network model (~20MB, loaded lazily on first use). More rob
 - Browser with `getUserMedia` support (all modern browsers)
 - Audio input device (built-in mic, USB audio interface, or USB multi-effects pedal)
 - Slopsmith core with `highway.getSongInfo()` tuning data (v1.x+)
+
+## Develop locally
+
+The repo ships a `Makefile` + compose overlay that mounts this plugin into a
+running Slopsmith container via `SLOPSMITH_PLUGINS_DIR` (upstream
+`slopsmith@b65a08c`). You edit `screen.js` here; the browser reload picks
+it up.
+
+Prereqs: a Slopsmith checkout (`../slopsmith` by default) and Docker
+Compose v2.
+
+### Two workflows
+
+| What you're doing | Where | How |
+|---|---|---|
+| Running Slopsmith without touching this plugin | `~/src/slopsmith` | `DLC_PATH=... docker compose up -d` |
+| **Developing this plugin** (live-mounted into Slopsmith) | This repo | `make dev` |
+
+`make dev` is not a competing launcher — it uses `slopsmith/docker-compose.yml`
+plus `docker-compose.slopsmith.yml` (the overlay in this repo) to add the
+bind mount and the `SLOPSMITH_PLUGINS_DIR` env var. Edits to `screen.js`
+here are live on the next browser reload.
+
+### One-time setup
+
+Copy `.env.example` to `.env` and fill in your paths:
+
+```bash
+cp .env.example .env
+# then edit — typical entries:
+#   SLOPSMITH_PORT=8088
+#   DLC_PATH=/home/you/slopsmith-dlc
+```
+
+`.env` is gitignored. The Makefile auto-loads it and exports each variable
+to Docker Compose; Compose also reads the file directly for `${…}`
+substitutions in the overlay.
+
+### Daily use
+
+```bash
+make help              # list targets
+make test              # run the node:test suite (no deps)
+make dev               # start slopsmith with this plugin mounted
+make logs              # tail the container
+make verify-mount      # confirm the plugin is visible inside
+make down              # stop slopsmith
+```
+
+`make dev` launches Slopsmith at `http://localhost:$SLOPSMITH_PORT` with this
+plugin mounted read-only at `/opt/user-plugins/note_detect`. The built-in
+`plugins/` directory still loads as usual; this plugin's `plugin.json.id` wins
+on the duplicate-id check so a previously-installed copy is safely shadowed.
+
+### Why not clone into `slopsmith/plugins/` directly?
+
+You can (the README's "Install" section describes that). The overlay approach
+is better for development because:
+
+- Your edits live in a git-tracked repo separate from the Slopsmith tree
+- No manual sync or symlinks
+- Swap branches without touching Slopsmith's working tree
+- `make down` cleans up; no leftovers in `slopsmith/plugins/`
+
+## Tests
+
+    npm test
+
+Runs a Node `vm`-based harness (Node 18+, no dependencies) that loads the shipped
+`screen.js` against DOM stubs and exercises its real pitch-detection and mapping
+functions with synthetic signals. Tests cover YIN detection at guitar/bass
+frequencies, the arrangement-aware string/fret mapping, the chart-context-aware
+display fingering resolver, and noise-tolerance regression guards.
+
+See `test/README.md` for the full rationale. Adding tests when changing
+detection or mapping logic is encouraged — the `vm` loader means tests
+exercise the actual shipping code, not a parallel copy.
 
 ## License
 
