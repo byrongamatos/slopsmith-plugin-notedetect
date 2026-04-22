@@ -7,7 +7,7 @@
 // instances can be constructed via `window.createNoteDetector(...)` by
 // plugins like splitscreen that need per-panel detection.
 //
-// Originally proposed by topkoa in PR #2 on this repo; this take-over
+// Originally proposed by topkoa in PR #2 on this repo; this takeover
 // re-applies the factory design on top of 5-string-bass (#14),
 // per-note hit/miss events (#12), CI (#13), and HPS (#15) which all
 // landed after his branch diverged. Co-Authored-By: topkoa.
