@@ -1983,9 +1983,22 @@ function _ndInstallPlaySongHook() {
 }
 
 // ── Singleton + bootstrap ──────────────────────────────────────────────────
-const _ndDefaultInstance = createNoteDetector({ isDefault: true });
+// Reuse an existing default instance if the file has been evaluated
+// before (HMR, accidental double <script> load). Without this, each
+// evaluation would call `createNoteDetector({isDefault:true})` afresh
+// — and since `_ndShared.instances` is anchored on window, the old
+// default would still be in the registry, producing duplicate Detect
+// buttons and per-instance DOM on every reload. Pair this with the
+// playSong-wrapper idempotency guard already in place; both together
+// keep double-load end-to-end idempotent.
+const _ndExistingDefault = (window.noteDetect && typeof window.noteDetect.injectButton === 'function')
+    ? window.noteDetect
+    : null;
+const _ndDefaultInstance = _ndExistingDefault || createNoteDetector({ isDefault: true });
 window.noteDetect = _ndDefaultInstance;
 window.createNoteDetector = createNoteDetector;
 
 _ndInstallPlaySongHook();
-_ndDefaultInstance.injectButton();
+// Only inject on first evaluation — re-injecting on a subsequent load
+// would duplicate the button, since the old one is still in the DOM.
+if (!_ndExistingDefault) _ndDefaultInstance.injectButton();
