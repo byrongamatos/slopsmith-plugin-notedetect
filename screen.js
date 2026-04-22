@@ -354,7 +354,10 @@ function _ndHpsDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
         const m3 = magnitudes[peakBin * 3];
         const dominantSecond = m2 > 2 * m1;
         const weakThird = m3 < 0.1 * m2;
-        if (dominantSecond && weakThird && peakBin * 2 <= highBin) peakBin *= 2;
+        if (dominantSecond && weakThird && peakBin * 2 <= highBin) {
+            peakBin *= 2;
+            peakVal = hps[peakBin]; // keep confidence tied to the corrected bin
+        }
     }
 
     const delta = (peakBin > lowBin && peakBin < highBin)
@@ -665,9 +668,12 @@ async function _ndProcessFrame(buffer) {
     const sr = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
     // HPS intentionally doesn't auto-fall-back to YIN on a weak result
     // — if a user opts in to a frequency-domain detector, they get it.
-    // CREPE keeps its YIN fallback because its failure mode is "model
-    // didn't load" (network / WebGL), not "model gave a wrong answer"
-    // — silent fallback is the right UX there.
+    // CREPE has two fall-through paths to YIN: model-didn't-load
+    // (network / WebGL failure) and weak-result (freq<=0 or confidence
+    // <0.3). Both are silent on purpose — CREPE's model can take
+    // seconds to load and sporadically returns low-confidence results
+    // on transient noise; silent YIN fallback keeps detection alive in
+    // both cases without the user noticing.
     switch (_ndDetectionMethod) {
         case 'crepe':
             if (_ndModel) {
@@ -689,7 +695,7 @@ async function _ndProcessFrame(buffer) {
 
     if (result.freq <= 0 || result.confidence < 0.3) {
         if (result.underBuffered && !_ndUnderBufferWarned) {
-            console.warn('[note_detect] YIN received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.');
+            console.warn(`[note_detect] ${_ndDetectionMethod} received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.`);
             _ndUnderBufferWarned = true;
         }
         _ndDetectedMidi = -1;

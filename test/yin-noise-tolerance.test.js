@@ -79,4 +79,4 @@ test('5-string low B (31 Hz) with moderate noise (amp 0.3) stays within ±50 cen
 // The former test.todo about recovering a suppressed-fundamental 41 Hz
 // signal "beyond vanilla YIN" is now exercised by `hps.test.js` — HPS
 // is a user-selectable method for exactly this rig profile. Cepstrum
-// was scoped out for this PR; see issue #TBD for the follow-up.
+// was scoped out for this PR; tracked in #16.
