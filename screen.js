@@ -23,11 +23,10 @@ let _ndSharedModelLoading = false;
 // disable every instance when a new song loads.
 const _ndInstances = new Set();
 
-// Idempotency guard for the playSong wrapper. Without this, a plugin
-// reloading (HMR, test harness, double <script> tag) would wrap
-// window.playSong twice and the inner wrapper's _ndInstances iteration
-// would double-fire.
-let _ndPlaySongWrapped = false;
+// (The playSong wrapper's idempotency guard lives on the wrapper
+// function object itself — see `_ndInstallPlaySongHook()` below —
+// so it persists across HMR / double-<script>-load where a
+// module-level flag would be reset.)
 
 const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 
@@ -1718,12 +1717,19 @@ function createNoteDetector(options = {}) {
 // ── playSong wrapper (idempotent) ──────────────────────────────────────────
 // On a new song, disable every live instance so scoring doesn't carry over,
 // then let the original playSong load the chart, then re-inject the default
-// singleton's button. The guard prevents double-wrapping if this script
-// happens to load twice.
+// singleton's button.
+//
+// The idempotency guard lives on the wrapper function itself
+// (`wrapper._ndWrapped = true`) rather than on a module-level flag.
+// Module scope resets on every evaluation, so HMR or a double
+// <script> load would see a false module flag, wrap the already-
+// wrapped `window.playSong`, and produce a nested wrapper that
+// disables instances twice per song switch. Marking the function
+// itself persists across re-evaluations because `window.playSong`
+// keeps the reference.
 let _ndPlaySongRetries = 0;
 const _ND_PLAY_SONG_MAX_RETRIES = 20;
 function _ndInstallPlaySongHook() {
-    if (_ndPlaySongWrapped) return;
     const origPlaySong = window.playSong;
     if (typeof origPlaySong !== 'function') {
         // playSong may not exist yet. Common on HMR or unusual load
@@ -1736,7 +1742,10 @@ function _ndInstallPlaySongHook() {
         }
         return;
     }
-    window.playSong = async function (...args) {
+    // If this file was evaluated before, `window.playSong` already
+    // points at our wrapper. Bail rather than wrap it again.
+    if (origPlaySong._ndWrapped) return;
+    const wrapper = async function (...args) {
         // Silent-disable each live instance so scoring doesn't carry
         // over to the next song, but DON'T show the end-of-song
         // summary — the original implementation just reset scoring
@@ -1753,7 +1762,8 @@ function _ndInstallPlaySongHook() {
         }
         return ret;
     };
-    _ndPlaySongWrapped = true;
+    wrapper._ndWrapped = true;
+    window.playSong = wrapper;
 }
 
 // ── Singleton + bootstrap ──────────────────────────────────────────────────
