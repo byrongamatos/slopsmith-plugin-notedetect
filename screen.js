@@ -934,13 +934,23 @@ function createNoteDetector(options = {}) {
     // ── Level meter ───────────────────────────────────────────────────
     function startLevelMeter() {
         stopLevelMeter();
+        // Cache the analyser read buffer across rAF ticks. At 60 fps
+        // with fftSize=512 this was allocating ~120 kB/s per enabled
+        // instance; reusing a single Float32Array (re-allocating only
+        // if fftSize changes) keeps the meter out of the GC path.
+        let levelBuf = null;
+        let levelBufSize = 0;
         const tick = () => {
             if (!levelAnalyser) return;
-            const buf = new Float32Array(levelAnalyser.fftSize);
-            levelAnalyser.getFloatTimeDomainData(buf);
+            const fftSize = levelAnalyser.fftSize;
+            if (!levelBuf || levelBufSize !== fftSize) {
+                levelBuf = new Float32Array(fftSize);
+                levelBufSize = fftSize;
+            }
+            levelAnalyser.getFloatTimeDomainData(levelBuf);
             let sum = 0;
-            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-            const rms = Math.sqrt(sum / buf.length);
+            for (let i = 0; i < levelBuf.length; i++) sum += levelBuf[i] * levelBuf[i];
+            const rms = Math.sqrt(sum / levelBuf.length);
             inputLevel = Math.min(1, rms * 5);
             if (inputLevel > inputPeak) {
                 inputPeak = inputLevel;
