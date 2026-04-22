@@ -57,25 +57,30 @@ function _ndSetArrangement(name) {
     _ndCurrentArrangement = _ndArrangementKindFromName(name);
 }
 
-// Return the standard-tuning MIDI base array for a given (arrangement,
-// stringCount). `stringCount` defaults to `_ndTuningOffsets.length` which
-// is populated from `song_info.tuning` when Detect activates or a new
-// song plays, so most callers inherit the right size automatically.
+// Standard-tuning MIDI base per (arrangement kind, string count).
 //
-// Tunings ascend in fourths (B0→E1→A1→D2→G2 for 5-string bass;
-// B1→E2→A2→D3→G3→B3→E4 for 7-string guitar — the B string is the
-// standard 6-string layout; low B adds one fourth below low E).
+// Bass ascends in perfect fourths end-to-end; guitar is fourths except
+// the major third between G3→B3 (the standard irregularity). Low B on
+// 5-string bass and 7-string guitar both add a perfect fourth below
+// the standard low-E string.
+//
+// Hoisted to module-level constants so _ndStandardMidiFor doesn't
+// allocate on the match-loop hot path (called per candidate chart
+// note + for every detected pitch).
+const _ND_TUNING_BASS_4 = [28, 33, 38, 43];             // E1 A1 D2 G2
+const _ND_TUNING_BASS_5 = [23, 28, 33, 38, 43];         // B0 E1 A1 D2 G2
+const _ND_TUNING_GUITAR_6 = [40, 45, 50, 55, 59, 64];   // E2 A2 D3 G3 B3 E4
+const _ND_TUNING_GUITAR_7 = [35, 40, 45, 50, 55, 59, 64]; // B1 E2 A2 D3 G3 B3 E4
+
+// Pick the base for a given (arrangement, stringCount). `stringCount`
+// defaults to `_ndTuningOffsets.length`, populated from song_info.tuning
+// when Detect activates or a new song plays — so most callers inherit
+// the right size automatically.
 function _ndStandardMidiFor(arrangement, stringCount = _ndTuningOffsets.length) {
     if (arrangement === 'bass') {
-        switch (stringCount) {
-            case 5:  return [23, 28, 33, 38, 43];       // B0 E1 A1 D2 G2
-            default: return [28, 33, 38, 43];           // 4-string E1 A1 D2 G2
-        }
+        return stringCount === 5 ? _ND_TUNING_BASS_5 : _ND_TUNING_BASS_4;
     }
-    switch (stringCount) {
-        case 7:  return [35, 40, 45, 50, 55, 59, 64];   // B1 E2 A2 D3 G3 B3 E4
-        default: return [40, 45, 50, 55, 59, 64];       // 6-string E2 A2 D3 G3 B3 E4
-    }
+    return stringCount === 7 ? _ND_TUNING_GUITAR_7 : _ND_TUNING_GUITAR_6;
 }
 
 // Audio processing — use native sample rate, accumulate samples for YIN
