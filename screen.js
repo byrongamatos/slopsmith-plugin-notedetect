@@ -878,12 +878,27 @@ function createNoteDetector(options = {}) {
             stopAudio();
             if (!enabled) return;
             const ok = await startAudio();
+            // Treat a restart failure (e.g. mic permission revoked,
+            // device unplugged, selected deviceId no longer exists)
+            // as a hard disable. Without this, the instance would
+            // stay `enabled=true` with HUD + miss-check intervals
+            // still running, racking up misses against no audio and
+            // showing the Detect button as active. Only fire the
+            // disable if we're still the winning operation —
+            // otherwise a newer restart or a concurrent disable
+            // already owns the teardown.
+            if (!ok) {
+                if (gen === sessionGen && enabled) {
+                    disable({ silent: true });
+                }
+                return;
+            }
             // Even within the chain, disable() can still bump
             // sessionGen and set !enabled between our stop/start
             // and our return. Tear down what startAudio just
             // acquired in that case.
             if (gen !== sessionGen || !enabled) {
-                if (ok) stopAudio();
+                stopAudio();
             }
         });
     }
