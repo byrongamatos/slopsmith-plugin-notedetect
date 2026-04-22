@@ -617,6 +617,25 @@ function _ndMatchNotes() {
             _ndStreak++;
             if (_ndStreak > _ndBestStreak) _ndBestStreak = _ndStreak;
             _ndUpdateSectionStat('hit');
+            // Per-hit event for real-time integrations (e.g. step-mode,
+            // custom scoring overlays). Emitted alongside the aggregate
+            // `notedetect:session` event fired at end-of-song. Wrapped
+            // in try/catch so a *throwing* listener can't break the
+            // match loop (doesn't guard against slow/blocking listeners;
+            // dispatchEvent runs them synchronously). Same guard shape
+            // as _ndPublishToJournal. See #3.
+            try {
+                window.dispatchEvent(new CustomEvent('notedetect:hit', {
+                    detail: {
+                        note: { s: cn.s, f: cn.f },
+                        time: t,                 // classification playback-now
+                        noteTime: cn.t,          // chart note time
+                        expectedMidi,
+                        detectedMidi: _ndDetectedMidi,
+                        confidence: _ndDetectedConfidence,
+                    },
+                }));
+            } catch (e) { /* listener threw; scoring continues */ }
         }
     }
 }
@@ -641,6 +660,16 @@ function _ndCheckMisses() {
             _ndMisses++;
             _ndStreak = 0;
             _ndUpdateSectionStat('miss');
+            try {
+                window.dispatchEvent(new CustomEvent('notedetect:miss', {
+                    detail: {
+                        note: { s, f },
+                        time: t,             // classification playback-now
+                        noteTime,            // chart note time (timing window expired)
+                        expectedMidi: _ndMidiFromStringFret(s, f, _ndCurrentArrangement),
+                    },
+                }));
+            } catch (e) { /* listener threw; miss-checking continues */ }
         }
     };
 
