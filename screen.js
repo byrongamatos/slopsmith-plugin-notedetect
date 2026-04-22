@@ -620,8 +620,10 @@ function _ndMatchNotes() {
             // Per-hit event for real-time integrations (e.g. step-mode,
             // custom scoring overlays). Emitted alongside the aggregate
             // `notedetect:session` event fired at end-of-song. Wrapped
-            // in try/catch so a misbehaving listener can't break the
-            // match loop (same guard shape as _ndPublishToJournal). See #3.
+            // in try/catch so a *throwing* listener can't break the
+            // match loop (doesn't guard against slow/blocking listeners;
+            // dispatchEvent runs them synchronously). Same guard shape
+            // as _ndPublishToJournal. See #3.
             try {
                 window.dispatchEvent(new CustomEvent('notedetect:hit', {
                     detail: {
