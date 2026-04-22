@@ -40,12 +40,10 @@ let _ndDetectedConfidence = 0;
 let _ndDetectedString = -1;
 let _ndDetectedFret = -1;
 
-// Tuning — standard tuning MIDI base per string, adjusted by arrangement offsets.
-// Guitar: 6 strings, low E2 to high E4. Bass: 4 strings, low E1 to high G2
-// (one octave below guitar low-4 minus the top two). Arrangement type is
-// derived from song_info.arrangement name; see _ndSetArrangement.
-const _ndStandardMidiGuitar = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
-const _ndStandardMidiBass = [28, 33, 38, 43];           // E1 A1 D2 G2
+// Tuning — standard tuning MIDI base per string, adjusted by arrangement
+// offsets. Arrangement type is derived from song_info.arrangement name
+// (see _ndSetArrangement); string count comes from song_info.tuning.length
+// (see _ndTuningOffsets below).
 let _ndCurrentArrangement = 'guitar';                   // 'guitar' | 'bass'
 let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
 let _ndCapo = 0;
@@ -59,8 +57,25 @@ function _ndSetArrangement(name) {
     _ndCurrentArrangement = _ndArrangementKindFromName(name);
 }
 
-function _ndStandardMidiFor(arrangement) {
-    return arrangement === 'bass' ? _ndStandardMidiBass : _ndStandardMidiGuitar;
+// Return the standard-tuning MIDI base array for a given (arrangement,
+// stringCount). `stringCount` defaults to `_ndTuningOffsets.length` which
+// is populated from `song_info.tuning` when Detect activates or a new
+// song plays, so most callers inherit the right size automatically.
+//
+// Tunings ascend in fourths (B0→E1→A1→D2→G2 for 5-string bass;
+// B1→E2→A2→D3→G3→B3→E4 for 7-string guitar — the B string is the
+// standard 6-string layout; low B adds one fourth below low E).
+function _ndStandardMidiFor(arrangement, stringCount = _ndTuningOffsets.length) {
+    if (arrangement === 'bass') {
+        switch (stringCount) {
+            case 5:  return [23, 28, 33, 38, 43];       // B0 E1 A1 D2 G2
+            default: return [28, 33, 38, 43];           // 4-string E1 A1 D2 G2
+        }
+    }
+    switch (stringCount) {
+        case 7:  return [35, 40, 45, 50, 55, 59, 64];   // B1 E2 A2 D3 G3 B3 E4
+        default: return [40, 45, 50, 55, 59, 64];       // 6-string E2 A2 D3 G3 B3 E4
+    }
 }
 
 // Audio processing — use native sample rate, accumulate samples for YIN
@@ -489,18 +504,18 @@ function _ndFreqToMidi(freq) {
     return 12 * Math.log2(freq / 440) + 69;
 }
 
-function _ndMidiFromStringFret(string, fret, arrangement = _ndCurrentArrangement) {
-    const base = _ndStandardMidiFor(arrangement);
+function _ndMidiFromStringFret(string, fret, arrangement = _ndCurrentArrangement, stringCount = _ndTuningOffsets.length) {
+    const base = _ndStandardMidiFor(arrangement, stringCount);
     return base[string] + _ndTuningOffsets[string] + _ndCapo + fret;
 }
 
-function _ndMidiToStringFret(midiNote, arrangement = _ndCurrentArrangement) {
+function _ndMidiToStringFret(midiNote, arrangement = _ndCurrentArrangement, stringCount = _ndTuningOffsets.length) {
     // Pure geometric fallback: walk strings 0..N and return the first position
     // that matches the pitch. Used when there is no chart context available
     // (player noodling between chart notes). When a chart note is in play,
     // _ndResolveDisplayFingering picks the chart's (s, f) instead — see the
     // research notes in mapping-bass.test.js.
-    const base = _ndStandardMidiFor(arrangement);
+    const base = _ndStandardMidiFor(arrangement, stringCount);
     let bestDist = Infinity;
     let bestString = -1;
     let bestFret = -1;
