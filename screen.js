@@ -113,7 +113,12 @@ function _ndLoadSettings() {
         const s = JSON.parse(raw);
         if (s.deviceId !== undefined) _ndSelectedDeviceId = s.deviceId;
         if (s.channel) _ndSelectedChannel = s.channel;
-        if (s.method) _ndDetectionMethod = s.method;
+        // Allowlist guards against settings restored from a future build
+        // with an unknown method — falling back to YIN beats silently
+        // running an undefined detector.
+        if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) {
+            _ndDetectionMethod = s.method;
+        }
         if (s.timingTolerance !== undefined) _ndTimingTolerance = s.timingTolerance;
         if (s.pitchTolerance !== undefined) _ndPitchTolerance = s.pitchTolerance;
         if (s.inputGain !== undefined) _ndInputGain = s.inputGain;
@@ -176,6 +181,229 @@ function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     const freq = sampleRate / betterTau;
     const confidence = 1 - yinBuffer[tau];
     return { freq, confidence: Math.max(0, confidence), underBuffered };
+}
+
+// ── Pitch Detection: Shared FFT helper ─────────────────────────────────────
+// Real-valued FFT via Cooley-Tukey radix-2, in-place on interleaved
+// complex arrays. Currently used by HPS; factored out as a helper so
+// future frequency-domain detectors (e.g. cepstrum) can reuse it.
+// ~80 lines of dependency-free JS to preserve notedetect's zero-deps
+// principle.
+
+// Next power-of-two ≥ n. FFT sizes must be powers of two; the input
+// buffer is zero-padded up to this length before transforming.
+function _ndNextPow2(n) {
+    let p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+// In-place radix-2 Cooley-Tukey on interleaved {re, im} pairs.
+// `data` has length 2*N (N real/imag pairs). `direction` is +1 for
+// forward (standard DFT sign: exp(-i·2π·k·n/N)) and -1 for inverse. No
+// normalization here; callers divide by N themselves when they want
+// the inverse to be an average.
+function _ndFftInPlace(data, direction) {
+    const nPairs = data.length >> 1;
+    // Bit-reversal permutation — puts inputs in the order the butterfly
+    // stages expect.
+    for (let i = 1, j = 0; i < nPairs; i++) {
+        let bit = nPairs >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            const ir = 2 * i, jr = 2 * j;
+            let tmp = data[ir];     data[ir] = data[jr];     data[jr] = tmp;
+            tmp = data[ir + 1]; data[ir + 1] = data[jr + 1]; data[jr + 1] = tmp;
+        }
+    }
+    // Butterfly stages. Negate the angle for direction=+1 so the
+    // twiddle exp(i·angle) carries the standard forward-DFT negative
+    // sign; direction=-1 yields the positive sign for inverse use.
+    for (let len = 2; len <= nPairs; len <<= 1) {
+        const halfLen = len >> 1;
+        const angle = -direction * 2 * Math.PI / len;
+        const wRe = Math.cos(angle);
+        const wIm = Math.sin(angle);
+        for (let i = 0; i < nPairs; i += len) {
+            let twRe = 1, twIm = 0;
+            for (let k = 0; k < halfLen; k++) {
+                const evenIdx = 2 * (i + k);
+                const oddIdx = 2 * (i + k + halfLen);
+                const oRe = data[oddIdx] * twRe - data[oddIdx + 1] * twIm;
+                const oIm = data[oddIdx] * twIm + data[oddIdx + 1] * twRe;
+                data[oddIdx]     = data[evenIdx]     - oRe;
+                data[oddIdx + 1] = data[evenIdx + 1] - oIm;
+                data[evenIdx]     = data[evenIdx]     + oRe;
+                data[evenIdx + 1] = data[evenIdx + 1] + oIm;
+                const nextTwRe = twRe * wRe - twIm * wIm;
+                twIm = twRe * wIm + twIm * wRe;
+                twRe = nextTwRe;
+            }
+        }
+    }
+}
+
+// Hann window + zero-pad + forward FFT → magnitude spectrum.
+// Returns `{ magnitudes, binHz, fftSize }` so callers can map bin → Hz
+// directly. Magnitude length is fftSize/2 + 1 (Nyquist-inclusive).
+//
+// Reuses scratch buffers across calls — at ~20 fps a per-frame pair of
+// Float32Array allocations (32 kB interleaved + 32 kB magnitudes at
+// 48 kHz / 16384 fftSize) becomes real GC pressure. We re-allocate
+// only when fftSize changes.
+let _ndFftInterleavedScratch = null;
+let _ndFftMagnitudesScratch = null;
+let _ndFftScratchSize = 0;
+
+// HPS scratch — reallocated only when highBin changes. Same GC-pressure
+// rationale as the FFT buffers above.
+let _ndHpsScratch = null;
+let _ndHpsScratchSize = 0;
+
+function _ndFftMagnitude(buffer, sampleRate) {
+    // Target ~3 Hz bin width regardless of device sample rate. A fixed
+    // floor (e.g. 16384) would degrade to ~5.86 Hz/bin at 96 kHz and
+    // reintroduce the low-B binning problem (30.87 Hz ≈ bin 5.27 with
+    // ~90 cents of drift even after parabolic interpolation). Deriving
+    // the floor from sampleRate keeps the fundamental resolvable on
+    // 5-string bass across any rate a modern audio interface serves.
+    const TARGET_BIN_HZ = 3;
+    const resolutionFloor = _ndNextPow2(Math.ceil(sampleRate / TARGET_BIN_HZ));
+    const fftSize = Math.max(_ndNextPow2(buffer.length), resolutionFloor);
+    const halfBins = (fftSize >> 1) + 1;
+
+    if (_ndFftScratchSize !== fftSize) {
+        _ndFftInterleavedScratch = new Float32Array(2 * fftSize);
+        _ndFftMagnitudesScratch = new Float32Array(halfBins);
+        _ndFftScratchSize = fftSize;
+    }
+    const interleaved = _ndFftInterleavedScratch;
+    const magnitudes = _ndFftMagnitudesScratch;
+    // Zero the scratch — windowed buffer fills only the first 2*buffer.length
+    // slots, but the FFT reads the whole array.
+    interleaved.fill(0);
+
+    // Hann-window the real part, leave imag as zero. Windowing reduces
+    // spectral leakage from a finite-length buffer.
+    for (let i = 0; i < buffer.length; i++) {
+        const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (buffer.length - 1)));
+        interleaved[2 * i] = buffer[i] * w;
+    }
+    _ndFftInPlace(interleaved, 1);
+    for (let k = 0; k < halfBins; k++) {
+        const re = interleaved[2 * k];
+        const im = interleaved[2 * k + 1];
+        magnitudes[k] = Math.sqrt(re * re + im * im);
+    }
+    return { magnitudes, binHz: sampleRate / fftSize, fftSize };
+}
+
+// Parabolic interpolation over a 3-sample peak — returns a sub-sample
+// offset `delta` in [-1, 1] that refines the peak location. Clamps to
+// ±1 so a near-zero denom can't produce a runaway offset that lands the
+// corrected peak in a neighboring bin.
+function _ndParabolicOffset(yPrev, yPeak, yNext) {
+    const denom = yPrev - 2 * yPeak + yNext;
+    if (Math.abs(denom) < 1e-12) return 0;
+    const delta = 0.5 * (yPrev - yNext) / denom;
+    if (delta > 1) return 1;
+    if (delta < -1) return -1;
+    return delta;
+}
+
+// ── Pitch Detection: HPS (Harmonic Product Spectrum) ───────────────────────
+// Frequency-domain detector designed for bass signals with a suppressed
+// fundamental — amp-sim DIs, small-speaker playback, heavily compressed
+// tones all commonly roll off below ~60 Hz. YIN's time-domain
+// autocorrelation locks onto the 2nd harmonic in that case and reports
+// the pitch one octave high; HPS multiplies together downsampled copies
+// of the magnitude spectrum so the bins at the fundamental reinforce
+// even when that fundamental is weak.
+//
+// When to prefer this: bass (4- or 5-string) where YIN reports octave-up
+// on your rig. Opt-in via the settings dropdown — if you're happy with
+// YIN on clean signals, there's no reason to switch.
+//
+// Failure mode: signals with strong subharmonic structure (unusual; the
+// algorithm can latch onto a frequency below the true fundamental). If
+// that happens on a real rig, fall back to YIN or CREPE and file an
+// issue — a cepstrum-based detector is a plausible follow-up.
+function _ndHpsDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
+    const halfLen = Math.floor(buffer.length / 2);
+    const minHalfLenForFreq = Math.ceil(sampleRate / minFreqHz);
+    const underBuffered = halfLen < minHalfLenForFreq;
+    if (underBuffered) return { freq: -1, confidence: 0, underBuffered };
+
+    const { magnitudes, binHz } = _ndFftMagnitude(buffer, sampleRate);
+    const nBins = magnitudes.length;
+    const harmonics = 3;
+    const maxFreqHz = 2000;
+    const lowBin = Math.max(1, Math.floor(minFreqHz / binHz));
+    const highBin = Math.min(Math.floor((nBins - 1) / harmonics),
+                             Math.floor(maxFreqHz / binHz));
+    if (highBin <= lowBin) return { freq: -1, confidence: 0, underBuffered: false };
+
+    // Find peak magnitude for a sensible dB floor — prevents near-zero bins
+    // from driving the product to garbage, which is the classic HPS failure
+    // on pure sines (all harmonic bins except the fundamental are ~0, so
+    // the product collapses everywhere).
+    let maxMag = 0;
+    for (let k = 0; k < nBins; k++) if (magnitudes[k] > maxMag) maxMag = magnitudes[k];
+    const floor = maxMag * 1e-3; // -60 dB relative to peak
+
+    // Log-sum of downsampled magnitudes. Equivalent to log(product) but
+    // with a floor — more numerically stable and, because log is
+    // monotonic, preserves the same peak location as the textbook product
+    // formulation.
+    if (_ndHpsScratchSize <= highBin) {
+        _ndHpsScratch = new Float32Array(highBin + 1);
+        _ndHpsScratchSize = highBin + 1;
+    }
+    const hps = _ndHpsScratch;
+    let peakBin = lowBin;
+    let peakVal = -Infinity;
+    let sum = 0;
+    for (let k = lowBin; k <= highBin; k++) {
+        let logSum = 0;
+        for (let h = 1; h <= harmonics; h++) {
+            logSum += Math.log(Math.max(magnitudes[k * h], floor));
+        }
+        hps[k] = logSum;
+        sum += logSum;
+        if (logSum > peakVal) { peakVal = logSum; peakBin = k; }
+    }
+    if (!isFinite(peakVal)) return { freq: -1, confidence: 0, underBuffered: false };
+
+    // Subharmonic correction — the classic HPS failure mode is picking
+    // k = k_true / 2 on near-pure sines, because HPS's k=k_true/2 row
+    // picks up the real peak at k_true as its "2nd harmonic" and wins.
+    // Diagnose by checking whether the original peakBin actually has
+    // harmonic support: a real fundamental has both 2nd AND 3rd
+    // harmonics with comparable magnitude. A subharmonic error doesn't —
+    // spec[3*peakBin] is pure leakage, tiny next to spec[2*peakBin].
+    if (peakBin * 3 < nBins) {
+        const m1 = magnitudes[peakBin];
+        const m2 = magnitudes[peakBin * 2];
+        const m3 = magnitudes[peakBin * 3];
+        const dominantSecond = m2 > 2 * m1;
+        const weakThird = m3 < 0.1 * m2;
+        if (dominantSecond && weakThird && peakBin * 2 <= highBin) {
+            peakBin *= 2;
+            peakVal = hps[peakBin]; // keep confidence tied to the corrected bin
+        }
+    }
+
+    const delta = (peakBin > lowBin && peakBin < highBin)
+        ? _ndParabolicOffset(hps[peakBin - 1], hps[peakBin], hps[peakBin + 1])
+        : 0;
+    const freq = (peakBin + delta) * binHz;
+
+    const mean = sum / (highBin - lowBin + 1);
+    const spread = peakVal - mean; // typical scale ~1–10 for clean signals
+    const confidence = Math.min(1, Math.max(0, spread / (harmonics * Math.log(10))));
+
+    return { freq, confidence, underBuffered: false };
 }
 
 // ── Pitch Detection: CREPE ─────────────────────────────────────────────────
@@ -358,13 +586,20 @@ async function _ndStartAudio() {
             }
         };
 
-        // Detection runs on a timer, not in the audio callback
+        // Detection runs on a timer, not in the audio callback. The
+        // in-flight guard matters when CREPE inference takes longer
+        // than the 50 ms tick — without it, multiple `_ndProcessFrame`
+        // promises can be alive at once and resolve out of order,
+        // letting a stale detection overwrite a newer one. Skipping
+        // while busy is safe because the worklet keeps only the most
+        // recent ready buffer in `_ndPendingBuffer`, so we never queue
+        // up a backlog.
         _ndDetectInterval = setInterval(() => {
-            if (_ndPendingBuffer) {
-                const buf = _ndPendingBuffer;
-                _ndPendingBuffer = null;
-                _ndProcessFrame(buf);
-            }
+            if (_ndProcessingFrame || !_ndPendingBuffer) return;
+            const buf = _ndPendingBuffer;
+            _ndPendingBuffer = null;
+            _ndProcessingFrame = true;
+            _ndProcessFrame(buf).finally(() => { _ndProcessingFrame = false; });
         }, 50); // ~20fps detection — plenty for note matching
 
         gainNode.connect(processor);
@@ -386,6 +621,7 @@ async function _ndStartAudio() {
 
 let _ndDetectInterval = null;
 let _ndPendingBuffer = null;
+let _ndProcessingFrame = false; // in-flight guard — see setInterval below
 
 function _ndStopAudio() {
     _ndStopLevelMeter();
@@ -471,20 +707,45 @@ function _ndDrawSettingsVU() {
 
 async function _ndProcessFrame(buffer) {
     let result;
+    let detectorUsed; // name the detector that actually produced `result`
+                     // so diagnostics (e.g. the undersized-buffer warning)
+                     // don't misattribute YIN's state to CREPE.
     const sr = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
-    if (_ndDetectionMethod === 'crepe' && _ndModel) {
-        result = await _ndCrepeDetect(buffer);
-        // Fall back to YIN if CREPE returned nothing useful
-        if (result.freq <= 0 || result.confidence < 0.3) {
+    // HPS intentionally doesn't auto-fall-back to YIN on a weak result
+    // — if a user opts in to a frequency-domain detector, they get it.
+    // CREPE has two fall-through paths to YIN: model-didn't-load
+    // (network / WebGL failure) and weak-result (freq<=0 or confidence
+    // <0.3). Both are silent on purpose — CREPE's model can take
+    // seconds to load and sporadically returns low-confidence results
+    // on transient noise; silent YIN fallback keeps detection alive in
+    // both cases without the user noticing.
+    switch (_ndDetectionMethod) {
+        case 'crepe':
+            if (_ndModel) {
+                result = await _ndCrepeDetect(buffer);
+                detectorUsed = 'crepe';
+                if (result.freq <= 0 || result.confidence < 0.3) {
+                    result = _ndYinDetect(buffer, sr);
+                    detectorUsed = 'yin';
+                }
+                break;
+            }
+            result = _ndYinDetect(buffer, sr); // model hasn't finished loading
+            detectorUsed = 'yin';
+            break;
+        case 'hps':
+            result = _ndHpsDetect(buffer, sr);
+            detectorUsed = 'hps';
+            break;
+        case 'yin':
+        default:
             result = _ndYinDetect(buffer, sr);
-        }
-    } else {
-        result = _ndYinDetect(buffer, sr);
+            detectorUsed = 'yin';
     }
 
     if (result.freq <= 0 || result.confidence < 0.3) {
         if (result.underBuffered && !_ndUnderBufferWarned) {
-            console.warn('[note_detect] YIN received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.');
+            console.warn(`[note_detect] ${detectorUsed} received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.`);
             _ndUnderBufferWarned = true;
         }
         _ndDetectedMidi = -1;
@@ -789,6 +1050,7 @@ function _ndShowSettings() {
         <select id="nd-method-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-3"
                 onchange="_ndSetMethod(this.value)">
             <option value="yin" ${_ndDetectionMethod === 'yin' ? 'selected' : ''}>YIN (lightweight, clean signals)</option>
+            <option value="hps" ${_ndDetectionMethod === 'hps' ? 'selected' : ''}>HPS (bass with weak fundamental, no model)</option>
             <option value="crepe" ${_ndDetectionMethod === 'crepe' ? 'selected' : ''}>CREPE/SPICE (robust, ~20MB model)</option>
         </select>
 
@@ -817,6 +1079,7 @@ function _ndShowSettings() {
 
         <div class="text-[10px] text-gray-600 mt-1 leading-tight">
             Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
+            See the <b>Pitch Detection Methods</b> section of the plugin README for guidance on choosing between YIN, HPS, and CREPE.
         </div>
     `;
 

@@ -82,7 +82,7 @@ function loadDetectionCore() {
     }
 
     const required = [
-        '_ndYinDetect', '_ndFreqToMidi',
+        '_ndYinDetect', '_ndHpsDetect', '_ndFreqToMidi',
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
         '_ndResolveDisplayFingering',
     ];
@@ -105,6 +105,7 @@ function loadDetectionCore() {
 
     return {
         yinDetect: rewrapYin(sandbox._ndYinDetect),
+        hpsDetect: rewrapYin(sandbox._ndHpsDetect),
         freqToMidi: sandbox._ndFreqToMidi,
         midiFromStringFret: sandbox._ndMidiFromStringFret,
         midiToStringFret: rewrapSf(sandbox._ndMidiToStringFret),

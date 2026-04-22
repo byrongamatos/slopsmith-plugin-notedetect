@@ -40,7 +40,7 @@ Click the gear icon when detection is active to access:
 - **Audio Input Device** — select which interface to capture from
 - **Input Channel** — Left (Ch 1), Right (Ch 2), or Mono (mix)
 - **Input Level** — VU meter showing signal level on the selected channel
-- **Detection Method** — YIN (lightweight, instant) or CREPE/SPICE (TensorFlow.js, ~20MB model download, better with effects)
+- **Detection Method** — YIN (default), HPS (bass with weak fundamental), or CREPE/SPICE (TensorFlow.js, ~20MB model download, better with effects). See the [Pitch Detection Methods](#pitch-detection-methods) section below for guidance.
 - **Timing Tolerance** — how close to the beat a note must be played (default ±100ms)
 - **Pitch Tolerance** — how close in pitch a note must be (default ±50 cents)
 - **Input Gain** — amplify weak signals
@@ -85,11 +85,33 @@ window.addEventListener('notedetect:hit', (e) => {
 
 ## Pitch Detection Methods
 
+YIN is the default and handles most rigs well. The other methods are opt-in for specific failure modes:
+
+| Method | Best for | Caveat |
+|---|---|---|
+| **YIN** | clean signals (default) | octave-up errors on suppressed fundamentals |
+| **HPS** | bass with weak fundamental | can miss on strong subharmonic stacks |
+| **CREPE / SPICE** | distorted / effected signals | 20 MB model download, WebGL required for speed |
+
 ### YIN (default)
-Lightweight autocorrelation-based algorithm. Works instantly with no model download. Best for clean or lightly distorted signals.
+
+Lightweight time-domain autocorrelation (implemented as the cumulative-mean-normalized difference function from de Cheveigné & Kawahara, 2002). Works instantly with no model download. Best for clean or lightly distorted signals with a strong fundamental.
+
+**Known failure mode:** when the fundamental is rolled off — amp-sim DIs, small-speaker playback, heavily compressed tones — YIN can lock onto the 2nd harmonic and report the pitch an octave too high. If your bass rig sounds right but detection reads an octave up, try HPS.
+
+### HPS (Harmonic Product Spectrum)
+
+Frequency-domain detector aimed at signals with a suppressed fundamental. Fourier-transforms the audio buffer, then evaluates, for each candidate frequency bin `k`, the sum of log-magnitudes at `k`, `2k`, and `3k`. A real pitch reinforces its own harmonics; a spurious bin doesn't. Peaks that turn out to be subharmonics of a louder higher bin get flipped by a small post-check.
+
+**When to prefer HPS:** bass (4- or 5-string) where YIN reports octave-up on your rig. Typical scenarios — amp-sim DIs, direct-to-interface bass with roll-off below 60 Hz, heavily compressed tones.
+
+**Known failure mode:** signals with strong subharmonic structure (rare on stringed instruments) can fool HPS. If that happens on a rig you care about, fall back to YIN or CREPE and file an issue with a recording.
+
+No extra dependencies — the FFT is an inline radix-2 Cooley-Tukey, ~80 lines of vanilla JS, and keeps the plugin's zero-deps posture.
 
 ### CREPE / SPICE
-TensorFlow.js neural network model (~20MB, loaded lazily on first use). More robust with heavily distorted or effected signals. Uses WebGL acceleration when available.
+
+TensorFlow.js neural network model (~20MB, loaded lazily on first use). More robust with heavily distorted or effected signals. Uses WebGL acceleration when available. If the model fails to load (network / WebGL), YIN is used as a transparent runtime fallback.
 
 ## Requirements
 
@@ -166,9 +188,10 @@ is better for development because:
 
 Runs a Node `vm`-based harness (Node 18+, no dependencies) that loads the shipped
 `screen.js` against DOM stubs and exercises its real pitch-detection and mapping
-functions with synthetic signals. Tests cover YIN detection at guitar/bass
-frequencies, the arrangement-aware string/fret mapping, the chart-context-aware
-display fingering resolver, and noise-tolerance regression guards.
+functions with synthetic signals. Tests cover YIN and HPS detection at
+guitar/bass frequencies, the arrangement-aware string/fret mapping, the
+chart-context-aware display fingering resolver, and noise-tolerance regression
+guards.
 
 See `test/README.md` for the full rationale. Adding tests when changing
 detection or mapping logic is encouraged — the `vm` loader means tests
