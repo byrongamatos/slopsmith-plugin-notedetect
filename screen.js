@@ -830,36 +830,41 @@ function createNoteDetector(options = {}) {
         accumBuffer = new Float32Array(0);
     }
 
-    // Per-instance promise chain that serializes restartAudio calls.
-    // A generation-only check isn't enough here because startAudio()
-    // writes to shared instance vars (stream, audioCtx, sourceNode,
-    // gainNode, ...) BEFORE the post-await gen check fires. If two
-    // restarts overlap on getUserMedia, the second one's resolved
-    // write clobbers the first's refs; the first's gen-check then
-    // calls stopAudio — which disconnects the SECOND call's graph
-    // because the instance vars now point at its nodes. Chaining
-    // start/stop onto a single promise prevents overlap entirely.
-    let restartAudioChain = Promise.resolve();
+    // Per-instance promise chain that serializes ALL audio-lifecycle
+    // operations that await startAudio — both restartAudio and the
+    // startAudio call from enable. A generation-only check isn't
+    // enough on its own because startAudio() writes to shared
+    // instance vars (stream, audioCtx, sourceNode, gainNode, ...)
+    // BEFORE the post-await gen check fires. If two operations
+    // overlap on getUserMedia, the second's resolved write clobbers
+    // the first's refs, and the first's gen-check stopAudio then
+    // disconnects the SECOND one's graph. Chaining start/stop onto a
+    // single promise prevents overlap entirely.
+    let audioOpChain = Promise.resolve();
+    function queueAudioOp(fn) {
+        const queued = audioOpChain.then(fn);
+        // .catch on the chain itself so one rejected op doesn't
+        // poison every subsequent call. The caller still sees the
+        // unswallowed promise.
+        audioOpChain = queued.catch(() => {});
+        return queued;
+    }
+
     function restartAudio() {
-        const queued = restartAudioChain.then(async () => {
+        return queueAudioOp(async () => {
             sessionGen++;
             const gen = sessionGen;
             stopAudio();
             if (!enabled) return;
             const ok = await startAudio();
-            // Even within a chain, enable()/disable() can still bump
-            // sessionGen between our stop/start and our return — keep
-            // the guard so a disable that interleaves into the chain
-            // tears down what startAudio just acquired.
+            // Even within the chain, disable() can still bump
+            // sessionGen and set !enabled between our stop/start
+            // and our return. Tear down what startAudio just
+            // acquired in that case.
             if (gen !== sessionGen || !enabled) {
                 if (ok) stopAudio();
             }
         });
-        // .catch on the chain itself so one rejected restart doesn't
-        // poison every subsequent call. The caller still sees the
-        // unswallowed promise.
-        restartAudioChain = queued.catch(() => {});
-        return queued;
     }
 
     // ── Level meter ───────────────────────────────────────────────────
@@ -1557,13 +1562,6 @@ function createNoteDetector(options = {}) {
     async function enable() {
         if (enabled) return true;
         enabled = true;
-        // New session — bump the generation counter and snapshot it
-        // so we can detect a disable() / restart that runs while
-        // startAudio() is still awaited (e.g. double-clicking Detect,
-        // playSong-hook silent-disable mid-enable, programmatic
-        // disable from another plugin).
-        sessionGen++;
-        const gen = sessionGen;
         // Make sure the instanceRoot is in the DOM before HUD/summary
         // rendering kicks in — `createNoteDetector({container}).enable()`
         // without a prior `injectButton()` call would otherwise render
@@ -1578,18 +1576,35 @@ function createNoteDetector(options = {}) {
 
         resetScoring();
 
-        const ok = await startAudio();
-        // Cancellation guard — if disable() (or a restart) fired
-        // while we were awaiting getUserMedia / AudioContext setup,
-        // the instance is no longer in this session. Tear down the
-        // audio that startAudio just acquired and bail without
-        // starting HUD / missCheck / GC intervals, which would
-        // otherwise continue running against a disabled instance.
-        if (gen !== sessionGen || !enabled) {
-            if (ok) stopAudio();
+        // Queue the audio acquisition through the shared chain so
+        // enable cannot overlap with a concurrent restartAudio
+        // (settings slider) or another enable. Without this,
+        // startAudio from enable and startAudio from a settings-
+        // triggered restart could both race to write `stream` /
+        // `audioCtx` / node refs.
+        const result = await queueAudioOp(async () => {
+            // New session — bump the generation counter and snapshot
+            // it so we can detect a disable() that fires while
+            // startAudio is still awaited.
+            sessionGen++;
+            const gen = sessionGen;
+            const ok = await startAudio();
+            if (gen !== sessionGen || !enabled) {
+                // Superseded by disable() during the await. Tear down
+                // the audio that just came up.
+                if (ok) stopAudio();
+                return { ok: false, superseded: true };
+            }
+            return { ok, superseded: false };
+        });
+
+        if (result.superseded) {
+            // disable() ran during the await and already set
+            // enabled=false / updated the button. Just report the
+            // aborted enable back to the caller.
             return false;
         }
-        if (!ok) {
+        if (!result.ok) {
             enabled = false;
             updateButton();
             return false;
