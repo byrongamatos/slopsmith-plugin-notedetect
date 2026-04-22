@@ -14,14 +14,28 @@
 
 // ── Module-level shared state ──────────────────────────────────────────────
 
-// CREPE/SPICE model is a ~20 MB download; keep it at module scope so
-// multiple instances share a single load.
-let _ndSharedModel = null;
-let _ndSharedModelLoading = false;
-
-// Registry of live detector APIs. The playSong hook iterates this to
-// disable every instance when a new song loads.
-const _ndInstances = new Set();
+// Shared state anchored on `window` so multiple evaluations of this
+// file (HMR, accidental double <script> load) all see the same
+// registry and model-load state. A bare module-scoped Set would let
+// the second evaluation register its detectors into a fresh set
+// while the first evaluation's live playSong wrapper iterates the
+// old set — breaking song-switch disable/reset on any detector
+// created by the second eval.
+//
+// `_ndShared` is initialised once; subsequent evaluations reuse the
+// existing object. All mutable shared state (CREPE model, loading
+// flag, instance registry, playSong-hook retry counter) lives on it
+// so reassignments land on the canonical object, not on a fresh
+// module-scope copy.
+const _ndShared = (window.__ndShared = window.__ndShared || {
+    model: null,          // CREPE/SPICE model (single ~20 MB load)
+    modelLoading: false,
+    instances: new Set(), // live detector APIs — iterated by playSong hook
+    playSongRetries: 0,   // bounded-retry counter for _ndInstallPlaySongHook
+});
+// Local aliases — kept for readability of the rest of the file, but
+// they're the same objects as `window.__ndShared.*`.
+const _ndInstances = _ndShared.instances;
 
 // (The playSong wrapper's idempotency guard lives on the wrapper
 // function object itself — see `_ndInstallPlaySongHook()` below —
@@ -400,8 +414,8 @@ function _ndHpsDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
 // ── Pitch Detection: CREPE (shared model) ──────────────────────────────────
 
 async function _ndLoadCrepe() {
-    if (_ndSharedModel || _ndSharedModelLoading) return;
-    _ndSharedModelLoading = true;
+    if (_ndShared.model || _ndShared.modelLoading) return;
+    _ndShared.modelLoading = true;
     // Refresh every instance's button so any detector on 'crepe' shows
     // "loading model..." while the ~20 MB download is in flight.
     // Without this, the UI stays idle for the multi-second download
@@ -412,7 +426,7 @@ async function _ndLoadCrepe() {
         if (!window.tf) {
             await _ndLoadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js');
         }
-        _ndSharedModel = await tf.loadGraphModel(
+        _ndShared.model = await tf.loadGraphModel(
             'https://tfhub.dev/google/tfjs-model/spice/2/default/1',
             { fromTFHub: true }
         );
@@ -420,16 +434,16 @@ async function _ndLoadCrepe() {
     } catch (e1) {
         console.warn('SPICE TFHub load failed, trying CREPE backup:', e1);
         try {
-            _ndSharedModel = await tf.loadLayersModel(
+            _ndShared.model = await tf.loadLayersModel(
                 'https://cdn.jsdelivr.net/gh/nicksherron/crepe-js@master/model/model.json'
             );
             console.log('CREPE model loaded (fallback)');
         } catch (e2) {
             console.warn('All model loads failed, using YIN for this session:', e2);
-            _ndSharedModel = null;
+            _ndShared.model = null;
         }
     }
-    _ndSharedModelLoading = false;
+    _ndShared.modelLoading = false;
     // Update every instance's button — any of them might be on crepe.
     for (const inst of _ndInstances) inst._updateButton();
 }
@@ -446,14 +460,14 @@ function _ndLoadScript(src) {
 }
 
 async function _ndCrepeDetect(buffer) {
-    if (!_ndSharedModel) return { freq: -1, confidence: 0 };
+    if (!_ndShared.model) return { freq: -1, confidence: 0 };
     try {
         const input = tf.tensor(buffer, [1, buffer.length]);
         let outputs;
-        if (_ndSharedModel.execute) {
-            outputs = _ndSharedModel.execute(input);
+        if (_ndShared.model.execute) {
+            outputs = _ndShared.model.execute(input);
         } else {
-            outputs = _ndSharedModel.predict(input);
+            outputs = _ndShared.model.predict(input);
         }
 
         let freq = -1, confidence = 0;
@@ -964,7 +978,7 @@ function createNoteDetector(options = {}) {
         const sr = audioCtx ? audioCtx.sampleRate : 48000;
         switch (detectionMethod) {
             case 'crepe':
-                if (_ndSharedModel) {
+                if (_ndShared.model) {
                     result = await _ndCrepeDetect(buffer);
                     detectorUsed = 'crepe';
                     if (result.freq <= 0 || result.confidence < 0.3) {
@@ -1582,7 +1596,7 @@ function createNoteDetector(options = {}) {
 
     function updateButton() {
         if (!detectBtn) return;
-        const loading = detectionMethod === 'crepe' && _ndSharedModelLoading;
+        const loading = detectionMethod === 'crepe' && _ndShared.modelLoading;
         if (loading) {
             detectBtn.textContent = 'Detect (loading model...)';
             detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-dark-600 rounded-lg text-xs text-gray-400 transition';
@@ -1897,7 +1911,6 @@ function createNoteDetector(options = {}) {
 // disables instances twice per song switch. Marking the function
 // itself persists across re-evaluations because `window.playSong`
 // keeps the reference.
-let _ndPlaySongRetries = 0;
 const _ND_PLAY_SONG_MAX_RETRIES = 20;
 function _ndInstallPlaySongHook() {
     const origPlaySong = window.playSong;
@@ -1907,7 +1920,9 @@ function _ndInstallPlaySongHook() {
         // defines it. Retry a bounded number of times on the next
         // task — cap prevents an infinite loop in host environments
         // that never define playSong (e.g. the node:test vm harness).
-        if (_ndPlaySongRetries++ < _ND_PLAY_SONG_MAX_RETRIES) {
+        // Retry counter lives on `_ndShared` so a second evaluation
+        // doesn't get a fresh 20-attempt budget on top of the first.
+        if (_ndShared.playSongRetries++ < _ND_PLAY_SONG_MAX_RETRIES) {
             setTimeout(_ndInstallPlaySongHook, 50);
         }
         return;
