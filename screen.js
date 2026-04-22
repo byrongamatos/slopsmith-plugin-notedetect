@@ -1384,6 +1384,11 @@ function createNoteDetector(options = {}) {
 
         if (countsEl && total > 0) {
             countsEl.textContent = `${hits} / ${total}`;
+        } else if (countsEl) {
+            // Clear on zero-total so a reset/new-song enable doesn't
+            // show the previous session's `X / Y` until the first
+            // judgment lands. Mirrors the accuracy label's else-branch.
+            countsEl.textContent = '';
         }
 
         if (detectedEl) {
