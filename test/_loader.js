@@ -55,11 +55,17 @@ function makeSandbox() {
         navigator: navigatorStub,
         location: { protocol: 'http:', host: 'localhost' },
         console,
-        // Stubbed setTimeout: no-op that returns a handle so the
-        // playSong-hook bounded-retry runs once but doesn't actually
-        // schedule anything in the real event loop (keeps the test
-        // process from lingering on pending timers).
-        setTimeout: () => 0,
+        // Stubbed setTimeout: invoke the callback synchronously once
+        // and return a dummy handle so the playSong-hook bounded
+        // retry runs without scheduling anything in the real event
+        // loop (keeps the test process from lingering on pending
+        // timers). The `window.playSong` stub below resolves on the
+        // first attempt, so one synchronous invocation is enough to
+        // install the hook in any test that needs it.
+        setTimeout: (callback) => {
+            if (typeof callback === 'function') callback();
+            return 0;
+        },
         clearTimeout: noop,
         setInterval: () => 0,
         clearInterval: noop,

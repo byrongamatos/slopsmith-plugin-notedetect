@@ -253,10 +253,16 @@ function _ndFftInPlace(data, direction) {
 // Reuses scratch buffers across calls — at ~20 fps a per-frame pair of
 // Float32Array allocations (32 kB interleaved + 32 kB magnitudes at
 // 48 kHz / 16384 fftSize) becomes real GC pressure. We re-allocate
-// only when fftSize changes. Safe across detector instances because
-// _ndProcessFrame has an in-flight guard preventing concurrent
-// execution, and the FFT's non-reentrancy only matters within one
-// call anyway.
+// only when fftSize changes. These module-level scratch buffers are
+// shared by every detector instance, which is safe only because
+// FFT work here is fully synchronous and JS runs on one thread — the
+// scratch is written and read to completion before any other instance
+// (or any async continuation) can enter. Each factory instance has
+// its own `processingFrame` in-flight guard that serializes its own
+// calls; concurrent calls from *different* instances never interleave
+// inside `_ndFftMagnitude` because there are no awaits inside it.
+// An async/parallel future (Web Workers, AudioWorklet with real
+// re-entrancy) would need per-instance or per-call scratch instead.
 let _ndFftInterleavedScratch = null;
 let _ndFftMagnitudesScratch = null;
 let _ndFftScratchSize = 0;
@@ -765,6 +771,12 @@ function createNoteDetector(options = {}) {
         } catch (e) {
             console.error('Note detect: mic access denied or failed:', e);
             alert('Note Detection: Could not access audio input.\n\n' + e.message);
+            // Partial-init cleanup — if we got as far as acquiring the
+            // stream or creating any AudioNodes before the throw, we
+            // own the teardown. stopAudio is null-safe for every
+            // resource and respects ownsStream / ownsAudioCtx, so it
+            // handles partial state regardless of where we failed.
+            stopAudio();
             return false;
         }
     }
