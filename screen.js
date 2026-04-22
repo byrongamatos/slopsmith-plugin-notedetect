@@ -1611,8 +1611,29 @@ function createNoteDetector(options = {}) {
         detectedFret = -1;
     }
 
-    async function enable() {
-        if (enabled) return true;
+    // Tracks an in-flight enable() promise. A second enable() call
+    // while the first is still awaiting startAudio returns the
+    // SAME promise rather than short-circuiting on the already-set
+    // `enabled` flag — otherwise the second caller would see
+    // `return true` while audio isn't actually started yet, and if
+    // startAudio ultimately failed, the first call's cleanup would
+    // flip `enabled` back to false after the second had already
+    // reported success.
+    let enableInFlight = null;
+    function enable() {
+        if (enableInFlight) return enableInFlight;
+        if (enabled) return Promise.resolve(true);
+        enableInFlight = (async () => {
+            try {
+                return await enableImpl();
+            } finally {
+                enableInFlight = null;
+            }
+        })();
+        return enableInFlight;
+    }
+
+    async function enableImpl() {
         // Resolve the highway lazily — supports plugin load orders
         // where highway isn't defined at factory construction. If
         // it's still missing, there's nothing to hook into, so bail

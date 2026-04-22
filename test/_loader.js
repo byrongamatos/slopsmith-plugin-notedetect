@@ -53,7 +53,7 @@ function makeSandbox() {
         document: documentStub,
         localStorage: localStorageStub,
         navigator: navigatorStub,
-        location: { protocol: 'http:', host: 'localhost' },
+        location: { protocol: 'http:', host: 'localhost', hostname: 'localhost' },
         console,
         // Stubbed setTimeout: invoke the callback synchronously once
         // and return a dummy handle so the playSong-hook bounded
