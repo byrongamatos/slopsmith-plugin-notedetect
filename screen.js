@@ -256,6 +256,11 @@ let _ndFftInterleavedScratch = null;
 let _ndFftMagnitudesScratch = null;
 let _ndFftScratchSize = 0;
 
+// HPS scratch — reallocated only when highBin changes. Same GC-pressure
+// rationale as the FFT buffers above.
+let _ndHpsScratch = null;
+let _ndHpsScratchSize = 0;
+
 function _ndFftMagnitude(buffer, sampleRate) {
     // Target ~3 Hz bin width regardless of device sample rate. A fixed
     // floor (e.g. 16384) would degrade to ~5.86 Hz/bin at 96 kHz and
@@ -351,7 +356,11 @@ function _ndHpsDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     // with a floor — more numerically stable and, because log is
     // monotonic, preserves the same peak location as the textbook product
     // formulation.
-    const hps = new Float32Array(highBin + 1);
+    if (_ndHpsScratchSize <= highBin) {
+        _ndHpsScratch = new Float32Array(highBin + 1);
+        _ndHpsScratchSize = highBin + 1;
+    }
+    const hps = _ndHpsScratch;
     let peakBin = lowBin;
     let peakVal = -Infinity;
     let sum = 0;
