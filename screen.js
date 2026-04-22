@@ -67,6 +67,19 @@ function _ndFreqToMidi(freq) {
     return 12 * Math.log2(freq / 440) + 69;
 }
 
+// MIDI → scientific pitch name (e.g. 40 → "E2"). Rounds to the nearest
+// semitone. Used by the HUD so the "detected note" label is correct
+// regardless of arrangement, tuning offsets, or capo — the previous
+// implementation hardcoded `['E2','A2','D3','G3','B3','E4']` indexed
+// by string, which mislabelled every bass / 7-string / retuned note.
+const _ND_PITCH_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+function _ndMidiToName(midi) {
+    const rounded = Math.round(midi);
+    const pc = ((rounded % 12) + 12) % 12;
+    const octave = Math.floor(rounded / 12) - 1;
+    return _ND_PITCH_NAMES[pc] + octave;
+}
+
 function _ndMidiFromStringFret(string, fret, arrangement, stringCount, offsets, capo) {
     const base = _ndStandardMidiFor(arrangement, stringCount);
     const offset = offsets && offsets[string] !== undefined ? offsets[string] : 0;
@@ -526,8 +539,22 @@ function createNoteDetector(options = {}) {
 
     // ── Per-instance state ────────────────────────────────────────────
     let enabled = false;
+    // Session generation — incremented on every disable(). A frame
+    // that captures the value at the start of processing and re-checks
+    // after an `await _ndCrepeDetect(...)` can drop its result rather
+    // than apply stale hits to a disabled (or re-enabled) session.
+    let sessionGen = 0;
     let audioCtx = null;
     let stream = null;
+    // Full audio-node chain — stored so stopAudio can disconnect
+    // every node, not just the ScriptProcessor. Matters particularly
+    // in borrower mode (external audioCtx): without tearing these
+    // down the caller's context graph grows by N nodes per
+    // enable/disable cycle.
+    let sourceNode = null;
+    let gainNode = null;
+    let splitterNode = null;
+    let mergerNode = null;
     let worklet = null;
     let levelAnalyser = null;
 
@@ -672,21 +699,21 @@ function createNoteDetector(options = {}) {
             // just one of {stream, context} and we create the other.
             audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
 
-            const source = audioCtx.createMediaStreamSource(stream);
-            const streamChannels = source.channelCount;
+            sourceNode = audioCtx.createMediaStreamSource(stream);
+            const streamChannels = sourceNode.channelCount;
 
-            const gainNode = audioCtx.createGain();
+            gainNode = audioCtx.createGain();
             gainNode.gain.value = inputGain;
 
             if (streamChannels >= 2 && selectedChannel !== 'mono') {
-                const splitter = audioCtx.createChannelSplitter(2);
-                source.connect(splitter);
-                const merger = audioCtx.createChannelMerger(1);
+                splitterNode = audioCtx.createChannelSplitter(2);
+                sourceNode.connect(splitterNode);
+                mergerNode = audioCtx.createChannelMerger(1);
                 const chIdx = selectedChannel === 'left' ? 0 : 1;
-                splitter.connect(merger, chIdx, 0);
-                merger.connect(gainNode);
+                splitterNode.connect(mergerNode, chIdx, 0);
+                mergerNode.connect(gainNode);
             } else {
-                source.connect(gainNode);
+                sourceNode.connect(gainNode);
             }
 
             levelAnalyser = audioCtx.createAnalyser();
@@ -746,11 +773,35 @@ function createNoteDetector(options = {}) {
         stopLevelMeter();
         if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
         pendingBuffer = null;
+        // Disconnect the full node chain in reverse-connect order.
+        // Critical in borrower mode (external audioCtx): we leave the
+        // caller's context open, and any node we don't disconnect
+        // stays live in its graph across enable/disable cycles.
         if (worklet) {
+            worklet.onaudioprocess = null;
             try { worklet.disconnect(); } catch (e) { /* already disconnected */ }
             worklet = null;
         }
-        levelAnalyser = null;
+        if (levelAnalyser) {
+            try { levelAnalyser.disconnect(); } catch (e) {}
+            levelAnalyser = null;
+        }
+        if (gainNode) {
+            try { gainNode.disconnect(); } catch (e) {}
+            gainNode = null;
+        }
+        if (mergerNode) {
+            try { mergerNode.disconnect(); } catch (e) {}
+            mergerNode = null;
+        }
+        if (splitterNode) {
+            try { splitterNode.disconnect(); } catch (e) {}
+            splitterNode = null;
+        }
+        if (sourceNode) {
+            try { sourceNode.disconnect(); } catch (e) {}
+            sourceNode = null;
+        }
         // Tear down each resource only if we own it. Ownership is
         // tracked per-resource (see ownsStream / ownsAudioCtx at the
         // top of the factory) so a caller can pass just a stream or
@@ -824,6 +875,13 @@ function createNoteDetector(options = {}) {
     async function processFrame(buffer) {
         let result;
         let detectorUsed;
+        // Capture the session generation at frame start. disable()
+        // increments sessionGen, so any frame that was already running
+        // past an `await` sees a changed generation and bails rather
+        // than apply stale hits / fire stale events. Without this
+        // guard a CREPE inference in flight during song switch would
+        // score against the old session's chart.
+        const gen = sessionGen;
         const sr = audioCtx ? audioCtx.sampleRate : 48000;
         switch (detectionMethod) {
             case 'crepe':
@@ -848,6 +906,11 @@ function createNoteDetector(options = {}) {
                 result = _ndYinDetect(buffer, sr);
                 detectorUsed = 'yin';
         }
+
+        // If the instance was disabled (or re-enabled into a new
+        // session) while CREPE was awaiting, drop this result on the
+        // floor — don't touch detection state or fire events.
+        if (!enabled || gen !== sessionGen) return;
 
         if (result.freq <= 0 || result.confidence < 0.3) {
             if (result.underBuffered && !underBufferWarned) {
@@ -1250,8 +1313,10 @@ function createNoteDetector(options = {}) {
 
         if (detectedEl) {
             if (detectedString >= 0 && detectedConfidence > 0.3) {
-                const names = ['E2', 'A2', 'D3', 'G3', 'B3', 'E4'];
-                detectedEl.textContent = `${names[detectedString] || '?'} fret ${detectedFret}`;
+                // Derive the label from the detected MIDI (always correct)
+                // rather than indexing a guitar-6 lookup by string — bass,
+                // 7-string guitar, non-standard tuning, and capo all work.
+                detectedEl.textContent = `${_ndMidiToName(detectedMidi)} · s${detectedString} f${detectedFret}`;
             } else {
                 detectedEl.textContent = '';
             }
@@ -1491,6 +1556,10 @@ function createNoteDetector(options = {}) {
     function disable(opts) {
         if (!enabled) return;
         enabled = false;
+        // Invalidate any CREPE inference currently awaited in
+        // processFrame — it captured the previous sessionGen and will
+        // bail on mismatch rather than apply post-disable detections.
+        sessionGen++;
         stopAudio();
         stopHUD();
         if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
