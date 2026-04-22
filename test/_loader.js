@@ -160,8 +160,8 @@ function loadDetectionCore() {
         return { string: r.string, fret: r.fret };
     };
 
-    const resolveDisplayFingeringWrapped = (detectedMidi, candidates, arrangement = 'guitar', pitchTolCents = 50) => {
-        const sc = arrangement === 'bass' ? 4 : 6;
+    const resolveDisplayFingeringWrapped = (detectedMidi, candidates, arrangement = 'guitar', pitchTolCents = 50, stringCount) => {
+        const sc = stringCount ?? (arrangement === 'bass' ? 4 : 6);
         const r = sandbox._ndResolveDisplayFingering(
             detectedMidi, candidates, arrangement, sc, defaultOffsetsFor(arrangement, sc), 0, pitchTolCents
         );
