@@ -527,7 +527,17 @@ async function _ndCrepeDetect(buffer) {
 //   showSummary()    — force-show the end-of-song summary modal
 function createNoteDetector(options = {}) {
     const opts = options || {};
-    const hw = opts.highway || window.highway;
+    // Highway is resolved lazily. A caller can pass `highway` in
+    // options for explicit binding (splitscreen per-panel use);
+    // otherwise we fall back to `window.highway`, re-checking on
+    // every access so late initialization (plugin loads before
+    // slopsmith-core defines highway) is picked up automatically.
+    let hw = opts.highway || window.highway || null;
+    function resolveHw() {
+        if (hw) return hw;
+        hw = opts.highway || window.highway || null;
+        return hw;
+    }
     const isDefault = !!opts.isDefault;
 
     // Audio ownership: if caller passed stream/ctx in, they own the
@@ -651,8 +661,19 @@ function createNoteDetector(options = {}) {
     // Draw hook — registered once per instance; removed in destroy().
     // The hook itself early-returns when !enabled, so the cost is
     // minimal for a disabled instance. Stored so removeDrawHook() can
-    // find the same reference.
+    // find the same reference. If `hw` isn't resolved at construction
+    // time (plugin loaded before highway), ensureDrawHook retries on
+    // first enable.
     const drawHookFn = (ctx, W, H) => drawOverlay(ctx, W, H);
+    let drawHookRegistered = false;
+    function ensureDrawHook() {
+        if (drawHookRegistered) return;
+        const h = resolveHw();
+        if (h && h.addDrawHook) {
+            h.addDrawHook(drawHookFn);
+            drawHookRegistered = true;
+        }
+    }
 
     // ── Settings persistence (only the default singleton writes) ──────
     function saveSettings() {
@@ -1274,12 +1295,23 @@ function createNoteDetector(options = {}) {
         if (method === 'crepe') _ndLoadCrepe();
     }
 
+    // Accepts only the documented channel indices (-1 mono, 0 left,
+    // 1 right). Returns `false` and leaves the channel unchanged for
+    // anything else so upstream bugs (stringified input, out-of-range
+    // index) surface instead of silently coercing to mono.
     function setChannel(idx) {
-        if (idx === 0) selectedChannel = 'left';
-        else if (idx === 1) selectedChannel = 'right';
-        else selectedChannel = 'mono';
+        let next;
+        if (idx === -1) next = 'mono';
+        else if (idx === 0) next = 'left';
+        else if (idx === 1) next = 'right';
+        else {
+            console.warn(`[note_detect] setChannel: invalid channel ${idx}; expected -1 (mono), 0 (left), or 1 (right).`);
+            return false;
+        }
+        selectedChannel = next;
         saveSettings();
         restartAudio();
+        return true;
     }
 
     // ── HUD ───────────────────────────────────────────────────────────
@@ -1561,6 +1593,15 @@ function createNoteDetector(options = {}) {
 
     async function enable() {
         if (enabled) return true;
+        // Resolve the highway lazily — supports plugin load orders
+        // where highway isn't defined at factory construction. If
+        // it's still missing, there's nothing to hook into, so bail
+        // cleanly rather than throw from `hw.getSongInfo()` below.
+        if (!resolveHw()) {
+            console.warn('[note_detect] enable() called but `highway` is not available yet — plugin may have loaded before slopsmith core.');
+            return false;
+        }
+        ensureDrawHook();
         enabled = true;
         // Make sure the instanceRoot is in the DOM before HUD/summary
         // rendering kicks in — `createNoteDetector({container}).enable()`
@@ -1629,11 +1670,13 @@ function createNoteDetector(options = {}) {
         return true;
     }
 
-    // `opts.silent: true` suppresses the end-of-song summary modal.
-    // The playSong hook uses this when a new song loads so the user
-    // doesn't see a summary pop every song switch; the original
-    // pre-factory behaviour was to silently reset here.
-    function disable(opts) {
+    // `disableOptions.silent: true` suppresses the end-of-song summary
+    // modal. The playSong hook uses this when a new song loads so the
+    // user doesn't see a summary pop every song switch; the original
+    // pre-factory behaviour was to silently reset here. Parameter is
+    // named distinctly from the factory's outer `opts` to avoid the
+    // lexical shadow.
+    function disable(disableOptions) {
         if (!enabled) return;
         enabled = false;
         // Invalidate any CREPE inference currently awaited in
@@ -1647,7 +1690,7 @@ function createNoteDetector(options = {}) {
         for (const tid of flashTimeouts) clearTimeout(tid);
         flashTimeouts = [];
 
-        if (!opts || !opts.silent) showSummary();
+        if (!disableOptions || !disableOptions.silent) showSummary();
 
         const panel = instanceRoot.querySelector('.nd-settings-panel');
         if (panel) panel.remove();
@@ -1777,7 +1820,9 @@ function createNoteDetector(options = {}) {
 
     // Register the draw hook once per instance. The hook early-returns
     // on !enabled so disabled instances cost essentially nothing.
-    if (hw && hw.addDrawHook) hw.addDrawHook(drawHookFn);
+    // If highway isn't ready at construction time, ensureDrawHook()
+    // (called from enable()) re-tries after resolving `hw` lazily.
+    ensureDrawHook();
 
     _ndInstances.add(api);
     return api;
