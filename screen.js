@@ -831,8 +831,22 @@ function createNoteDetector(options = {}) {
     }
 
     async function restartAudio() {
+        // The settings-panel sliders/selects call this without
+        // awaiting the promise, so a user dragging a slider can
+        // overlap multiple restarts. Without serialization, an
+        // earlier startAudio() can still create / connect nodes or
+        // acquire a MediaStream AFTER a later stopAudio() has run,
+        // leaving orphan nodes and an inconsistent state. Bump the
+        // session generation and capture it; after the await, bail
+        // (with cleanup) if a newer restart has taken over.
+        sessionGen++;
+        const gen = sessionGen;
         stopAudio();
-        if (enabled) await startAudio();
+        if (!enabled) return;
+        const ok = await startAudio();
+        if (gen !== sessionGen || !enabled) {
+            if (ok) stopAudio();
+        }
     }
 
     // ── Level meter ───────────────────────────────────────────────────
@@ -1520,6 +1534,13 @@ function createNoteDetector(options = {}) {
     async function enable() {
         if (enabled) return true;
         enabled = true;
+        // New session — bump the generation counter and snapshot it
+        // so we can detect a disable() / restart that runs while
+        // startAudio() is still awaited (e.g. double-clicking Detect,
+        // playSong-hook silent-disable mid-enable, programmatic
+        // disable from another plugin).
+        sessionGen++;
+        const gen = sessionGen;
         // Make sure the instanceRoot is in the DOM before HUD/summary
         // rendering kicks in — `createNoteDetector({container}).enable()`
         // without a prior `injectButton()` call would otherwise render
@@ -1535,6 +1556,16 @@ function createNoteDetector(options = {}) {
         resetScoring();
 
         const ok = await startAudio();
+        // Cancellation guard — if disable() (or a restart) fired
+        // while we were awaiting getUserMedia / AudioContext setup,
+        // the instance is no longer in this session. Tear down the
+        // audio that startAudio just acquired and bail without
+        // starting HUD / missCheck / GC intervals, which would
+        // otherwise continue running against a disabled instance.
+        if (gen !== sessionGen || !enabled) {
+            if (ok) stopAudio();
+            return false;
+        }
         if (!ok) {
             enabled = false;
             updateButton();
