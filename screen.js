@@ -604,7 +604,12 @@ function createNoteDetector(options = {}) {
         if (raw) {
             const s = JSON.parse(raw);
             if (s.deviceId !== undefined) selectedDeviceId = s.deviceId;
-            if (s.channel) selectedChannel = s.channel;
+            // Allowlist channel — a manually-edited or future-version
+            // storage value would otherwise fall through `startAudio`'s
+            // `selectedChannel === 'left' ? 0 : 1` check and silently
+            // default to the right channel. Same defensive shape as
+            // the method allowlist below.
+            if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
             if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
             if (s.timingTolerance !== undefined) timingTolerance = s.timingTolerance;
             if (s.pitchTolerance !== undefined) pitchTolerance = s.pitchTolerance;
@@ -804,7 +809,16 @@ function createNoteDetector(options = {}) {
             return true;
         } catch (e) {
             console.error('Note detect: mic access denied or failed:', e);
-            alert('Note Detection: Could not access audio input.\n\n' + e.message);
+            // Suppress the user-facing alert if the instance is no
+            // longer enabled — the enable/restart was superseded by a
+            // concurrent disable (e.g. song switch while the mic
+            // permission prompt was open). Surfacing an error the
+            // user never asked to see in that case is just noise.
+            // The console.error still goes to devtools for
+            // diagnostics.
+            if (enabled) {
+                alert('Note Detection: Could not access audio input.\n\n' + e.message);
+            }
             // Partial-init cleanup — if we got as far as acquiring the
             // stream or creating any AudioNodes before the throw, we
             // own the teardown. stopAudio is null-safe for every
