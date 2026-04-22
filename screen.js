@@ -633,7 +633,7 @@ function _ndMatchNotes() {
                         confidence: _ndDetectedConfidence,
                     },
                 }));
-            } catch { /* listener threw; scoring continues */ }
+            } catch (e) { /* listener threw; scoring continues */ }
         }
     }
 }
@@ -667,7 +667,7 @@ function _ndCheckMisses() {
                         expectedMidi: _ndMidiFromStringFret(s, f, _ndCurrentArrangement),
                     },
                 }));
-            } catch { /* listener threw; miss-checking continues */ }
+            } catch (e) { /* listener threw; miss-checking continues */ }
         }
     };
 
