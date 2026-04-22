@@ -244,14 +244,38 @@ function _ndFftInPlace(data, direction) {
 // Hann window + zero-pad + forward FFT → magnitude spectrum.
 // Returns `{ magnitudes, binHz, fftSize }` so callers can map bin → Hz
 // directly. Magnitude length is fftSize/2 + 1 (Nyquist-inclusive).
+//
+// Reuses scratch buffers across calls — at ~20 fps a per-frame pair of
+// Float32Array allocations (32 kB interleaved + 32 kB magnitudes at
+// 48 kHz / 16384 fftSize) becomes real GC pressure. We re-allocate
+// only when fftSize changes.
+let _ndFftInterleavedScratch = null;
+let _ndFftMagnitudesScratch = null;
+let _ndFftScratchSize = 0;
+
 function _ndFftMagnitude(buffer, sampleRate) {
-    // 16384-bin floor → ~2.93 Hz resolution at 48 kHz. Lower floor like
-    // 8192 (5.86 Hz) puts low-B (30.87 Hz) at bin ~5.27, where even
-    // parabolic interpolation leaves ~90 cents of drift. Doubling the
-    // FFT size is a one-time cost well below the per-frame budget and
-    // makes 5-string bass usable.
-    const fftSize = Math.max(_ndNextPow2(buffer.length), 16384);
-    const interleaved = new Float32Array(2 * fftSize);
+    // Target ~3 Hz bin width regardless of device sample rate. A fixed
+    // floor (e.g. 16384) would degrade to ~5.86 Hz/bin at 96 kHz and
+    // reintroduce the low-B binning problem (30.87 Hz ≈ bin 5.27 with
+    // ~90 cents of drift even after parabolic interpolation). Deriving
+    // the floor from sampleRate keeps the fundamental resolvable on
+    // 5-string bass across any rate a modern audio interface serves.
+    const TARGET_BIN_HZ = 3;
+    const resolutionFloor = _ndNextPow2(Math.ceil(sampleRate / TARGET_BIN_HZ));
+    const fftSize = Math.max(_ndNextPow2(buffer.length), resolutionFloor);
+    const halfBins = (fftSize >> 1) + 1;
+
+    if (_ndFftScratchSize !== fftSize) {
+        _ndFftInterleavedScratch = new Float32Array(2 * fftSize);
+        _ndFftMagnitudesScratch = new Float32Array(halfBins);
+        _ndFftScratchSize = fftSize;
+    }
+    const interleaved = _ndFftInterleavedScratch;
+    const magnitudes = _ndFftMagnitudesScratch;
+    // Zero the scratch — windowed buffer fills only the first 2*buffer.length
+    // slots, but the FFT reads the whole array.
+    interleaved.fill(0);
+
     // Hann-window the real part, leave imag as zero. Windowing reduces
     // spectral leakage from a finite-length buffer.
     for (let i = 0; i < buffer.length; i++) {
@@ -259,8 +283,6 @@ function _ndFftMagnitude(buffer, sampleRate) {
         interleaved[2 * i] = buffer[i] * w;
     }
     _ndFftInPlace(interleaved, 1);
-    const halfBins = (fftSize >> 1) + 1;
-    const magnitudes = new Float32Array(halfBins);
     for (let k = 0; k < halfBins; k++) {
         const re = interleaved[2 * k];
         const im = interleaved[2 * k + 1];
@@ -665,6 +687,9 @@ function _ndDrawSettingsVU() {
 
 async function _ndProcessFrame(buffer) {
     let result;
+    let detectorUsed; // name the detector that actually produced `result`
+                     // so diagnostics (e.g. the undersized-buffer warning)
+                     // don't misattribute YIN's state to CREPE.
     const sr = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
     // HPS intentionally doesn't auto-fall-back to YIN on a weak result
     // — if a user opts in to a frequency-domain detector, they get it.
@@ -678,24 +703,29 @@ async function _ndProcessFrame(buffer) {
         case 'crepe':
             if (_ndModel) {
                 result = await _ndCrepeDetect(buffer);
+                detectorUsed = 'crepe';
                 if (result.freq <= 0 || result.confidence < 0.3) {
                     result = _ndYinDetect(buffer, sr);
+                    detectorUsed = 'yin';
                 }
                 break;
             }
             result = _ndYinDetect(buffer, sr); // model hasn't finished loading
+            detectorUsed = 'yin';
             break;
         case 'hps':
             result = _ndHpsDetect(buffer, sr);
+            detectorUsed = 'hps';
             break;
         case 'yin':
         default:
             result = _ndYinDetect(buffer, sr);
+            detectorUsed = 'yin';
     }
 
     if (result.freq <= 0 || result.confidence < 0.3) {
         if (result.underBuffered && !_ndUnderBufferWarned) {
-            console.warn(`[note_detect] ${_ndDetectionMethod} received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.`);
+            console.warn(`[note_detect] ${detectorUsed} received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.`);
             _ndUnderBufferWarned = true;
         }
         _ndDetectedMidi = -1;
