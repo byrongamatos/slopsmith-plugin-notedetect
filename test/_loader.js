@@ -62,9 +62,18 @@ function makeSandbox() {
         requestAnimationFrame: () => 0,
         cancelAnimationFrame: noop,
         Float32Array, Int16Array, Uint8Array, Array, Map, Set, Date, Math, JSON, Error,
-        Promise,
+        Promise, CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
         // Highway API stub — plugin's IIFE at bottom reads window.playSong
-        highway: { getTime: () => 0, getNotes: () => [], getSongInfo: () => ({}) },
+        highway: {
+            getTime: () => 0,
+            getNotes: () => [],
+            getChords: () => [],
+            getSections: () => [],
+            getSongInfo: () => ({}),
+            getAvOffset: () => 0,
+            addDrawHook: noop,
+            removeDrawHook: noop,
+        },
     };
 }
 
@@ -85,6 +94,7 @@ function loadDetectionCore() {
         '_ndYinDetect', '_ndHpsDetect', '_ndFreqToMidi',
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
         '_ndResolveDisplayFingering',
+        'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
@@ -103,13 +113,50 @@ function loadDetectionCore() {
         return { freq: r.freq, confidence: r.confidence, underBuffered: r.underBuffered };
     };
 
+    // Test-friendly wrappers for the now-explicit pure mapping helpers.
+    // The factory refactor removed module-level fallbacks that defaulted
+    // to the default singleton's state; tests don't operate through the
+    // factory, so defaults live here in the test harness instead.
+    // Defaults: guitar, 6 strings, zero offsets, zero capo.
+    const guitarDefaultOffsets6 = [0, 0, 0, 0, 0, 0];
+    const bassDefaultOffsets4 = [0, 0, 0, 0];
+    const bassDefaultOffsets5 = [0, 0, 0, 0, 0];
+    const guitarDefaultOffsets7 = [0, 0, 0, 0, 0, 0, 0];
+
+    function defaultOffsetsFor(arrangement, stringCount) {
+        if (arrangement === 'bass') {
+            return stringCount === 5 ? bassDefaultOffsets5 : bassDefaultOffsets4;
+        }
+        return stringCount === 7 ? guitarDefaultOffsets7 : guitarDefaultOffsets6;
+    }
+
+    const midiFromStringFretWrapped = (string, fret, arrangement = 'guitar', stringCount) => {
+        const sc = stringCount ?? (arrangement === 'bass' ? 4 : 6);
+        return sandbox._ndMidiFromStringFret(string, fret, arrangement, sc, defaultOffsetsFor(arrangement, sc), 0);
+    };
+
+    const midiToStringFretWrapped = (midi, arrangement = 'guitar', stringCount) => {
+        const sc = stringCount ?? (arrangement === 'bass' ? 4 : 6);
+        const r = sandbox._ndMidiToStringFret(midi, arrangement, sc, defaultOffsetsFor(arrangement, sc), 0);
+        return { string: r.string, fret: r.fret };
+    };
+
+    const resolveDisplayFingeringWrapped = (detectedMidi, candidates, arrangement = 'guitar', pitchTolCents = 50) => {
+        const sc = arrangement === 'bass' ? 4 : 6;
+        const r = sandbox._ndResolveDisplayFingering(
+            detectedMidi, candidates, arrangement, sc, defaultOffsetsFor(arrangement, sc), 0, pitchTolCents
+        );
+        return { string: r.string, fret: r.fret };
+    };
+
     return {
         yinDetect: rewrapYin(sandbox._ndYinDetect),
         hpsDetect: rewrapYin(sandbox._ndHpsDetect),
         freqToMidi: sandbox._ndFreqToMidi,
-        midiFromStringFret: sandbox._ndMidiFromStringFret,
-        midiToStringFret: rewrapSf(sandbox._ndMidiToStringFret),
-        resolveDisplayFingering: rewrapSf(sandbox._ndResolveDisplayFingering),
+        midiFromStringFret: midiFromStringFretWrapped,
+        midiToStringFret: midiToStringFretWrapped,
+        resolveDisplayFingering: resolveDisplayFingeringWrapped,
+        createNoteDetector: sandbox.createNoteDetector,
     };
 }
 
