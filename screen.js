@@ -200,8 +200,9 @@ function _ndNextPow2(n) {
 
 // In-place radix-2 Cooley-Tukey on interleaved {re, im} pairs.
 // `data` has length 2*N (N real/imag pairs). `direction` is +1 for
-// forward, -1 for inverse. No normalization here; callers divide by
-// N themselves when they want the inverse to be an average.
+// forward (standard DFT sign: exp(-i·2π·k·n/N)) and -1 for inverse. No
+// normalization here; callers divide by N themselves when they want
+// the inverse to be an average.
 function _ndFftInPlace(data, direction) {
     const nPairs = data.length >> 1;
     // Bit-reversal permutation — puts inputs in the order the butterfly
@@ -216,10 +217,12 @@ function _ndFftInPlace(data, direction) {
             tmp = data[ir + 1]; data[ir + 1] = data[jr + 1]; data[jr + 1] = tmp;
         }
     }
-    // Butterfly stages.
+    // Butterfly stages. Negate the angle for direction=+1 so the
+    // twiddle exp(i·angle) carries the standard forward-DFT negative
+    // sign; direction=-1 yields the positive sign for inverse use.
     for (let len = 2; len <= nPairs; len <<= 1) {
         const halfLen = len >> 1;
-        const angle = direction * 2 * Math.PI / len;
+        const angle = -direction * 2 * Math.PI / len;
         const wRe = Math.cos(angle);
         const wIm = Math.sin(angle);
         for (let i = 0; i < nPairs; i += len) {
@@ -574,13 +577,20 @@ async function _ndStartAudio() {
             }
         };
 
-        // Detection runs on a timer, not in the audio callback
+        // Detection runs on a timer, not in the audio callback. The
+        // in-flight guard matters when CREPE inference takes longer
+        // than the 50 ms tick — without it, multiple `_ndProcessFrame`
+        // promises can be alive at once and resolve out of order,
+        // letting a stale detection overwrite a newer one. Skipping
+        // while busy is safe because the worklet keeps only the most
+        // recent ready buffer in `_ndPendingBuffer`, so we never queue
+        // up a backlog.
         _ndDetectInterval = setInterval(() => {
-            if (_ndPendingBuffer) {
-                const buf = _ndPendingBuffer;
-                _ndPendingBuffer = null;
-                _ndProcessFrame(buf);
-            }
+            if (_ndProcessingFrame || !_ndPendingBuffer) return;
+            const buf = _ndPendingBuffer;
+            _ndPendingBuffer = null;
+            _ndProcessingFrame = true;
+            _ndProcessFrame(buf).finally(() => { _ndProcessingFrame = false; });
         }, 50); // ~20fps detection — plenty for note matching
 
         gainNode.connect(processor);
@@ -602,6 +612,7 @@ async function _ndStartAudio() {
 
 let _ndDetectInterval = null;
 let _ndPendingBuffer = null;
+let _ndProcessingFrame = false; // in-flight guard — see setInterval below
 
 function _ndStopAudio() {
     _ndStopLevelMeter();
