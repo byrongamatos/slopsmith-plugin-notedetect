@@ -830,23 +830,36 @@ function createNoteDetector(options = {}) {
         accumBuffer = new Float32Array(0);
     }
 
-    async function restartAudio() {
-        // The settings-panel sliders/selects call this without
-        // awaiting the promise, so a user dragging a slider can
-        // overlap multiple restarts. Without serialization, an
-        // earlier startAudio() can still create / connect nodes or
-        // acquire a MediaStream AFTER a later stopAudio() has run,
-        // leaving orphan nodes and an inconsistent state. Bump the
-        // session generation and capture it; after the await, bail
-        // (with cleanup) if a newer restart has taken over.
-        sessionGen++;
-        const gen = sessionGen;
-        stopAudio();
-        if (!enabled) return;
-        const ok = await startAudio();
-        if (gen !== sessionGen || !enabled) {
-            if (ok) stopAudio();
-        }
+    // Per-instance promise chain that serializes restartAudio calls.
+    // A generation-only check isn't enough here because startAudio()
+    // writes to shared instance vars (stream, audioCtx, sourceNode,
+    // gainNode, ...) BEFORE the post-await gen check fires. If two
+    // restarts overlap on getUserMedia, the second one's resolved
+    // write clobbers the first's refs; the first's gen-check then
+    // calls stopAudio — which disconnects the SECOND call's graph
+    // because the instance vars now point at its nodes. Chaining
+    // start/stop onto a single promise prevents overlap entirely.
+    let restartAudioChain = Promise.resolve();
+    function restartAudio() {
+        const queued = restartAudioChain.then(async () => {
+            sessionGen++;
+            const gen = sessionGen;
+            stopAudio();
+            if (!enabled) return;
+            const ok = await startAudio();
+            // Even within a chain, enable()/disable() can still bump
+            // sessionGen between our stop/start and our return — keep
+            // the guard so a disable that interleaves into the chain
+            // tears down what startAudio just acquired.
+            if (gen !== sessionGen || !enabled) {
+                if (ok) stopAudio();
+            }
+        });
+        // .catch on the chain itself so one rejected restart doesn't
+        // poison every subsequent call. The caller still sees the
+        // unswallowed promise.
+        restartAudioChain = queued.catch(() => {});
+        return queued;
     }
 
     // ── Level meter ───────────────────────────────────────────────────
@@ -1348,14 +1361,24 @@ function createNoteDetector(options = {}) {
         }
 
         if (flashEl) {
+            // Track pending flash timeouts so destroy()/disable() can
+            // clear them. Each timeout self-splices from the list on
+            // fire so the array doesn't grow unbounded across a long
+            // session (~60 min of play at ~20 hits/min was previously
+            // accumulating ~1200 stale entries before disable ran).
+            const spawnFlash = (color) => {
+                flashEl.style.borderColor = color;
+                const tid = setTimeout(() => {
+                    if (flashEl) flashEl.style.borderColor = 'transparent';
+                    const idx = flashTimeouts.indexOf(tid);
+                    if (idx !== -1) flashTimeouts.splice(idx, 1);
+                }, 80);
+                flashTimeouts.push(tid);
+            };
             if (hits > lastHitCount) {
-                flashEl.style.borderColor = 'rgba(0, 255, 136, 0.6)';
-                const tid = setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
-                flashTimeouts.push(tid);
+                spawnFlash('rgba(0, 255, 136, 0.6)');
             } else if (misses > lastMissCount) {
-                flashEl.style.borderColor = 'rgba(255, 50, 68, 0.4)';
-                const tid = setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
-                flashTimeouts.push(tid);
+                spawnFlash('rgba(255, 50, 68, 0.4)');
             }
             lastHitCount = hits;
             lastMissCount = misses;
