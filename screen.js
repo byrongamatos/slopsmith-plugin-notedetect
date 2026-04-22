@@ -381,10 +381,14 @@ function _ndHpsDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
 
 // ── Pitch Detection: CREPE (shared model) ──────────────────────────────────
 
-async function _ndLoadCrepe(onProgress) {
+async function _ndLoadCrepe() {
     if (_ndSharedModel || _ndSharedModelLoading) return;
     _ndSharedModelLoading = true;
-    if (onProgress) onProgress('loading');
+    // Refresh every instance's button so any detector on 'crepe' shows
+    // "loading model..." while the ~20 MB download is in flight.
+    // Without this, the UI stays idle for the multi-second download
+    // window and users get no feedback.
+    for (const inst of _ndInstances) inst._updateButton();
 
     try {
         if (!window.tf) {
@@ -408,7 +412,6 @@ async function _ndLoadCrepe(onProgress) {
         }
     }
     _ndSharedModelLoading = false;
-    if (onProgress) onProgress('done');
     // Update every instance's button — any of them might be on crepe.
     for (const inst of _ndInstances) inst._updateButton();
 }
@@ -514,6 +517,12 @@ function createNoteDetector(options = {}) {
     // consult it in stopAudio().
     const externalStream = opts.audioStream || null;
     const externalAudioCtx = opts.audioCtx || null;
+    // Track ownership of each resource independently — a caller can
+    // pass just a stream (we create the context) or just a context
+    // (we open getUserMedia for the stream). Basing teardown on
+    // `!externalStream` alone would leak a context in the former case.
+    const ownsStream = !externalStream;
+    const ownsAudioCtx = !externalAudioCtx;
 
     // ── Per-instance state ────────────────────────────────────────────
     let enabled = false;
@@ -632,9 +641,9 @@ function createNoteDetector(options = {}) {
     // ── Audio pipeline ────────────────────────────────────────────────
     async function startAudio() {
         try {
+            // Acquire the stream — use the supplied one or open
+            // getUserMedia for our own.
             if (externalStream) {
-                // Borrower mode — use the caller's stream and context
-                audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
                 stream = externalStream;
             } else {
                 const constraints = {
@@ -657,8 +666,11 @@ function createNoteDetector(options = {}) {
                     throw new Error(msg);
                 }
                 stream = await navigator.mediaDevices.getUserMedia(constraints);
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             }
+
+            // Acquire the context independently — a caller can supply
+            // just one of {stream, context} and we create the other.
+            audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
 
             const source = audioCtx.createMediaStreamSource(stream);
             const streamChannels = source.channelCount;
@@ -739,13 +751,15 @@ function createNoteDetector(options = {}) {
             worklet = null;
         }
         levelAnalyser = null;
-        // Only tear down stream/context if we created them. If the
-        // caller passed them in via options, they own the lifecycle.
-        if (stream && !externalStream) {
+        // Tear down each resource only if we own it. Ownership is
+        // tracked per-resource (see ownsStream / ownsAudioCtx at the
+        // top of the factory) so a caller can pass just a stream or
+        // just a context without leaking the other.
+        if (stream && ownsStream) {
             stream.getTracks().forEach(t => t.stop());
         }
         stream = null;
-        if (audioCtx && !externalAudioCtx && !externalStream) {
+        if (audioCtx && ownsAudioCtx) {
             try { audioCtx.close(); } catch (e) { /* may already be closed */ }
         }
         audioCtx = null;
@@ -1354,6 +1368,18 @@ function createNoteDetector(options = {}) {
     }
 
     // ── Button injection ──────────────────────────────────────────────
+    // Attach instanceRoot into the DOM. Called from `injectButton()`
+    // and from `enable()` so programmatic `createNoteDetector({container}).enable()`
+    // usage (no button injection) still gets HUD/settings/summary
+    // rendered. Idempotent — re-attaching an already-appended element
+    // is a no-op via the `contains()` guard.
+    function attachInstanceRoot() {
+        const target = container || document.getElementById('player');
+        if (target && !target.contains(instanceRoot)) {
+            target.appendChild(instanceRoot);
+        }
+    }
+
     function injectButton(bar) {
         const controls = bar || document.getElementById('player-controls');
         if (!controls) return;
@@ -1377,12 +1403,11 @@ function createNoteDetector(options = {}) {
         if (closeBtn) controls.insertBefore(gearBtn, closeBtn);
         else controls.appendChild(gearBtn);
 
-        // Attach instanceRoot to the container so HUD/panel/overlay
-        // DOM lives alongside the button.
-        const target = container || document.getElementById('player');
-        if (target && !target.contains(instanceRoot)) {
-            target.appendChild(instanceRoot);
-        }
+        attachInstanceRoot();
+        // Sync button class/text with current state. If the instance
+        // was already enabled (or CREPE is mid-load) when the button is
+        // injected, the default 'Detect' text would be out of date.
+        updateButton();
     }
 
     function updateButton() {
@@ -1419,6 +1444,11 @@ function createNoteDetector(options = {}) {
     async function enable() {
         if (enabled) return true;
         enabled = true;
+        // Make sure the instanceRoot is in the DOM before HUD/summary
+        // rendering kicks in — `createNoteDetector({container}).enable()`
+        // without a prior `injectButton()` call would otherwise render
+        // to a detached subtree.
+        attachInstanceRoot();
         updateButton();
 
         const info = hw.getSongInfo ? hw.getSongInfo() : null;
@@ -1454,7 +1484,11 @@ function createNoteDetector(options = {}) {
         return true;
     }
 
-    function disable() {
+    // `opts.silent: true` suppresses the end-of-song summary modal.
+    // The playSong hook uses this when a new song loads so the user
+    // doesn't see a summary pop every song switch; the original
+    // pre-factory behaviour was to silently reset here.
+    function disable(opts) {
         if (!enabled) return;
         enabled = false;
         stopAudio();
@@ -1464,7 +1498,7 @@ function createNoteDetector(options = {}) {
         for (const tid of flashTimeouts) clearTimeout(tid);
         flashTimeouts = [];
 
-        showSummary();
+        if (!opts || !opts.silent) showSummary();
 
         const panel = instanceRoot.querySelector('.nd-settings-panel');
         if (panel) panel.remove();
@@ -1605,17 +1639,30 @@ function createNoteDetector(options = {}) {
 // then let the original playSong load the chart, then re-inject the default
 // singleton's button. The guard prevents double-wrapping if this script
 // happens to load twice.
+let _ndPlaySongRetries = 0;
+const _ND_PLAY_SONG_MAX_RETRIES = 20;
 function _ndInstallPlaySongHook() {
     if (_ndPlaySongWrapped) return;
     const origPlaySong = window.playSong;
     if (typeof origPlaySong !== 'function') {
-        // playSong may not exist yet; retry on next microtask. In
-        // practice slopsmith's app.js defines it before plugins load.
+        // playSong may not exist yet. Common on HMR or unusual load
+        // orders where the plugin runs before slopsmith's app.js
+        // defines it. Retry a bounded number of times on the next
+        // task — cap prevents an infinite loop in host environments
+        // that never define playSong (e.g. the node:test vm harness).
+        if (_ndPlaySongRetries++ < _ND_PLAY_SONG_MAX_RETRIES) {
+            setTimeout(_ndInstallPlaySongHook, 50);
+        }
         return;
     }
     window.playSong = async function (...args) {
+        // Silent-disable each live instance so scoring doesn't carry
+        // over to the next song, but DON'T show the end-of-song
+        // summary — the original implementation just reset scoring
+        // here, and popping a modal every time a user switches songs
+        // would be a regression.
         for (const inst of _ndInstances) {
-            if (inst.isEnabled()) inst.disable();
+            if (inst.isEnabled()) inst.disable({ silent: true });
         }
         const ret = await origPlaySong.apply(this, args);
         // Re-inject the default singleton's button and re-read tuning

@@ -49,14 +49,18 @@ function makeSandbox() {
         },
     };
 
-    return {
+    const sandbox = {
         document: documentStub,
         localStorage: localStorageStub,
         navigator: navigatorStub,
-        window: {},
         location: { protocol: 'http:', host: 'localhost' },
         console,
-        setTimeout, clearTimeout,
+        // Stubbed setTimeout: no-op that returns a handle so the
+        // playSong-hook bounded-retry runs once but doesn't actually
+        // schedule anything in the real event loop (keeps the test
+        // process from lingering on pending timers).
+        setTimeout: () => 0,
+        clearTimeout: noop,
         setInterval: () => 0,
         clearInterval: noop,
         requestAnimationFrame: () => 0,
@@ -75,6 +79,15 @@ function makeSandbox() {
             removeDrawHook: noop,
         },
     };
+    // window must reference the sandbox itself so the plugin's
+    // `window.playSong = ...` assignments and reads work. Some tests
+    // also look up `window.noteDetect` / `window.createNoteDetector`
+    // after load; those land on the sandbox under `window`.
+    sandbox.window = sandbox;
+    // Minimal playSong stub so _ndInstallPlaySongHook completes on
+    // the first try (avoids a bounded retry loop in the harness).
+    sandbox.playSong = async () => {};
+    return sandbox;
 }
 
 function loadDetectionCore() {

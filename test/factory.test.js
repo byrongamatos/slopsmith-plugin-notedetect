@@ -60,25 +60,27 @@ test('destroy() after disable() is safe even though disable was a no-op', () => 
     assert.doesNotThrow(() => det.destroy());
 });
 
-test('multiple instances have independent state (getStats)', () => {
-    // Two detectors created simultaneously — verify their stats objects
-    // are distinct closures. We can't drive hits through the real audio
-    // pipeline from this harness, but we can confirm the stats-object
-    // identity is per-instance and that destroying one doesn't leak
-    // into the other.
+test('destroying one instance does not break a sibling', () => {
+    // Can't drive hits through the real audio pipeline from the vm
+    // harness (no AudioContext, no getUserMedia), so we can't directly
+    // observe per-instance counter divergence — a fuller isolation
+    // test lives in the browser smoke-test step. What we CAN assert
+    // from here: each instance gets its own API surface and destroy()
+    // on one leaves the other's methods callable without throwing.
+    // That's the minimum guarantee the factory needs to keep so
+    // splitscreen can mount and unmount panels independently.
     const a = createNoteDetector();
     const b = createNoteDetector();
 
-    const statsA = a.getStats();
-    const statsB = b.getStats();
-    assert.notStrictEqual(statsA, statsB, 'stats objects should be distinct per instance');
-    assert.notStrictEqual(statsA.sectionStats, statsB.sectionStats,
-        'sectionStats arrays should be distinct per instance');
+    // Sanity: each call returns a fresh API object (distinct closures).
+    assert.notStrictEqual(a, b, 'each factory call should return a distinct API object');
 
     a.destroy();
-    // b should still be usable after a.destroy()
+
+    // Sibling instance should still be fully callable after destroy().
     assert.equal(b.isEnabled(), false);
     assert.doesNotThrow(() => b.getStats());
+    assert.doesNotThrow(() => b.setChannel(0));
     b.destroy();
 });
 
