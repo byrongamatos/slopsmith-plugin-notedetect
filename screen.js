@@ -1719,10 +1719,17 @@ function createNoteDetector(options = {}) {
     }
 
     function destroy() {
-        disable();
+        // Silent disable on teardown: calling plain disable() would
+        // fire showSummary() (publishing `notedetect:session` and
+        // building the summary overlay) for any instance with ≥5
+        // judgments, but then we immediately remove `instanceRoot`
+        // so the overlay flashes and vanishes. Unexpected for
+        // callers like splitscreen that unmount a panel without
+        // meaning to end-of-song the session.
+        disable({ silent: true });
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
-        try { if (hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
+        try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
         if (detectBtn) { detectBtn.remove(); detectBtn = null; }
         if (gearBtn) { gearBtn.remove(); gearBtn = null; }
         if (instanceRoot.parentNode) instanceRoot.remove();
@@ -1832,6 +1839,14 @@ function createNoteDetector(options = {}) {
         setChannel,
         injectButton,
         showSummary,
+        // Clear hits / misses / streak / noteResults / sectionStats /
+        // detection state back to zeros. Used by the playSong hook so
+        // both ENABLED and DISABLED instances drop stale stats on a
+        // song switch — matches the pre-factory behaviour where the
+        // module-level `_ndResetScoring()` ran on every playSong
+        // regardless of whether detection was on. Safe to call at
+        // any time (doesn't touch audio/UI/timers, just data).
+        resetScoring,
         // Internal — updateButton is called by _ndLoadCrepe() when the
         // shared model finishes loading to refresh every instance's
         // button text. Prefixed with `_` to mark it as non-public.
@@ -1880,13 +1895,19 @@ function _ndInstallPlaySongHook() {
     // points at our wrapper. Bail rather than wrap it again.
     if (origPlaySong._ndWrapped) return;
     const wrapper = async function (...args) {
-        // Silent-disable each live instance so scoring doesn't carry
-        // over to the next song, but DON'T show the end-of-song
-        // summary — the original implementation just reset scoring
-        // here, and popping a modal every time a user switches songs
-        // would be a regression.
+        // For each live instance: silent-disable if currently enabled
+        // (stop audio + timers without popping a summary modal), then
+        // reset scoring unconditionally. Enabled-only disable misses
+        // the case of a DISABLED instance that still holds stale
+        // stats from the previous song — getStats() / showSummary()
+        // on that instance would report yesterday's numbers until
+        // the user clicked Detect again. Pre-factory code had a
+        // single module-level `_ndResetScoring()` that always ran
+        // here; the explicit `resetScoring()` on every instance
+        // preserves that behaviour.
         for (const inst of _ndInstances) {
             if (inst.isEnabled()) inst.disable({ silent: true });
+            if (typeof inst.resetScoring === 'function') inst.resetScoring();
         }
         const ret = await origPlaySong.apply(this, args);
         // Re-inject the default singleton's button and re-read tuning
