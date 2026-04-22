@@ -59,16 +59,27 @@ Other plugins can listen for these `window`-scoped `CustomEvent`s:
 
 | Event | When | `detail` payload |
 |---|---|---|
-| `notedetect:hit` | A chart note is classified as a hit | `{ note: {s, f}, time, expectedMidi, detectedMidi, confidence }` |
-| `notedetect:miss` | A chart note's timing window expires without a matching pitch | `{ note: {s, f}, time, expectedMidi }` |
+| `notedetect:hit` | A chart note is classified as a hit | `{ note, time, noteTime, expectedMidi, detectedMidi, confidence }` |
+| `notedetect:miss` | A chart note's timing window expires without a matching pitch | `{ note, time, noteTime, expectedMidi }` |
 | `notedetect:session` | End of song | aggregate stats for the full run (see [Practice Journal plugin](https://github.com/byrongamatos/slopsmith-plugin-practice) for a consumer) |
 
-Example:
+Field reference for the per-note events:
+
+| Field | Meaning |
+|---|---|
+| `note` | `{ s, f }` — Rocksmith string / fret of the chart note |
+| `time` | Classification time in seconds — the plugin's view of "now" when it made the decision (derived from `highway.getTime()` plus the A/V-sync offset, minus the detector's latency compensation) |
+| `noteTime` | Chart time in seconds — when the note is scheduled on the chart |
+| `expectedMidi` | MIDI number the chart note should produce given the arrangement's tuning |
+| `detectedMidi` | MIDI number the pitch detector actually heard (hit only) |
+| `confidence` | Detector's confidence score, 0–1 (hit only) |
+
+Example — log every hit:
 
 ```js
 window.addEventListener('notedetect:hit', (e) => {
-    const { note, confidence } = e.detail;
-    console.log(`hit string ${note.s} fret ${note.f} (conf ${confidence.toFixed(2)})`);
+    const { note, time, confidence } = e.detail;
+    console.log(`hit ${note.s}/${note.f} at t=${time.toFixed(2)}s (conf ${confidence.toFixed(2)})`);
 });
 ```
 
