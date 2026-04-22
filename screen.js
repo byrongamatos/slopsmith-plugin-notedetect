@@ -617,6 +617,18 @@ function _ndMatchNotes() {
             _ndStreak++;
             if (_ndStreak > _ndBestStreak) _ndBestStreak = _ndStreak;
             _ndUpdateSectionStat('hit');
+            // Per-hit event for real-time integrations (e.g. step-mode,
+            // custom scoring overlays). Emitted alongside the aggregate
+            // `notedetect:session` event fired at end-of-song. See #3.
+            window.dispatchEvent(new CustomEvent('notedetect:hit', {
+                detail: {
+                    note: { s: cn.s, f: cn.f },
+                    time: cn.t,
+                    expectedMidi,
+                    detectedMidi: _ndDetectedMidi,
+                    confidence: _ndDetectedConfidence,
+                },
+            }));
         }
     }
 }
@@ -641,6 +653,13 @@ function _ndCheckMisses() {
             _ndMisses++;
             _ndStreak = 0;
             _ndUpdateSectionStat('miss');
+            window.dispatchEvent(new CustomEvent('notedetect:miss', {
+                detail: {
+                    note: { s, f },
+                    time: noteTime,
+                    expectedMidi: _ndMidiFromStringFret(s, f, _ndCurrentArrangement),
+                },
+            }));
         }
     };
 

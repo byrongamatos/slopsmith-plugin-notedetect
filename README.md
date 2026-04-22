@@ -52,7 +52,25 @@ All settings are persisted in localStorage across sessions.
 - Accuracy percentage displayed in the highway HUD (top right)
 - Streak counter (consecutive hits) and best streak
 - Per-section accuracy breakdown shown when detection is stopped
-- Fires a `notedetect:session` CustomEvent for Practice Journal integration
+
+## Events
+
+Other plugins can listen for these `window`-scoped `CustomEvent`s:
+
+| Event | When | `detail` payload |
+|---|---|---|
+| `notedetect:hit` | A chart note is classified as a hit | `{ note: {s, f}, time, expectedMidi, detectedMidi, confidence }` |
+| `notedetect:miss` | A chart note's timing window expires without a matching pitch | `{ note: {s, f}, time, expectedMidi }` |
+| `notedetect:session` | End of song | aggregate stats for the full run (see [Practice Journal plugin](https://github.com/byrongamatos/slopsmith-plugin-practice) for a consumer) |
+
+Example:
+
+```js
+window.addEventListener('notedetect:hit', (e) => {
+    const { note, confidence } = e.detail;
+    console.log(`hit string ${note.s} fret ${note.f} (conf ${confidence.toFixed(2)})`);
+});
+```
 
 ## Pitch Detection Methods
 
