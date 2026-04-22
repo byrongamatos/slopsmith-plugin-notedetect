@@ -1899,14 +1899,15 @@ function createNoteDetector(options = {}) {
         setChannel,
         injectButton,
         showSummary,
-        // Clear hits / misses / streak / noteResults / sectionStats /
-        // detection state back to zeros. Used by the playSong hook so
-        // both ENABLED and DISABLED instances drop stale stats on a
-        // song switch — matches the pre-factory behaviour where the
-        // module-level `_ndResetScoring()` ran on every playSong
-        // regardless of whether detection was on. Safe to call at
-        // any time (doesn't touch audio/UI/timers, just data).
-        resetScoring,
+        // Internal — clear hits / misses / streak / noteResults /
+        // sectionStats / detection state back to zeros. Used by the
+        // playSong hook so both ENABLED and DISABLED instances drop
+        // stale stats on a song switch — matches the pre-factory
+        // behaviour where the module-level `_ndResetScoring()` ran on
+        // every playSong regardless of whether detection was on.
+        // Safe to call at any time (doesn't touch audio/UI/timers,
+        // just data). Prefixed with `_` to mark it as non-public.
+        _resetScoring: resetScoring,
         // Internal — updateButton is called by _ndLoadCrepe() when the
         // shared model finishes loading to refresh every instance's
         // button text. Prefixed with `_` to mark it as non-public.
@@ -1968,11 +1969,13 @@ function _ndInstallPlaySongHook() {
         // preserves that behaviour.
         for (const inst of _ndInstances) {
             if (inst.isEnabled()) inst.disable({ silent: true });
-            if (typeof inst.resetScoring === 'function') inst.resetScoring();
+            if (typeof inst._resetScoring === 'function') inst._resetScoring();
         }
         const ret = await origPlaySong.apply(this, args);
-        // Re-inject the default singleton's button and re-read tuning
-        // from the newly loaded song.
+        // Re-inject the default singleton's Detect button in case the
+        // loader recreated the player-controls row. Tuning/capo/
+        // arrangement are re-read later inside enable() from
+        // hw.getSongInfo(); no need to refresh them eagerly here.
         if (window.noteDetect) {
             window.noteDetect.injectButton();
         }
