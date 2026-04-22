@@ -1693,6 +1693,12 @@ function createNoteDetector(options = {}) {
         // triggered restart could both race to write `stream` /
         // `audioCtx` / node refs.
         const result = await queueAudioOp(async () => {
+            // Early bail before startAudio: disable()/destroy() may
+            // have run after enable() queued this op but before it
+            // got its turn on the chain. Calling startAudio in that
+            // case would prompt for mic permission and create nodes
+            // purely to tear them down on the next line.
+            if (!enabled) return { ok: false, superseded: true };
             // New session — bump the generation counter and snapshot
             // it so we can detect a disable() that fires while
             // startAudio is still awaited.
@@ -1856,7 +1862,12 @@ function createNoteDetector(options = {}) {
     }
 
     function publishToJournal(accuracy) {
-        const info = hw.getSongInfo ? hw.getSongInfo() : null;
+        // Use resolveHw() so showSummary() can be called on an
+        // instance whose highway wasn't available at construction
+        // but has since been defined. `hw` is a `let`, so a direct
+        // deref would throw in the pre-resolution case.
+        const currentHw = resolveHw();
+        const info = currentHw && currentHw.getSongInfo ? currentHw.getSongInfo() : null;
         if (!info) return;
         dispatchInstanceEvent('notedetect:session', {
             title: info.title,
