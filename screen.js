@@ -137,7 +137,8 @@
 //
 // Exposed in the settings panel as "Chord Leniency" (slider: 25–100%).
 // Persisted in localStorage under the existing _ND_STORAGE_KEY alongside all
-// other settings. Loaded and allowlist-clamped to [0, 1] on construction.
+// other settings. Loaded and clamped to [0.25, 1] on construction so a stale
+// persisted value can't put scoring in a state the slider can't represent.
 //
 // ── CHANGE 6: HUD chord display ──────────────────────────────────────────
 //
@@ -586,7 +587,7 @@ function _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo) {
 // Reuses the existing FFT scratch buffers — this is a read-only pass over
 // magnitudes that were produced by _ndFftMagnitude in the same synchronous
 // call chain, so no re-entrancy or buffer corruption risk.
-function _ndBandEnergy(magnitudes, binHz, loHz, hiHz) {
+function _ndBandEnergy(magnitudes, binHz, loHz, hiHz, totalEnergy = null) {
     const nBins = magnitudes.length;
     const loBin = Math.max(0, Math.floor(loHz / binHz));
     const hiBin = Math.min(nBins - 1, Math.ceil(hiHz / binHz));
@@ -596,14 +597,32 @@ function _ndBandEnergy(magnitudes, binHz, loHz, hiHz) {
     if (hiBin < loBin) return 0;
 
     let bandEnergy = 0;
-    let totalEnergy = 0;
-    for (let k = 0; k < nBins; k++) {
-        const e = magnitudes[k] * magnitudes[k];
-        totalEnergy += e;
-        if (k >= loBin && k <= hiBin) bandEnergy += e;
+    for (let k = loBin; k <= hiBin; k++) {
+        bandEnergy += magnitudes[k] * magnitudes[k];
+    }
+
+    // Caller can pre-compute total energy once per frame and pass it in
+    // — saves N full-spectrum scans during chord scoring (one per
+    // string). When omitted (e.g. single-string callers), compute here.
+    if (totalEnergy === null) {
+        totalEnergy = 0;
+        for (let k = 0; k < nBins; k++) {
+            totalEnergy += magnitudes[k] * magnitudes[k];
+        }
     }
     if (totalEnergy < 1e-12) return 0;
     return bandEnergy / totalEnergy;
+}
+
+// Sum of squared magnitudes across the full spectrum. Pulled out so
+// `_ndScoreChord` can compute it once per FFT frame and reuse it across
+// every per-string `_ndBandEnergy` call.
+function _ndTotalEnergy(magnitudes) {
+    let total = 0;
+    for (let k = 0; k < magnitudes.length; k++) {
+        total += magnitudes[k] * magnitudes[k];
+    }
+    return total;
 }
 
 // Check whether a specific string+fret is audible in the current audio frame.
@@ -623,16 +642,18 @@ function _ndConstraintCheckString(
     stringIdx, fret, arrangement, stringCount, offsets, capo,
     pitchCheckCents = 0,
     energyThreshold = 0.03,
-    precomputedSpectrum = null
+    precomputedSpectrum = null,
+    precomputedTotalEnergy = null
 ) {
-    // Optional precomputed spectrum lets _ndScoreChord run one FFT for the
-    // whole chord and reuse it across per-string checks. The scratch buffer
-    // returned by _ndFftMagnitude is module-level, so callers must keep this
+    // Optional precomputed spectrum + total energy let _ndScoreChord run
+    // one FFT and one full-spectrum sum for the whole chord and reuse
+    // both across per-string checks. The scratch buffer returned by
+    // _ndFftMagnitude is module-level, so callers must keep this
     // synchronous and not interleave other FFT-using detectors.
     const { magnitudes, binHz } = precomputedSpectrum || _ndFftMagnitude(buffer, sampleRate);
     const [loHz, hiHz] = _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo);
 
-    const bandEnergy = _ndBandEnergy(magnitudes, binHz, loHz, hiHz);
+    const bandEnergy = _ndBandEnergy(magnitudes, binHz, loHz, hiHz, precomputedTotalEnergy);
     if (bandEnergy < energyThreshold) {
         return { hit: false, bandEnergy, centsDiff: null };
     }
@@ -683,7 +704,11 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
     // Run one FFT for the whole chord and reuse the magnitude spectrum
     // across every per-string check. Without this a 6-string chord ran
     // 6 FFTs per detection tick — measurable CPU on slower devices.
+    // Pre-compute total energy too — it's per-frame, not per-string,
+    // and was the inner loop's dominant cost on a single 4096-point
+    // spectrum.
     const spectrum = _ndFftMagnitude(buffer, sampleRate);
+    const totalEnergy = _ndTotalEnergy(spectrum.magnitudes);
 
     for (const cn of chordNotes) {
         // Per-technique threshold adjustments (brief §"Handling Techniques")
@@ -706,7 +731,7 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
         const check = _ndConstraintCheckString(
             buffer, sampleRate,
             cn.s, cn.f, arrangement, stringCount, offsets, capo,
-            cents, energyThreshold, spectrum
+            cents, energyThreshold, spectrum, totalEnergy
         );
         results.push({ s: cn.s, f: cn.f, ...check });
         if (check.hit) hitStrings++;
@@ -961,10 +986,14 @@ function createNoteDetector(options = {}) {
     let detectedFret = -1;
     let underBufferWarned = false;
     // Last chord constraint result — shown in HUD when no single note is detected.
-    // Reset on song change via resetScoring().
+    // Reset on song change via resetScoring(). `lastChordTime` is the
+    // chart timestamp of the chord that produced these readings; the HUD
+    // uses it to age the display out so a stale chord readout doesn't
+    // linger past the chord's timing window during silence/noise.
     let lastChordScore = null;
     let lastChordHit = 0;
     let lastChordTotal = 0;
+    let lastChordTime = -Infinity;
 
     // Tuning — per-instance so panels can be on different songs.
     // tuningOffsets is resized to match the actual string count on enable();
@@ -1528,6 +1557,7 @@ function createNoteDetector(options = {}) {
                 lastChordScore = chordResult.score;
                 lastChordHit = chordResult.hitStrings;
                 lastChordTotal = chordResult.totalStrings;
+                lastChordTime = group[0].t;
 
                 if (!chordResult.isHit) continue;
 
@@ -1565,9 +1595,11 @@ function createNoteDetector(options = {}) {
                 );
                 // Chord hits can fire even when monophonic detection
                 // wasn't confident on this frame (chord audio routinely
-                // does that). Null out detectedMidi / confidence in that
-                // case so consumers can distinguish "no monophonic
-                // pitch" from a real -1 detection result.
+                // does that). Keep `detectedMidi` and `confidence`
+                // numeric (-1 / 0 sentinels) for backward compatibility
+                // with consumers that expect numbers — `monophonicDetected`
+                // is the discriminator for "no monophonic pitch on this
+                // frame" vs. a real -1 result.
                 dispatchInstanceEvent('notedetect:hit', {
                     note: { s: lead.s, f: lead.f },
                     notes: group.map(cn => ({ s: cn.s, f: cn.f })),
@@ -1578,8 +1610,9 @@ function createNoteDetector(options = {}) {
                     time: t,
                     noteTime: lead.t,
                     expectedMidi,
-                    detectedMidi: detectedMidi >= 0 ? detectedMidi : null,
-                    confidence: detectedMidi >= 0 ? detectedConfidence : null,
+                    detectedMidi,
+                    confidence: detectedConfidence,
+                    monophonicDetected: detectedMidi >= 0,
                 });
             }
         }
@@ -1937,10 +1970,20 @@ function createNoteDetector(options = {}) {
                 // 7-string guitar, non-standard tuning, and capo all work.
                 detectedEl.textContent = `${_ndMidiToName(detectedMidi)} · s${detectedString} f${detectedFret}`;
             } else if (lastChordScore !== null) {
-                // No confident single-note detected this frame, but we have
-                // a recent chord score from the constraint path — show it.
-                const pct = Math.round(lastChordScore * 100);
-                detectedEl.textContent = `chord ${lastChordHit}/${lastChordTotal} (${pct}%)`;
+                // No confident single-note detected this frame, but we
+                // have a recent chord score from the constraint path —
+                // show it for a short TTL after the chord's chart time
+                // so the readout doesn't linger forever through silence
+                // / noise between notes.
+                const songTime = (hw.getTime ? hw.getTime() : 0) - latencyOffset
+                    + (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+                const CHORD_HUD_TTL_SEC = 1.5;
+                if (songTime - lastChordTime <= CHORD_HUD_TTL_SEC) {
+                    const pct = Math.round(lastChordScore * 100);
+                    detectedEl.textContent = `chord ${lastChordHit}/${lastChordTotal} (${pct}%)`;
+                } else {
+                    detectedEl.textContent = '';
+                }
             } else {
                 detectedEl.textContent = '';
             }
@@ -2141,6 +2184,7 @@ function createNoteDetector(options = {}) {
         lastChordScore = null;
         lastChordHit = 0;
         lastChordTotal = 0;
+        lastChordTime = -Infinity;
     }
 
     // Tracks an in-flight enable() promise. A second enable() call
