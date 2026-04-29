@@ -664,12 +664,15 @@ function _ndConstraintCheckString(
 //
 // score = hitStrings / totalStrings (0..1)
 // minHitRatio — fraction of strings that must ring for the chord to count as a hit.
-// techniqueFlags — object with { bend, slide, hammerOn, pullOff, harmonic } booleans
-//   from the chart note data, used to adjust thresholds:
-//   - hammerOn/pullOff: lower energyThreshold (no fresh pick attack)
-//   - bend/slide: widen pitchCheckCents (pitch is in motion)
-//   - harmonic: check at harmonic frequency (2x or 1.5x fundamental) — NYI,
-//     falls back to energy-only for now
+//
+// Each `chordNotes` entry may carry abbreviated technique flags from the chart
+// note data (`cn.ho`, `cn.po`, `cn.b`, `cn.sl`, `cn.hm`), used to adjust
+// per-string thresholds:
+//   - ho/po (hammer-on / pull-off): lower energyThreshold (no fresh pick attack)
+//   - b/sl (bend / slide): widen pitchCheckCents (pitch is in motion)
+//   - hm (harmonic): energy-only check (pitch check at fundamental is unreliable)
+//     — a future pass could check at 2x / 1.5x fundamental for stricter NYI
+//     classification.
 function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount, offsets, capo, pitchCheckCents, minHitRatio = 0.6) {
     let hitStrings = 0;
     const results = [];
@@ -919,7 +922,10 @@ function createNoteDetector(options = {}) {
             if (s.pitchTolerance !== undefined) pitchTolerance = s.pitchTolerance;
             if (s.inputGain !== undefined) inputGain = s.inputGain;
             if (s.latencyOffset !== undefined) latencyOffset = s.latencyOffset;
-            if (s.chordHitRatio !== undefined) chordHitRatio = Math.max(0, Math.min(1, s.chordHitRatio));
+            // Clamp to the slider's range so a stale persisted value
+            // (older build, manual edit) can't put scoring in a state the
+            // UI can't represent.
+            if (s.chordHitRatio !== undefined) chordHitRatio = Math.max(0.25, Math.min(1, s.chordHitRatio));
         }
     } catch (e) { /* localStorage unavailable */ }
 
@@ -1353,11 +1359,16 @@ function createNoteDetector(options = {}) {
             detectedConfidence = 0;
             detectedString = -1;
             detectedFret = -1;
-            return;
+            // Fall through to matchNotes — the chord path doesn't need a
+            // single confident pitch (it scores per-string energy bands),
+            // and chord audio is the case where YIN/HPS most often
+            // returns low confidence. Single-note matching inside
+            // matchNotes() is gated on detectedMidi >= 0, so it skips
+            // itself; only chord groups get evaluated here.
+        } else {
+            detectedMidi = _ndFreqToMidi(result.freq);
+            detectedConfidence = result.confidence;
         }
-
-        detectedMidi = _ndFreqToMidi(result.freq);
-        detectedConfidence = result.confidence;
 
         // Pass the current frame's buffer through to matchNotes so the
         // chord scorer can run on the same audio that was just analysed
@@ -1396,7 +1407,10 @@ function createNoteDetector(options = {}) {
     function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
-        if (detectedMidi < 0) return;
+        // Don't bail on detectedMidi < 0 here — chord scoring uses the
+        // raw audio buffer and doesn't need a confident monophonic pitch.
+        // The single-note path below is gated on detectedMidi >= 0 and
+        // skips itself when detection wasn't confident.
 
         const notes = hw.getNotes();
         const chords = hw.getChords();
@@ -1433,12 +1447,18 @@ function createNoteDetector(options = {}) {
             }
         }
 
-        const disp = _ndResolveDisplayFingering(
-            detectedMidi, candidateNotes, currentArrangement,
-            currentStringCount, tuningOffsets, capo, centsTolerance
-        );
-        detectedString = disp.string;
-        detectedFret = disp.fret;
+        // Display fingering is only meaningful when we have a confident
+        // monophonic pitch to map back to a (string, fret). With no pitch
+        // (chord-heavy frames) leave the HUD's last detected position
+        // alone — the per-string chord HUD takes over from there.
+        if (detectedMidi >= 0) {
+            const disp = _ndResolveDisplayFingering(
+                detectedMidi, candidateNotes, currentArrangement,
+                currentStringCount, tuningOffsets, capo, centsTolerance
+            );
+            detectedString = disp.string;
+            detectedFret = disp.fret;
+        }
 
         // ── Single-note path (existing YIN/HPS/CREPE result) ──────────
         // Group candidate notes by chord time so we can route chord events
@@ -1454,6 +1474,9 @@ function createNoteDetector(options = {}) {
         for (const [, group] of byTime) {
             if (group.length === 1) {
                 // ── Single note: use the detected MIDI from YIN/HPS/CREPE ──
+                // Skip when monophonic detection wasn't confident; the chord
+                // path below doesn't need detectedMidi and still runs.
+                if (detectedMidi < 0) continue;
                 const cn = group[0];
                 const key = noteKey(cn, cn.t);
                 if (noteResults.has(key)) continue;
@@ -2155,8 +2178,10 @@ function createNoteDetector(options = {}) {
             currentStringCount = tuningOffsets.length;
         } else {
             // No tuning info — reset to 6-string zero-offset default.
-            // Resize rather than reassign so we don't accidentally keep a
-            // stale 8-element array from a previous song on this instance.
+            // Reassign to a fresh array rather than mutate in place: the
+            // current `tuningOffsets` reference may point at the previous
+            // song's `info.tuning` (assigned in the `if` branch above), so
+            // `.length = 6 / .fill(0)` would clobber the highway's data.
             currentStringCount = 6;
             tuningOffsets = [0, 0, 0, 0, 0, 0];
         }

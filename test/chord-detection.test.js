@@ -71,9 +71,10 @@ test('stringBandHz: capo 2 shifts the low-E band up by 2 semitones', () => {
 // ── _ndBandEnergy ───────────────────────────────────────────────────────────
 
 test('bandEnergy: ~100% when a single sine sits inside the band', () => {
-    // FFT a 300 Hz sine and confirm the [200, 400] Hz band captures essentially
-    // all the energy. Some sidelobe leakage is expected with no window, so the
-    // floor is lenient.
+    // FFT a 300 Hz sine and confirm the string-0 band captures essentially
+    // all the energy. The production FFT path applies a Hann window, which
+    // cuts sidelobe leakage, but the floor is still lenient to allow for
+    // bin-edge / windowing effects.
     const buf = sine(300, SR, DURATION);
     // Use the constraint checker to get magnitudes via the same code path:
     // energy-only result.bandEnergy is the ratio we want.
@@ -120,9 +121,9 @@ test('constraintCheckString: pitch check fails when in-band signal is far off pi
 
 test('constraintCheckString: pitch check accepts within-tolerance signal', () => {
     // E2 = 82.41 Hz. A pure 82 Hz sine is ~9 cents flat — inside ±50 cents.
-    // Buffer must be long enough to resolve this low-frequency bin; 4096
-    // samples at 48 kHz gives ~11.7 Hz/bin which is too coarse, so use a
-    // longer 16384-sample buffer for this case.
+    // _ndFftMagnitude zero-pads up to a sample-rate-derived resolution
+    // floor (~3 Hz/bin target), but a longer 16384-sample buffer here
+    // gives a cleaner peak at this low frequency anyway.
     const longDur = 16384 / SR;
     const buf = sine(82, SR, longDur);
     const r = core.constraintCheckString(buf, SR, 0, 0,
