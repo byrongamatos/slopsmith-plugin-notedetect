@@ -590,7 +590,10 @@ function _ndBandEnergy(magnitudes, binHz, loHz, hiHz) {
     const nBins = magnitudes.length;
     const loBin = Math.max(0, Math.floor(loHz / binHz));
     const hiBin = Math.min(nBins - 1, Math.ceil(hiHz / binHz));
-    if (hiBin <= loBin) return 0;
+    // hiBin === loBin (a band that covers exactly one FFT bin) is still a
+    // valid case — include the bin's energy. Only bail when the band is
+    // empty (hi strictly below lo, e.g. hi clamped below 0).
+    if (hiBin < loBin) return 0;
 
     let bandEnergy = 0;
     let totalEnergy = 0;
@@ -1528,15 +1531,22 @@ function createNoteDetector(options = {}) {
 
                 if (!chordResult.isHit) continue;
 
-                // Chord cleared — mark every constituent note resolved so
-                // checkMisses() doesn't later double-count strings that
-                // didn't individually pass the per-string check (the chord
-                // is judged as one unit). Mark the chord-level key so the
-                // miss aggregator skips this chord.
+                // Chord cleared. Mark the chord-level key 'hit' so the
+                // miss aggregator in checkMisses() treats it as a single
+                // resolved unit and skips per-string miss accounting.
+                // Per-string keys still record each string's actual
+                // outcome from `chordResult.results` so the draw overlay
+                // can colour gems individually (green / red per fret) on
+                // lenient chord hits where some strings rang and some
+                // didn't.
                 noteResults.set(chordKey, 'hit');
-                for (const cn of group) {
+                for (let i = 0; i < group.length; i++) {
+                    const cn = group[i];
                     const key = noteKey(cn, cn.t);
-                    if (!noteResults.has(key)) noteResults.set(key, 'hit');
+                    if (noteResults.has(key)) continue;
+                    const stringRes = chordResult.results[i];
+                    const stringHit = stringRes && stringRes.hit;
+                    noteResults.set(key, stringHit ? 'hit' : 'miss');
                 }
 
                 hits++;
@@ -1553,6 +1563,11 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
+                // Chord hits can fire even when monophonic detection
+                // wasn't confident on this frame (chord audio routinely
+                // does that). Null out detectedMidi / confidence in that
+                // case so consumers can distinguish "no monophonic
+                // pitch" from a real -1 detection result.
                 dispatchInstanceEvent('notedetect:hit', {
                     note: { s: lead.s, f: lead.f },
                     notes: group.map(cn => ({ s: cn.s, f: cn.f })),
@@ -1563,8 +1578,8 @@ function createNoteDetector(options = {}) {
                     time: t,
                     noteTime: lead.t,
                     expectedMidi,
-                    detectedMidi,
-                    confidence: detectedConfidence,
+                    detectedMidi: detectedMidi >= 0 ? detectedMidi : null,
+                    confidence: detectedMidi >= 0 ? detectedConfidence : null,
                 });
             }
         }

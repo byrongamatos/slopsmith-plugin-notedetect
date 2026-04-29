@@ -35,7 +35,6 @@ const DURATION = BUF_SAMPLES / SR;
 
 const GUITAR_6 = { arrangement: 'guitar', stringCount: 6, offsets: [0, 0, 0, 0, 0, 0], capo: 0 };
 const GUITAR_8 = { arrangement: 'guitar', stringCount: 8, offsets: [0, 0, 0, 0, 0, 0, 0, 0], capo: 0 };
-const GUITAR_6_CAPO2 = { ...GUITAR_6, capo: 2 };
 
 // ── _ndStringBandHz ─────────────────────────────────────────────────────────
 
