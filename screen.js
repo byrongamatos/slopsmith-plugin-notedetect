@@ -11,6 +11,145 @@
 // re-applies the factory design on top of 5-string-bass (#14),
 // per-note hit/miss events (#12), CI (#13), and HPS (#15) which all
 // landed after his branch diverged. Co-Authored-By: topkoa.
+//
+// ── What this revision adds and why ───────────────────────────────────────
+//
+// BACKGROUND: WHY CHORD DETECTION NEEDED A DIFFERENT APPROACH
+//
+// YIN, HPS, and CREPE are all monophonic pitch detectors — they return one
+// frequency from the full mixed signal. That works well for single notes, but
+// a guitar chord produces 2–6 simultaneous fundamentals plus their harmonics
+// all overlapping in the spectrum. The detectors lock onto whichever string
+// is loudest (usually the lowest) and score the whole chord against that one
+// pitch, silently missing every other note. This revision adds a parallel
+// detection path for chords that avoids the problem entirely.
+//
+// The core insight (from a design brief accompanying this change): instead of
+// asking "what pitch is playing?" — which is hard for chords — ask "is there
+// energy near the frequency I *expect* on string S right now?" That is a much
+// simpler question. Because the arrangement XML already tells us exactly which
+// string plays which fret at every moment, we can compute the expected
+// frequency per string and check for it independently in that string's
+// frequency band. This turns one hard polyphonic detection problem into N easy
+// monophonic band-energy checks, one per string.
+//
+// The existing YIN/HPS/CREPE path is left completely intact for single notes,
+// where it already works well. The constraint path is additive: it activates
+// only when the chart has ≥2 simultaneous notes in the timing window.
+//
+// ── CHANGE 1: 8-string guitar tuning ─────────────────────────────────────
+//
+// _ND_TUNING_GUITAR_8 added: [30, 35, 40, 45, 50, 55, 59, 64]
+// That is F#1 B1 E2 A2 D3 G3 B3 E4 — standard Ibanez/Schecter 8-string
+// tuning, a perfect fourth below the 7-string low B.
+//
+// _ndStandardMidiFor() now branches on stringCount === 8 before the existing
+// 7-string check. Every downstream function — MIDI mapping, display labels,
+// and the new constraint band calculator — derives from this table, so no
+// other callsites required changes.
+//
+// ── CHANGE 2: Dynamic string-count sizing (prerequisite for changes 1 & 3) ─
+//
+// Previously, `tuningOffsets` was initialised as a hardcoded 6-element array
+// and never resized. Every call that passed `tuningOffsets.length` as the
+// stringCount argument to mapping helpers was therefore always passing 6,
+// regardless of what instrument was actually loaded. This silently produced
+// wrong frequency bands for 5-string bass, 7-string guitar, and would have
+// been completely broken for 8-string guitar.
+//
+// Fix: a new `currentStringCount` variable is set at enable() time from
+// `hw.getSongInfo().tuning.length` — the authoritative source. All three
+// call sites that were passing `tuningOffsets.length` into mapping helpers
+// now use `currentStringCount` instead. This was a prerequisite for both
+// 8-string support and for the constraint checker computing correct frequency
+// bands on non-6-string instruments.
+//
+// ── CHANGE 3: Constraint-based chord detection ────────────────────────────
+//
+// Three new module-level functions (after _ndHpsDetect, before _ndLoadCrepe):
+//
+//   _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo)
+//     Returns [loHz, hiHz] for a given string covering frets 0–24, with ±10%
+//     headroom for tuning offsets, capo, and bent notes. Derived from the
+//     tuning tables rather than hardcoded, so all instrument types are covered.
+//
+//   _ndBandEnergy(magnitudes, binHz, loHz, hiHz)
+//     Measures the fraction of total spectrum energy (0..1) that falls in a
+//     frequency band, operating on the magnitude spectrum from _ndFftMagnitude.
+//     NOTE: reuses the module-level FFT scratch buffers (_ndFftInterleavedScratch,
+//     _ndFftMagnitudesScratch). This is safe because the FFT is synchronous and
+//     JS is single-threaded — see the existing comment on those buffers. If this
+//     code is ever moved to an AudioWorklet or Web Worker, per-call scratch
+//     buffers would be needed instead.
+//
+//   _ndConstraintCheckString(buffer, sampleRate, stringIdx, fret, ...)
+//     The core per-string check. Calls _ndFftMagnitude once (which reuses the
+//     scratch), measures band energy for this string's frequency range, and
+//     optionally verifies that the dominant bin in the band is within
+//     pitchCheckCents of the expected frequency. Returns { hit, bandEnergy,
+//     centsDiff }. energyThreshold and pitchCheckCents are caller-adjustable
+//     to support technique-specific loosening (see change 4).
+//
+//   _ndScoreChord(buffer, sampleRate, chordNotes, ..., minHitRatio)
+//     Runs _ndConstraintCheckString for each note in a chord group, applies
+//     per-technique threshold adjustments (see change 4), and returns
+//     { score, hitStrings, totalStrings, results, isHit } where isHit is
+//     true if score >= minHitRatio.
+//
+// ROUTING IN matchNotes():
+//   Candidate notes (from the chart's timing window) are now bucketed by
+//   timestamp. A bucket with 1 note goes through the existing MIDI comparison
+//   against the YIN/HPS/CREPE result, unchanged. A bucket with ≥2 notes goes
+//   through _ndScoreChord using `pendingBuffer` — the same accumulated audio
+//   buffer that was handed to processFrame on the current tick. Each string's
+//   individual result is stored in noteResults so the draw overlay can colour
+//   fret gems per-note. The chord hit/miss is counted as a single judgment
+//   and fires a notedetect:hit event with { chord: true, hitStrings,
+//   totalStrings, score } instead of the usual { note, expectedMidi }.
+//
+// ── CHANGE 4: Technique-aware thresholds ─────────────────────────────────
+//
+// The arrangement XML includes technique flags on individual notes. _ndScoreChord
+// reads these from the chord note objects and adjusts thresholds before calling
+// _ndConstraintCheckString:
+//
+//   ho / po (hammer-on / pull-off)
+//     No fresh pick attack, so string energy will be lower than a picked note.
+//     energyThreshold is halved from 0.03 to 0.015.
+//
+//   b / sl (bend / slide)
+//     Pitch is moving continuously during the note. pitchCheckCents is widened
+//     to at least 100 cents (a semitone) so a note mid-bend still registers.
+//
+//   hm (harmonic)
+//     The fundamental is suppressed; the audible pitch is at 2x or 1.5x the
+//     fret frequency. Pitch checking against the fundamental is unreliable, so
+//     pitchCheckCents is set to 0 (energy-only check). A proper harmonic
+//     frequency check (checking at 2x/1.5x) is a known TODO — see the comment
+//     inside _ndScoreChord.
+//
+// ── CHANGE 5: chordHitRatio setting ──────────────────────────────────────
+//
+// The fraction of a chord's strings that must register energy to count as a
+// hit. Default 0.6 (60% — e.g. 4 of 6 strings for a full barre chord). Lower
+// values suit beginners or players using lighter touches on inner strings;
+// higher values enforce stricter accuracy.
+//
+// Exposed in the settings panel as "Chord Leniency" (slider: 25–100%).
+// Persisted in localStorage under the existing _ND_STORAGE_KEY alongside all
+// other settings. Loaded and clamped to [0.25, 1] on construction so a stale
+// persisted value can't put scoring in a state the slider can't represent.
+//
+// ── CHANGE 6: HUD chord display ──────────────────────────────────────────
+//
+// The cyan detected-note line in the HUD (`.nd-hud-detected`) previously only
+// showed output when a confident single-note detection existed. It now also
+// shows the most recent chord constraint result when no single note is detected,
+// e.g. "chord 4/6 (66%)". This gives the player real-time visibility into
+// whether the constraint scorer is seeing their strings ring, which is useful
+// for diagnosing audio input issues and tuning the Chord Leniency setting.
+// lastChordScore / lastChordHit / lastChordTotal are reset with the rest of
+// scoring state in resetScoring().
 
 // ── Module-level shared state ──────────────────────────────────────────────
 
@@ -53,11 +192,14 @@ const _ND_FRAME_SIZE = 2048;       // ScriptProcessor buffer size
 // Bass ascends in perfect fourths end-to-end; guitar is fourths except
 // the major third between G3→B3 (the standard irregularity). Low B on
 // 5-string bass and 7-string guitar both add a perfect fourth below
-// the standard low-E string.
-const _ND_TUNING_BASS_4 = [28, 33, 38, 43];             // E1 A1 D2 G2
-const _ND_TUNING_BASS_5 = [23, 28, 33, 38, 43];         // B0 E1 A1 D2 G2
-const _ND_TUNING_GUITAR_6 = [40, 45, 50, 55, 59, 64];   // E2 A2 D3 G3 B3 E4
-const _ND_TUNING_GUITAR_7 = [35, 40, 45, 50, 55, 59, 64]; // B1 E2 A2 D3 G3 B3 E4
+// the standard low-E string. 8-string guitar adds a further low F#1
+// below that (a perfect fourth below B1), matching the most common
+// Ibanez/Schecter 8-string standard tuning.
+const _ND_TUNING_BASS_4 = [28, 33, 38, 43];                   // E1 A1 D2 G2
+const _ND_TUNING_BASS_5 = [23, 28, 33, 38, 43];               // B0 E1 A1 D2 G2
+const _ND_TUNING_GUITAR_6 = [40, 45, 50, 55, 59, 64];         // E2 A2 D3 G3 B3 E4
+const _ND_TUNING_GUITAR_7 = [35, 40, 45, 50, 55, 59, 64];     // B1 E2 A2 D3 G3 B3 E4
+const _ND_TUNING_GUITAR_8 = [30, 35, 40, 45, 50, 55, 59, 64]; // F#1 B1 E2 A2 D3 G3 B3 E4
 
 function _ndArrangementKindFromName(name) {
     return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
@@ -67,7 +209,9 @@ function _ndStandardMidiFor(arrangement, stringCount) {
     if (arrangement === 'bass') {
         return stringCount === 5 ? _ND_TUNING_BASS_5 : _ND_TUNING_BASS_4;
     }
-    return stringCount === 7 ? _ND_TUNING_GUITAR_7 : _ND_TUNING_GUITAR_6;
+    if (stringCount === 8) return _ND_TUNING_GUITAR_8;
+    if (stringCount === 7) return _ND_TUNING_GUITAR_7;
+    return _ND_TUNING_GUITAR_6;
 }
 
 // ── Pure mapping helpers ───────────────────────────────────────────────────
@@ -411,6 +555,193 @@ function _ndHpsDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     return { freq, confidence, underBuffered: false };
 }
 
+// ── Constraint-Based Per-String Band Analysis ──────────────────────────────
+//
+// This is the core of the brief's proposal: instead of asking "what pitch is
+// playing?" (hard for chords), ask "is there energy near frequency F on string
+// S right now?" — a much simpler question that standard FFT can answer reliably.
+//
+// Used exclusively for chord scoring. Single notes continue to use YIN/HPS/CREPE
+// via processFrame unchanged; the two paths are additive, not competing.
+
+// Frequency bounds for each string covering frets 0–24 at standard tuning,
+// with ±10% headroom for non-standard tunings, capo, and tuning offsets.
+// Computed dynamically from MIDI tuning tables rather than hardcoded so
+// 5-string bass, 7-string and 8-string guitar all derive correct ranges
+// automatically.
+//
+// Returns [loHz, hiHz] for the given string/arrangement/stringCount/offsets/capo.
+function _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo) {
+    const openMidi = _ndMidiFromStringFret(stringIdx, 0, arrangement, stringCount, offsets, capo);
+    const fret24Midi = openMidi + 24;
+    // MIDI → Hz: 440 * 2^((midi-69)/12)
+    const loHz = 440 * Math.pow(2, (openMidi - 69) / 12) * 0.90; // -10% margin
+    const hiHz = 440 * Math.pow(2, (fret24Midi - 69) / 12) * 1.10; // +10% margin
+    return [loHz, hiHz];
+}
+
+// Measure the energy fraction in a frequency band [loHz, hiHz] relative to
+// total spectrum energy, using the magnitude spectrum already computed by
+// _ndFftMagnitude. Returns a value in [0, 1].
+//
+// Reuses the existing FFT scratch buffers — this is a read-only pass over
+// magnitudes that were produced by _ndFftMagnitude in the same synchronous
+// call chain, so no re-entrancy or buffer corruption risk.
+function _ndBandEnergy(magnitudes, binHz, loHz, hiHz, totalEnergy = null) {
+    const nBins = magnitudes.length;
+    const loBin = Math.max(0, Math.floor(loHz / binHz));
+    const hiBin = Math.min(nBins - 1, Math.ceil(hiHz / binHz));
+    // hiBin === loBin (a band that covers exactly one FFT bin) is still a
+    // valid case — include the bin's energy. Only bail when the band is
+    // empty (hi strictly below lo, e.g. hi clamped below 0).
+    if (hiBin < loBin) return 0;
+
+    let bandEnergy = 0;
+    for (let k = loBin; k <= hiBin; k++) {
+        bandEnergy += magnitudes[k] * magnitudes[k];
+    }
+
+    // Caller can pre-compute total energy once per frame and pass it in
+    // — saves N full-spectrum scans during chord scoring (one per
+    // string). When omitted (e.g. single-string callers), compute here.
+    if (totalEnergy === null) {
+        totalEnergy = 0;
+        for (let k = 0; k < nBins; k++) {
+            totalEnergy += magnitudes[k] * magnitudes[k];
+        }
+    }
+    if (totalEnergy < 1e-12) return 0;
+    return bandEnergy / totalEnergy;
+}
+
+// Sum of squared magnitudes across the full spectrum. Pulled out so
+// `_ndScoreChord` can compute it once per FFT frame and reuse it across
+// every per-string `_ndBandEnergy` call.
+function _ndTotalEnergy(magnitudes) {
+    let total = 0;
+    for (let k = 0; k < magnitudes.length; k++) {
+        total += magnitudes[k] * magnitudes[k];
+    }
+    return total;
+}
+
+// Check whether a specific string+fret is audible in the current audio frame.
+//
+// Returns { hit: bool, bandEnergy: float, centsDiff: float|null }
+//
+// energyThreshold  — minimum band energy fraction to count as "string is
+//                    ringing" (default 0.03, i.e. at least 3% of total
+//                    spectrum energy). Lower this for hammer-ons and pull-offs
+//                    where the pick attack is absent.
+// pitchCheckCents  — if > 0, also verify the dominant frequency in the band
+//                    is within this many cents of the expected pitch. Pass 0
+//                    to skip the pitch check and use energy-only (faster,
+//                    adequate for most chord hits on clean signals).
+function _ndConstraintCheckString(
+    buffer, sampleRate,
+    stringIdx, fret, arrangement, stringCount, offsets, capo,
+    pitchCheckCents = 0,
+    energyThreshold = 0.03,
+    precomputedSpectrum = null,
+    precomputedTotalEnergy = null
+) {
+    // Optional precomputed spectrum + total energy let _ndScoreChord run
+    // one FFT and one full-spectrum sum for the whole chord and reuse
+    // both across per-string checks. The scratch buffer returned by
+    // _ndFftMagnitude is module-level, so callers must keep this
+    // synchronous and not interleave other FFT-using detectors.
+    const { magnitudes, binHz } = precomputedSpectrum || _ndFftMagnitude(buffer, sampleRate);
+    const [loHz, hiHz] = _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo);
+
+    const bandEnergy = _ndBandEnergy(magnitudes, binHz, loHz, hiHz, precomputedTotalEnergy);
+    if (bandEnergy < energyThreshold) {
+        return { hit: false, bandEnergy, centsDiff: null };
+    }
+
+    if (pitchCheckCents <= 0) {
+        return { hit: true, bandEnergy, centsDiff: null };
+    }
+
+    // Find dominant bin in the band and refine with parabolic interpolation.
+    const nBins = magnitudes.length;
+    const loBin = Math.max(0, Math.floor(loHz / binHz));
+    const hiBin = Math.min(nBins - 1, Math.ceil(hiHz / binHz));
+    let peakBin = loBin;
+    let peakVal = -Infinity;
+    for (let k = loBin; k <= hiBin; k++) {
+        if (magnitudes[k] > peakVal) { peakVal = magnitudes[k]; peakBin = k; }
+    }
+    const delta = (peakBin > loBin && peakBin < hiBin)
+        ? _ndParabolicOffset(magnitudes[peakBin - 1], magnitudes[peakBin], magnitudes[peakBin + 1])
+        : 0;
+    const detectedHz = (peakBin + delta) * binHz;
+
+    const expectedMidi = _ndMidiFromStringFret(stringIdx, fret, arrangement, stringCount, offsets, capo);
+    const expectedHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
+    const centsDiff = Math.abs(1200 * Math.log2(detectedHz / expectedHz));
+
+    return { hit: centsDiff <= pitchCheckCents, bandEnergy, centsDiff };
+}
+
+// Score a chord by checking each of its constituent notes against their
+// respective string frequency bands. Returns { score, hitStrings, totalStrings }.
+//
+// score = hitStrings / totalStrings (0..1)
+// minHitRatio — fraction of strings that must ring for the chord to count as a hit.
+//
+// Each `chordNotes` entry may carry abbreviated technique flags from the chart
+// note data (`cn.ho`, `cn.po`, `cn.b`, `cn.sl`, `cn.hm`), used to adjust
+// per-string thresholds:
+//   - ho/po (hammer-on / pull-off): lower energyThreshold (no fresh pick attack)
+//   - b/sl (bend / slide): widen pitchCheckCents (pitch is in motion)
+//   - hm (harmonic): energy-only check (pitch check at fundamental is unreliable)
+//     — a future pass could check at 2x / 1.5x fundamental for stricter NYI
+//     classification.
+function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount, offsets, capo, pitchCheckCents, minHitRatio = 0.6) {
+    let hitStrings = 0;
+    const results = [];
+
+    // Run one FFT for the whole chord and reuse the magnitude spectrum
+    // across every per-string check. Without this a 6-string chord ran
+    // 6 FFTs per detection tick — measurable CPU on slower devices.
+    // Pre-compute total energy too — it's per-frame, not per-string,
+    // and was the inner loop's dominant cost on a single 4096-point
+    // spectrum.
+    const spectrum = _ndFftMagnitude(buffer, sampleRate);
+    const totalEnergy = _ndTotalEnergy(spectrum.magnitudes);
+
+    for (const cn of chordNotes) {
+        // Per-technique threshold adjustments (brief §"Handling Techniques")
+        let energyThreshold = 0.03;
+        let cents = pitchCheckCents;
+
+        if (cn.ho || cn.po) {
+            // Hammer-on / pull-off: no pick attack, energy will be lower
+            energyThreshold = 0.015;
+        }
+        if (cn.b || cn.sl) {
+            // Bend / slide: pitch is moving, widen the pitch window
+            cents = Math.max(cents, 100);
+        }
+        if (cn.hm) {
+            // Harmonic: energy-only check (pitch check at fundamental is unreliable)
+            cents = 0;
+        }
+
+        const check = _ndConstraintCheckString(
+            buffer, sampleRate,
+            cn.s, cn.f, arrangement, stringCount, offsets, capo,
+            cents, energyThreshold, spectrum, totalEnergy
+        );
+        results.push({ s: cn.s, f: cn.f, ...check });
+        if (check.hit) hitStrings++;
+    }
+
+    const totalStrings = chordNotes.length;
+    const score = totalStrings > 0 ? hitStrings / totalStrings : 0;
+    return { score, hitStrings, totalStrings, results, isHit: score >= minHitRatio };
+}
+
 // ── Pitch Detection: CREPE (shared model) ──────────────────────────────────
 
 async function _ndLoadCrepe() {
@@ -598,6 +929,10 @@ function createNoteDetector(options = {}) {
     let selectedDeviceId = '';
     let selectedChannel = 'mono';
     let latencyOffset = 0.080;
+    // Fraction of a chord's strings that must register energy for the chord
+    // to count as a hit (0.0–1.0). 0.6 = 60%, matching the brief's default.
+    // Lower this for beginners or dense chords; raise it for stricter scoring.
+    let chordHitRatio = 0.6;
 
     try {
         const raw = localStorage.getItem(_ND_STORAGE_KEY);
@@ -615,6 +950,10 @@ function createNoteDetector(options = {}) {
             if (s.pitchTolerance !== undefined) pitchTolerance = s.pitchTolerance;
             if (s.inputGain !== undefined) inputGain = s.inputGain;
             if (s.latencyOffset !== undefined) latencyOffset = s.latencyOffset;
+            // Clamp to the slider's range so a stale persisted value
+            // (older build, manual edit) can't put scoring in a state the
+            // UI can't represent.
+            if (s.chordHitRatio !== undefined) chordHitRatio = Math.max(0.25, Math.min(1, s.chordHitRatio));
         }
     } catch (e) { /* localStorage unavailable */ }
 
@@ -646,11 +985,24 @@ function createNoteDetector(options = {}) {
     let detectedString = -1;
     let detectedFret = -1;
     let underBufferWarned = false;
+    // Last chord constraint result — shown in HUD when no single note is detected.
+    // Reset on song change via resetScoring(). `lastChordTime` is the
+    // chart timestamp of the chord that produced these readings; the HUD
+    // uses it to age the display out so a stale chord readout doesn't
+    // linger past the chord's timing window during silence/noise.
+    let lastChordScore = null;
+    let lastChordHit = 0;
+    let lastChordTotal = 0;
+    let lastChordTime = -Infinity;
 
-    // Tuning — per-instance so panels can be on different songs
+    // Tuning — per-instance so panels can be on different songs.
+    // tuningOffsets is resized to match the actual string count on enable();
+    // the initial 6-element array is a safe default for 6-string guitar
+    // and is overwritten from hw.getSongInfo() before any detection runs.
     let currentArrangement = 'guitar';
     let tuningOffsets = [0, 0, 0, 0, 0, 0];
     let capo = 0;
+    let currentStringCount = 6; // kept in sync with tuningOffsets.length
 
     // Audio buffers
     let accumBuffer = new Float32Array(0);
@@ -706,6 +1058,7 @@ function createNoteDetector(options = {}) {
                 pitchTolerance,
                 inputGain,
                 latencyOffset,
+                chordHitRatio,
             }));
         } catch (e) { /* unavailable */ }
     }
@@ -1038,13 +1391,24 @@ function createNoteDetector(options = {}) {
             detectedConfidence = 0;
             detectedString = -1;
             detectedFret = -1;
-            return;
+            // Fall through to matchNotes — the chord path doesn't need a
+            // single confident pitch (it scores per-string energy bands),
+            // and chord audio is the case where YIN/HPS most often
+            // returns low confidence. Single-note matching inside
+            // matchNotes() is gated on detectedMidi >= 0, so it skips
+            // itself; only chord groups get evaluated here.
+        } else {
+            detectedMidi = _ndFreqToMidi(result.freq);
+            detectedConfidence = result.confidence;
         }
 
-        detectedMidi = _ndFreqToMidi(result.freq);
-        detectedConfidence = result.confidence;
-
-        matchNotes();
+        // Pass the current frame's buffer through to matchNotes so the
+        // chord scorer can run on the same audio that was just analysed
+        // for pitch. The shared `pendingBuffer` is cleared by the timer
+        // (see detectInterval) before processFrame is called, so reading
+        // it later from matchNotes would either skip (null) or pick up a
+        // newer buffer captured mid-processing.
+        matchNotes(buffer);
     }
 
     // ── Note matching ─────────────────────────────────────────────────
@@ -1072,10 +1436,13 @@ function createNoteDetector(options = {}) {
         try { instanceRoot.dispatchEvent(new CustomEvent(type, init)); } catch (e) {}
     }
 
-    function matchNotes() {
+    function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
-        if (detectedMidi < 0) return;
+        // Don't bail on detectedMidi < 0 here — chord scoring uses the
+        // raw audio buffer and doesn't need a confident monophonic pitch.
+        // The single-note path below is gated on detectedMidi >= 0 and
+        // skips itself when detection wasn't confident.
 
         const notes = hw.getNotes();
         const chords = hw.getChords();
@@ -1090,7 +1457,12 @@ function createNoteDetector(options = {}) {
                 const n = notes[i];
                 if (n.t > t + tolerance) break;
                 if (n.mt) continue;
-                candidateNotes.push({ s: n.s, f: n.f, t: n.t });
+                // Spread the chart note so technique flags (ho/po/b/sl/hm)
+                // travel with the candidate. _ndScoreChord reads these to
+                // adjust per-string thresholds, so dropping them here would
+                // make hammer-on/bend/harmonic adjustments dead code in
+                // actual gameplay.
+                candidateNotes.push({ ...n });
             }
         }
         if (chords && chords.length > 0) {
@@ -1100,40 +1472,147 @@ function createNoteDetector(options = {}) {
                 if (c.t > t + tolerance) break;
                 for (const cn of (c.notes || [])) {
                     if (cn.mt) continue;
-                    candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
+                    // Chord constituent notes don't carry their own time —
+                    // the chord's `c.t` is the timestamp.
+                    candidateNotes.push({ ...cn, t: c.t });
                 }
             }
         }
 
-        const disp = _ndResolveDisplayFingering(
-            detectedMidi, candidateNotes, currentArrangement,
-            tuningOffsets.length, tuningOffsets, capo, centsTolerance
-        );
-        detectedString = disp.string;
-        detectedFret = disp.fret;
-
-        for (const cn of candidateNotes) {
-            const key = noteKey(cn, cn.t);
-            if (noteResults.has(key)) continue;
-
-            const expectedMidi = _ndMidiFromStringFret(
-                cn.s, cn.f, currentArrangement, tuningOffsets.length, tuningOffsets, capo
+        // Display fingering is only meaningful when we have a confident
+        // monophonic pitch to map back to a (string, fret). With no pitch
+        // (chord-heavy frames) leave the HUD's last detected position
+        // alone — the per-string chord HUD takes over from there.
+        if (detectedMidi >= 0) {
+            const disp = _ndResolveDisplayFingering(
+                detectedMidi, candidateNotes, currentArrangement,
+                currentStringCount, tuningOffsets, capo, centsTolerance
             );
-            const detectedCents = (detectedMidi - expectedMidi) * 100;
+            detectedString = disp.string;
+            detectedFret = disp.fret;
+        }
 
-            if (Math.abs(detectedCents) <= centsTolerance) {
-                noteResults.set(key, 'hit');
+        // ── Single-note path (existing YIN/HPS/CREPE result) ──────────
+        // Group candidate notes by chord time so we can route chord events
+        // to the constraint scorer and single notes to the MIDI comparator.
+        // A chord is any group of ≥2 simultaneous candidates sharing a time.
+        const byTime = new Map();
+        for (const cn of candidateNotes) {
+            const tk = cn.t.toFixed(3);
+            if (!byTime.has(tk)) byTime.set(tk, []);
+            byTime.get(tk).push(cn);
+        }
+
+        for (const [, group] of byTime) {
+            if (group.length === 1) {
+                // ── Single note: use the detected MIDI from YIN/HPS/CREPE ──
+                // Skip when monophonic detection wasn't confident; the chord
+                // path below doesn't need detectedMidi and still runs.
+                if (detectedMidi < 0) continue;
+                const cn = group[0];
+                const key = noteKey(cn, cn.t);
+                if (noteResults.has(key)) continue;
+
+                const expectedMidi = _ndMidiFromStringFret(
+                    cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                );
+                const detectedCents = (detectedMidi - expectedMidi) * 100;
+
+                if (Math.abs(detectedCents) <= centsTolerance) {
+                    noteResults.set(key, 'hit');
+                    hits++;
+                    streak++;
+                    if (streak > bestStreak) bestStreak = streak;
+                    updateSectionStat('hit');
+                    dispatchInstanceEvent('notedetect:hit', {
+                        note: { s: cn.s, f: cn.f },
+                        time: t,
+                        noteTime: cn.t,
+                        expectedMidi,
+                        detectedMidi,
+                        confidence: detectedConfidence,
+                    });
+                }
+            } else {
+                // ── Chord path: constraint-based per-string band analysis ──
+                // Skip if no audio buffer was passed in (e.g. instance
+                // restart while a stale processFrame is unwinding).
+                if (!frameBuffer) continue;
+
+                // Chord-level resolved key. checkMisses() honours this so a
+                // failed chord becomes one miss event (not one per string).
+                const chordKey = `${group[0].t.toFixed(3)}_chord`;
+                if (noteResults.has(chordKey)) continue;
+
+                const sr = audioCtx ? audioCtx.sampleRate : 48000;
+                const chordResult = _ndScoreChord(
+                    frameBuffer, sr,
+                    group, currentArrangement, currentStringCount,
+                    tuningOffsets, capo,
+                    centsTolerance,   // pitch check per string
+                    chordHitRatio     // min fraction of strings required
+                );
+
+                // Update HUD chord display (latest reading, hit-or-miss)
+                lastChordScore = chordResult.score;
+                lastChordHit = chordResult.hitStrings;
+                lastChordTotal = chordResult.totalStrings;
+                lastChordTime = group[0].t;
+
+                if (!chordResult.isHit) continue;
+
+                // Chord cleared. Mark the chord-level key 'hit' so the
+                // miss aggregator in checkMisses() treats it as a single
+                // resolved unit and skips per-string miss accounting.
+                // Per-string keys still record each string's actual
+                // outcome from `chordResult.results` so the draw overlay
+                // can colour gems individually (green / red per fret) on
+                // lenient chord hits where some strings rang and some
+                // didn't.
+                noteResults.set(chordKey, 'hit');
+                for (let i = 0; i < group.length; i++) {
+                    const cn = group[i];
+                    const key = noteKey(cn, cn.t);
+                    if (noteResults.has(key)) continue;
+                    const stringRes = chordResult.results[i];
+                    const stringHit = stringRes && stringRes.hit;
+                    noteResults.set(key, stringHit ? 'hit' : 'miss');
+                }
+
                 hits++;
                 streak++;
                 if (streak > bestStreak) bestStreak = streak;
                 updateSectionStat('hit');
+
+                // Backward-compatible hit payload: keep `note`,
+                // `expectedMidi`, `detectedMidi` so existing single-note
+                // consumers (practice journal, splitscreen) still see the
+                // fields they expect — first note in the chord stands in.
+                // New chord-only fields ride alongside.
+                const lead = group[0];
+                const expectedMidi = _ndMidiFromStringFret(
+                    lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                );
+                // Chord hits can fire even when monophonic detection
+                // wasn't confident on this frame (chord audio routinely
+                // does that). Keep `detectedMidi` and `confidence`
+                // numeric (-1 / 0 sentinels) for backward compatibility
+                // with consumers that expect numbers — `monophonicDetected`
+                // is the discriminator for "no monophonic pitch on this
+                // frame" vs. a real -1 result.
                 dispatchInstanceEvent('notedetect:hit', {
-                    note: { s: cn.s, f: cn.f },
+                    note: { s: lead.s, f: lead.f },
+                    notes: group.map(cn => ({ s: cn.s, f: cn.f })),
+                    chord: true,
+                    hitStrings: chordResult.hitStrings,
+                    totalStrings: chordResult.totalStrings,
+                    score: chordResult.score,
                     time: t,
-                    noteTime: cn.t,
+                    noteTime: lead.t,
                     expectedMidi,
                     detectedMidi,
                     confidence: detectedConfidence,
+                    monophonicDetected: detectedMidi >= 0,
                 });
             }
         }
@@ -1161,7 +1640,7 @@ function createNoteDetector(options = {}) {
                     time: t,
                     noteTime,
                     expectedMidi: _ndMidiFromStringFret(
-                        s, f, currentArrangement, tuningOffsets.length, tuningOffsets, capo
+                        s, f, currentArrangement, currentStringCount, tuningOffsets, capo
                     ),
                 });
             }
@@ -1181,10 +1660,38 @@ function createNoteDetector(options = {}) {
             for (let i = start; i < chords.length; i++) {
                 const c = chords[i];
                 if (c.t > missDeadline) break;
-                for (const cn of (c.notes || [])) {
-                    if (cn.mt) continue;
-                    checkNote(cn.s, cn.f, c.t);
+                const liveNotes = (c.notes || []).filter(cn => !cn.mt);
+                if (liveNotes.length === 0) continue;
+                if (liveNotes.length === 1) {
+                    // Degenerate "chord" of one — treat as a single note.
+                    checkNote(liveNotes[0].s, liveNotes[0].f, c.t);
+                    continue;
                 }
+                // Multi-note chord: judge as a single unit. matchNotes()
+                // sets `<t>_chord` to 'hit' when the chord cleared the
+                // ratio threshold; if that key is set, the chord is
+                // already resolved and we leave the per-string keys alone.
+                const chordKey = `${c.t.toFixed(3)}_chord`;
+                if (noteResults.has(chordKey)) continue;
+                noteResults.set(chordKey, 'miss');
+                for (const cn of liveNotes) {
+                    const key = noteKey({ s: cn.s, f: cn.f }, c.t);
+                    if (!noteResults.has(key)) noteResults.set(key, 'miss');
+                }
+                misses++;
+                streak = 0;
+                updateSectionStat('miss');
+                dispatchInstanceEvent('notedetect:miss', {
+                    note: { s: liveNotes[0].s, f: liveNotes[0].f },
+                    notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
+                    chord: true,
+                    time: t,
+                    noteTime: c.t,
+                    expectedMidi: _ndMidiFromStringFret(
+                        liveNotes[0].s, liveNotes[0].f,
+                        currentArrangement, currentStringCount, tuningOffsets, capo
+                    ),
+                });
             }
         }
 
@@ -1276,6 +1783,13 @@ function createNoteDetector(options = {}) {
             <input type="range" min="1" max="50" value="${Math.round(inputGain * 10)}"
                    class="nd-gain-slider w-full accent-green-400 mb-3">
 
+            <label class="block text-gray-400 text-xs mb-1">Chord Leniency: <span class="nd-chord-ratio-val">${Math.round(chordHitRatio * 100)}</span>% of strings</label>
+            <input type="range" min="25" max="100" value="${Math.round(chordHitRatio * 100)}"
+                   class="nd-chord-ratio-slider w-full accent-green-400 mb-1">
+            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+                Chord detection uses per-string band analysis. This sets how many strings must ring to count as a hit (e.g. 60% = 4 of 6). Lower for beginners or dense voicings.
+            </div>
+
             <div class="text-[10px] text-gray-600 mt-1 leading-tight">
                 Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
                 See the <b>Pitch Detection Methods</b> section of the plugin README for guidance on choosing between YIN, HPS, and CREPE.
@@ -1307,6 +1821,11 @@ function createNoteDetector(options = {}) {
         panel.querySelector('.nd-gain-slider').oninput = (e) => {
             inputGain = e.target.value / 10;
             panel.querySelector('.nd-gain-val').textContent = inputGain.toFixed(1);
+            saveSettings();
+        };
+        panel.querySelector('.nd-chord-ratio-slider').oninput = (e) => {
+            chordHitRatio = e.target.value / 100;
+            panel.querySelector('.nd-chord-ratio-val').textContent = e.target.value;
             saveSettings();
         };
 
@@ -1450,6 +1969,21 @@ function createNoteDetector(options = {}) {
                 // rather than indexing a guitar-6 lookup by string — bass,
                 // 7-string guitar, non-standard tuning, and capo all work.
                 detectedEl.textContent = `${_ndMidiToName(detectedMidi)} · s${detectedString} f${detectedFret}`;
+            } else if (lastChordScore !== null) {
+                // No confident single-note detected this frame, but we
+                // have a recent chord score from the constraint path —
+                // show it for a short TTL after the chord's chart time
+                // so the readout doesn't linger forever through silence
+                // / noise between notes.
+                const songTime = (hw.getTime ? hw.getTime() : 0) - latencyOffset
+                    + (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+                const CHORD_HUD_TTL_SEC = 1.5;
+                if (songTime - lastChordTime <= CHORD_HUD_TTL_SEC) {
+                    const pct = Math.round(lastChordScore * 100);
+                    detectedEl.textContent = `chord ${lastChordHit}/${lastChordTotal} (${pct}%)`;
+                } else {
+                    detectedEl.textContent = '';
+                }
             } else {
                 detectedEl.textContent = '';
             }
@@ -1647,6 +2181,10 @@ function createNoteDetector(options = {}) {
         detectedConfidence = 0;
         detectedString = -1;
         detectedFret = -1;
+        lastChordScore = null;
+        lastChordHit = 0;
+        lastChordTotal = 0;
+        lastChordTime = -Infinity;
     }
 
     // Tracks an in-flight enable() promise. A second enable() call
@@ -1690,7 +2228,22 @@ function createNoteDetector(options = {}) {
         updateButton();
 
         const info = hw.getSongInfo ? hw.getSongInfo() : null;
-        if (info && info.tuning) tuningOffsets = info.tuning;
+        if (info && info.tuning) {
+            tuningOffsets = info.tuning;
+            // String count is authoritative from the tuning array length.
+            // This handles 4/5-string bass, 6/7/8-string guitar without
+            // any special-casing — _ndStandardMidiFor and the constraint
+            // checker both derive their tables from this count.
+            currentStringCount = tuningOffsets.length;
+        } else {
+            // No tuning info — reset to 6-string zero-offset default.
+            // Reassign to a fresh array rather than mutate in place: the
+            // current `tuningOffsets` reference may point at the previous
+            // song's `info.tuning` (assigned in the `if` branch above), so
+            // `.length = 6 / .fill(0)` would clobber the highway's data.
+            currentStringCount = 6;
+            tuningOffsets = [0, 0, 0, 0, 0, 0];
+        }
         if (info && info.capo !== undefined) capo = info.capo;
         if (info && info.arrangement) currentArrangement = _ndArrangementKindFromName(info.arrangement);
 

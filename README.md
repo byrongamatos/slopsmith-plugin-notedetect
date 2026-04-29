@@ -1,6 +1,6 @@
 # Slopsmith Note Detection Plugin
 
-Real-time pitch detection and scoring for [Slopsmith](https://github.com/byrongamatos/slopsmith) — works on both **guitar** (6-string) and **bass** (4-string) arrangements. The active tuning base is selected automatically from the loaded arrangement. Captures audio from your browser's audio input, detects the pitch being played, compares it against the notes on the highway, and shows hit/miss feedback with accuracy scoring.
+Real-time pitch detection and scoring for [Slopsmith](https://github.com/byrongamatos/slopsmith) — works on **guitar** (6/7/8-string) and **bass** (4/5-string) arrangements. The active tuning base is selected automatically from the loaded arrangement. Captures audio from your browser's audio input, detects the pitch being played, compares it against the notes on the highway, and shows hit/miss feedback with accuracy scoring. Single notes use YIN/HPS/CREPE pitch detection; chords use a constraint-based per-string energy check that scores how many of a chord's strings are actually ringing.
 
 ## Install
 
@@ -44,6 +44,7 @@ Click the gear icon when detection is active to access:
 - **Timing Tolerance** — how close to the beat a note must be played (default ±100ms)
 - **Pitch Tolerance** — how close in pitch a note must be (default ±50 cents)
 - **Input Gain** — amplify weak signals
+- **Chord Leniency** — fraction of a chord's strings that must ring for the chord to count as a hit (default 60%, range 25–100%)
 
 All settings are persisted in localStorage across sessions.
 
@@ -92,6 +93,13 @@ YIN is the default and handles most rigs well. The other methods are opt-in for 
 | **YIN** | clean signals (default) | octave-up errors on suppressed fundamentals |
 | **HPS** | bass with weak fundamental | can miss on strong subharmonic stacks |
 | **CREPE / SPICE** | distorted / effected signals | 20 MB model download, WebGL required for speed |
+| **Chord constraint** | chords (auto-routed for ≥2 simultaneous chart notes) | per-string energy band check, not full polyphonic transcription |
+
+### Chord detection
+
+When two or more chart notes share a timestamp the plugin routes through a constraint-based scorer instead of the single-note pitch detectors. For each note in the chord it computes the expected frequency band for that string (open pitch to fret 24, with ±10% headroom for capo, tuning offsets, and bends), measures how much of the audio frame's spectral energy falls inside that band, and counts the string as ringing if the band has ≥3% of total energy. The chord scores `hits / total`; the **Chord Leniency** setting decides how high that ratio needs to be for the chord to register as a hit.
+
+Per-note technique flags from the chart adjust the per-string thresholds: hammer-ons / pull-offs lower the energy threshold (no fresh pick attack); bends and slides widen the pitch tolerance (pitch is in motion); harmonics skip the pitch refinement and use energy-only.
 
 ### YIN (default)
 
@@ -190,8 +198,9 @@ Runs a Node `vm`-based harness (Node 18+, no dependencies) that loads the shippe
 `screen.js` against DOM stubs and exercises its real pitch-detection and mapping
 functions with synthetic signals. Tests cover YIN and HPS detection at
 guitar/bass frequencies, the arrangement-aware string/fret mapping, the
-chart-context-aware display fingering resolver, and noise-tolerance regression
-guards.
+chart-context-aware display fingering resolver, the constraint-based chord
+detector (per-string frequency bands, energy ratios, technique-flag threshold
+adjustments), and noise-tolerance regression guards.
 
 See `test/README.md` for the full rationale. Adding tests when changing
 detection or mapping logic is encouraged — the `vm` loader means tests
