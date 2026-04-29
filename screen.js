@@ -619,9 +619,14 @@ function _ndConstraintCheckString(
     buffer, sampleRate,
     stringIdx, fret, arrangement, stringCount, offsets, capo,
     pitchCheckCents = 0,
-    energyThreshold = 0.03
+    energyThreshold = 0.03,
+    precomputedSpectrum = null
 ) {
-    const { magnitudes, binHz } = _ndFftMagnitude(buffer, sampleRate);
+    // Optional precomputed spectrum lets _ndScoreChord run one FFT for the
+    // whole chord and reuse it across per-string checks. The scratch buffer
+    // returned by _ndFftMagnitude is module-level, so callers must keep this
+    // synchronous and not interleave other FFT-using detectors.
+    const { magnitudes, binHz } = precomputedSpectrum || _ndFftMagnitude(buffer, sampleRate);
     const [loHz, hiHz] = _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo);
 
     const bandEnergy = _ndBandEnergy(magnitudes, binHz, loHz, hiHz);
@@ -669,6 +674,11 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
     let hitStrings = 0;
     const results = [];
 
+    // Run one FFT for the whole chord and reuse the magnitude spectrum
+    // across every per-string check. Without this a 6-string chord ran
+    // 6 FFTs per detection tick — measurable CPU on slower devices.
+    const spectrum = _ndFftMagnitude(buffer, sampleRate);
+
     for (const cn of chordNotes) {
         // Per-technique threshold adjustments (brief §"Handling Techniques")
         let energyThreshold = 0.03;
@@ -690,7 +700,7 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
         const check = _ndConstraintCheckString(
             buffer, sampleRate,
             cn.s, cn.f, arrangement, stringCount, offsets, capo,
-            cents, energyThreshold
+            cents, energyThreshold, spectrum
         );
         results.push({ s: cn.s, f: cn.f, ...check });
         if (check.hit) hitStrings++;
@@ -1349,7 +1359,13 @@ function createNoteDetector(options = {}) {
         detectedMidi = _ndFreqToMidi(result.freq);
         detectedConfidence = result.confidence;
 
-        matchNotes();
+        // Pass the current frame's buffer through to matchNotes so the
+        // chord scorer can run on the same audio that was just analysed
+        // for pitch. The shared `pendingBuffer` is cleared by the timer
+        // (see detectInterval) before processFrame is called, so reading
+        // it later from matchNotes would either skip (null) or pick up a
+        // newer buffer captured mid-processing.
+        matchNotes(buffer);
     }
 
     // ── Note matching ─────────────────────────────────────────────────
@@ -1377,7 +1393,7 @@ function createNoteDetector(options = {}) {
         try { instanceRoot.dispatchEvent(new CustomEvent(type, init)); } catch (e) {}
     }
 
-    function matchNotes() {
+    function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         if (detectedMidi < 0) return;
@@ -1395,7 +1411,12 @@ function createNoteDetector(options = {}) {
                 const n = notes[i];
                 if (n.t > t + tolerance) break;
                 if (n.mt) continue;
-                candidateNotes.push({ s: n.s, f: n.f, t: n.t });
+                // Spread the chart note so technique flags (ho/po/b/sl/hm)
+                // travel with the candidate. _ndScoreChord reads these to
+                // adjust per-string thresholds, so dropping them here would
+                // make hammer-on/bend/harmonic adjustments dead code in
+                // actual gameplay.
+                candidateNotes.push({ ...n });
             }
         }
         if (chords && chords.length > 0) {
@@ -1405,7 +1426,9 @@ function createNoteDetector(options = {}) {
                 if (c.t > t + tolerance) break;
                 for (const cn of (c.notes || [])) {
                     if (cn.mt) continue;
-                    candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
+                    // Chord constituent notes don't carry their own time —
+                    // the chord's `c.t` is the timestamp.
+                    candidateNotes.push({ ...cn, t: c.t });
                 }
             }
         }
@@ -1457,59 +1480,69 @@ function createNoteDetector(options = {}) {
                 }
             } else {
                 // ── Chord path: constraint-based per-string band analysis ──
-                // Skip if we have no audio buffer available (e.g. session
-                // just started or CREPE took too long and pendingBuffer was
-                // consumed before this matchNotes call).
-                if (!pendingBuffer) continue;
+                // Skip if no audio buffer was passed in (e.g. instance
+                // restart while a stale processFrame is unwinding).
+                if (!frameBuffer) continue;
+
+                // Chord-level resolved key. checkMisses() honours this so a
+                // failed chord becomes one miss event (not one per string).
+                const chordKey = `${group[0].t.toFixed(3)}_chord`;
+                if (noteResults.has(chordKey)) continue;
 
                 const sr = audioCtx ? audioCtx.sampleRate : 48000;
                 const chordResult = _ndScoreChord(
-                    pendingBuffer, sr,
+                    frameBuffer, sr,
                     group, currentArrangement, currentStringCount,
                     tuningOffsets, capo,
                     centsTolerance,   // pitch check per string
                     chordHitRatio     // min fraction of strings required
                 );
 
-                // Update HUD chord display
+                // Update HUD chord display (latest reading, hit-or-miss)
                 lastChordScore = chordResult.score;
                 lastChordHit = chordResult.hitStrings;
                 lastChordTotal = chordResult.totalStrings;
 
-                // Record each string's result individually so the draw
-                // overlay can colour them per-note (green/red per fret gem).
-                for (let i = 0; i < group.length; i++) {
-                    const cn = group[i];
+                if (!chordResult.isHit) continue;
+
+                // Chord cleared — mark every constituent note resolved so
+                // checkMisses() doesn't later double-count strings that
+                // didn't individually pass the per-string check (the chord
+                // is judged as one unit). Mark the chord-level key so the
+                // miss aggregator skips this chord.
+                noteResults.set(chordKey, 'hit');
+                for (const cn of group) {
                     const key = noteKey(cn, cn.t);
-                    if (noteResults.has(key)) continue;
-
-                    const stringHit = chordResult.results[i] && chordResult.results[i].hit;
-                    const result = stringHit ? 'hit' : null; // nulls stay pending until miss window
-                    if (stringHit) noteResults.set(key, 'hit');
+                    if (!noteResults.has(key)) noteResults.set(key, 'hit');
                 }
 
-                // Scoring: count the chord as a single hit/miss judgment
-                // based on whether enough strings were detected. Only fire
-                // the event once per chord timestamp, keyed on the first note.
-                const chordKey = noteKey(group[0], group[0].t) + '_chord';
-                if (!noteResults.has(chordKey)) {
-                    noteResults.set(chordKey, chordResult.isHit ? 'hit' : null);
-                    if (chordResult.isHit) {
-                        hits++;
-                        streak++;
-                        if (streak > bestStreak) bestStreak = streak;
-                        updateSectionStat('hit');
-                        dispatchInstanceEvent('notedetect:hit', {
-                            chord: true,
-                            hitStrings: chordResult.hitStrings,
-                            totalStrings: chordResult.totalStrings,
-                            score: chordResult.score,
-                            time: t,
-                            noteTime: group[0].t,
-                            confidence: detectedConfidence,
-                        });
-                    }
-                }
+                hits++;
+                streak++;
+                if (streak > bestStreak) bestStreak = streak;
+                updateSectionStat('hit');
+
+                // Backward-compatible hit payload: keep `note`,
+                // `expectedMidi`, `detectedMidi` so existing single-note
+                // consumers (practice journal, splitscreen) still see the
+                // fields they expect — first note in the chord stands in.
+                // New chord-only fields ride alongside.
+                const lead = group[0];
+                const expectedMidi = _ndMidiFromStringFret(
+                    lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                );
+                dispatchInstanceEvent('notedetect:hit', {
+                    note: { s: lead.s, f: lead.f },
+                    notes: group.map(cn => ({ s: cn.s, f: cn.f })),
+                    chord: true,
+                    hitStrings: chordResult.hitStrings,
+                    totalStrings: chordResult.totalStrings,
+                    score: chordResult.score,
+                    time: t,
+                    noteTime: lead.t,
+                    expectedMidi,
+                    detectedMidi,
+                    confidence: detectedConfidence,
+                });
             }
         }
     }
@@ -1556,10 +1589,38 @@ function createNoteDetector(options = {}) {
             for (let i = start; i < chords.length; i++) {
                 const c = chords[i];
                 if (c.t > missDeadline) break;
-                for (const cn of (c.notes || [])) {
-                    if (cn.mt) continue;
-                    checkNote(cn.s, cn.f, c.t);
+                const liveNotes = (c.notes || []).filter(cn => !cn.mt);
+                if (liveNotes.length === 0) continue;
+                if (liveNotes.length === 1) {
+                    // Degenerate "chord" of one — treat as a single note.
+                    checkNote(liveNotes[0].s, liveNotes[0].f, c.t);
+                    continue;
                 }
+                // Multi-note chord: judge as a single unit. matchNotes()
+                // sets `<t>_chord` to 'hit' when the chord cleared the
+                // ratio threshold; if that key is set, the chord is
+                // already resolved and we leave the per-string keys alone.
+                const chordKey = `${c.t.toFixed(3)}_chord`;
+                if (noteResults.has(chordKey)) continue;
+                noteResults.set(chordKey, 'miss');
+                for (const cn of liveNotes) {
+                    const key = noteKey({ s: cn.s, f: cn.f }, c.t);
+                    if (!noteResults.has(key)) noteResults.set(key, 'miss');
+                }
+                misses++;
+                streak = 0;
+                updateSectionStat('miss');
+                dispatchInstanceEvent('notedetect:miss', {
+                    note: { s: liveNotes[0].s, f: liveNotes[0].f },
+                    notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
+                    chord: true,
+                    time: t,
+                    noteTime: c.t,
+                    expectedMidi: _ndMidiFromStringFret(
+                        liveNotes[0].s, liveNotes[0].f,
+                        currentArrangement, currentStringCount, tuningOffsets, capo
+                    ),
+                });
             }
         }
 
