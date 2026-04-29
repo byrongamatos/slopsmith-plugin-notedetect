@@ -113,6 +113,8 @@ function loadDetectionCore() {
         '_ndYinDetect', '_ndHpsDetect', '_ndFreqToMidi',
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
         '_ndResolveDisplayFingering',
+        '_ndStringBandHz', '_ndBandEnergy',
+        '_ndConstraintCheckString', '_ndScoreChord',
         'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -168,6 +170,10 @@ function loadDetectionCore() {
         return { string: r.string, fret: r.fret };
     };
 
+    // Chord-path helpers take all state (arrangement/stringCount/offsets/capo)
+    // as explicit arguments and return plain numerics or arrays/objects, so
+    // they don't need the sandbox-realm rewrapping the legacy fingering helpers
+    // do. Expose the raw functions; tests pass state in directly.
     return {
         yinDetect: rewrapYin(sandbox._ndYinDetect),
         hpsDetect: rewrapYin(sandbox._ndHpsDetect),
@@ -175,6 +181,22 @@ function loadDetectionCore() {
         midiFromStringFret: midiFromStringFretWrapped,
         midiToStringFret: midiToStringFretWrapped,
         resolveDisplayFingering: resolveDisplayFingeringWrapped,
+        stringBandHz: sandbox._ndStringBandHz,
+        bandEnergy: sandbox._ndBandEnergy,
+        constraintCheckString: sandbox._ndConstraintCheckString,
+        scoreChord: (...args) => {
+            const r = sandbox._ndScoreChord(...args);
+            return {
+                score: r.score,
+                hitStrings: r.hitStrings,
+                totalStrings: r.totalStrings,
+                isHit: r.isHit,
+                results: r.results.map(x => ({
+                    s: x.s, f: x.f, hit: x.hit,
+                    bandEnergy: x.bandEnergy, centsDiff: x.centsDiff,
+                })),
+            };
+        },
         createNoteDetector: sandbox.createNoteDetector,
     };
 }
