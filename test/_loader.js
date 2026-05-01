@@ -190,10 +190,11 @@ function loadDetectionCore() {
         classifyPitch: sandbox._ndClassifyPitch,
         makeJudgment: (opts) => {
             const r = sandbox._ndMakeJudgment(opts);
+            const toSF = o => (o ? { s: o.s, f: o.f } : o);
             return {
-                chartNote: r.chartNote,
-                note: r.note,
-                notes: r.notes,
+                chartNote: toSF(r.chartNote),
+                note: toSF(r.note),
+                notes: r.notes ? r.notes.map(toSF) : r.notes,
                 chord: r.chord,
                 hit: r.hit,
                 timingState: r.timingState,

@@ -346,12 +346,12 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
         for (const cn of candidateNotes) {
             const expected = _ndMidiFromStringFret(cn.s, cn.f, arrangement, stringCount, offsets, capo);
             if (Math.abs(_ndNearestOctaveCents(detectedMidi, expected)) <= pitchToleranceCents) {
-                return { string: cn.s, fret: cn.f, midi: expected };
+                return { string: cn.s, fret: cn.f, displayMidi: expected };
             }
         }
     }
     const fallback = _ndMidiToStringFret(detectedMidi, arrangement, stringCount, offsets, capo);
-    return { string: fallback.string, fret: fallback.fret, midi: detectedMidi };
+    return { string: fallback.string, fret: fallback.fret, displayMidi: detectedMidi };
 }
 
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
@@ -1545,7 +1545,8 @@ function createNoteDetector(options = {}) {
     }
 
     function makeMatchedJudgment(cn, noteTime, t, expectedMidi, detectedMidiForJudgment, confidence, extra = {}) {
-        const pitchError = Number.isFinite(extra.pitchError)
+        const hasExplicitPitchError = Object.prototype.hasOwnProperty.call(extra, 'pitchError');
+        const pitchError = hasExplicitPitchError
             ? extra.pitchError
             : (Number.isFinite(detectedMidiForJudgment) ? (detectedMidiForJudgment - expectedMidi) * 100 : null);
         const expectedFreq = 440 * Math.pow(2, (expectedMidi - 69) / 12);
@@ -1664,7 +1665,7 @@ function createNoteDetector(options = {}) {
             );
             detectedString = disp.string;
             detectedFret = disp.fret;
-            detectedDisplayMidi = Number.isFinite(disp.midi) ? disp.midi : detectedMidi;
+            detectedDisplayMidi = Number.isFinite(disp.displayMidi) ? disp.displayMidi : detectedMidi;
         }
 
         // ── Single-note path (existing YIN/HPS/CREPE result) ──────────
@@ -1784,27 +1785,13 @@ function createNoteDetector(options = {}) {
                     if (noteResults.has(key)) continue;
                     if (!chordJudgment.hit) {
                         // Chord passed energy/ratio threshold but missed the clean-hit
-                        // threshold. Build per-string judgments from each string's own
-                        // centsError (same as the hit path below) so diagnostic labels
-                        // reflect measured per-string errors rather than reusing the
-                        // chord-level aggregate.
-                        const stringRes = chordResult.results[i];
+                        // threshold. Use makeMissJudgment so each per-string entry is
+                        // internally consistent (no post-mutation of hit after _ndMakeJudgment
+                        // has already computed it from timingState/pitchState).
                         const stringExpectedMidi = _ndMidiFromStringFret(
                             cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                         );
-                        const stringHit = stringRes && stringRes.hit;
-                        const stringJudgment = stringHit
-                            ? makeMatchedJudgment(
-                                cn, cn.t, t, stringExpectedMidi,
-                                Number.isFinite(stringRes?.centsError)
-                                    ? stringExpectedMidi + stringRes.centsError / 100
-                                    : null,
-                                detectedConfidence,
-                                { pitchError: Number.isFinite(stringRes?.centsError) ? stringRes.centsError : null }
-                            )
-                            : makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
-                        stringJudgment.hit = false;
-                        noteResults.set(key, stringJudgment);
+                        noteResults.set(key, makeMissJudgment(cn, cn.t, t, stringExpectedMidi));
                         continue;
                     }
                     const stringRes = chordResult.results[i];
