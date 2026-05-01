@@ -63,8 +63,8 @@ Other plugins can listen for these `window`-scoped `CustomEvent`s:
 
 | Event | When | `detail` payload |
 |---|---|---|
-| `notedetect:hit` | A chart note is classified as a hit | `{ note, time, noteTime, expectedMidi, detectedMidi, confidence }` |
-| `notedetect:miss` | A chart note's timing window expires without a matching pitch | `{ note, time, noteTime, expectedMidi }` |
+| `notedetect:hit` | A chart note is classified as a clean hit | `{ note, time, noteTime, expectedMidi, detectedMidi, confidence }` |
+| `notedetect:miss` | A chart note's timing window expires **or** a matched-but-not-clean attempt is classified | Full judgment object (see field reference below) |
 | `notedetect:session` | End of song | aggregate stats for the full run (see [Practice Journal plugin](https://github.com/byrongamatos/slopsmith-plugin-practice) for a consumer) |
 
 When Slopsmith's event bus is available, the plugin also emits
@@ -77,17 +77,17 @@ When Slopsmith's event bus is available, the plugin also emits
 
 Field reference for the per-note events:
 
-| Field | Meaning |
-|---|---|
-| `note` | `{ s, f }` — Rocksmith string / fret of the chart note |
-| `time` | Classification time in seconds — the plugin's view of "now" when it made the decision (derived from `highway.getTime()` plus the A/V-sync offset, minus the detector's latency compensation) |
-| `noteTime` | Chart time in seconds — when the note is scheduled on the chart |
-| `expectedMidi` | MIDI number the chart note should produce given the arrangement's tuning |
-| `detectedMidi` | MIDI number the pitch detector actually heard (hit only) |
-| `confidence` | Detector's confidence score, 0–1 (hit only) |
-| `hit` | `true` only when timing and pitch are both clean |
-| `timingState` / `pitchState` | Independent diagnostic axes: `OK`, `EARLY`, `LATE`, `SHARP`, `FLAT`, or `null` for pure misses |
-| `timingError` / `pitchError` | Signed timing error in milliseconds and signed pitch error in cents |
+| Field | Meaning | Present for |
+|---|---|---|
+| `note` | `{ s, f }` — Rocksmith string / fret of the chart note | all events |
+| `time` | Classification time in seconds — the plugin's view of "now" when it made the decision (derived from `highway.getTime()` plus the A/V-sync offset, minus the detector's latency compensation) | all events |
+| `noteTime` | Chart time in seconds — when the note is scheduled on the chart | all events |
+| `expectedMidi` | MIDI number the chart note should produce given the arrangement's tuning | all events |
+| `detectedMidi` | MIDI number the pitch detector actually heard | clean hits and matched diagnostic misses; absent for pure misses (window expired with no pitch detected) |
+| `confidence` | Detector's confidence score, 0–1 | clean hits and matched diagnostic misses; absent for pure misses |
+| `hit` | `true` only when timing and pitch are both clean | all events (`false` for misses) |
+| `timingState` / `pitchState` | Independent diagnostic axes: `OK`, `EARLY`, `LATE`, `SHARP`, or `FLAT` | clean hits and matched diagnostic misses; `null` for pure misses |
+| `timingError` / `pitchError` | Signed timing error in milliseconds and signed pitch error in cents | clean hits and matched diagnostic misses; `null` for pure misses |
 
 Example — log every hit:
 

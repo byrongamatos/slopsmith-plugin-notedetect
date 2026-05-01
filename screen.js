@@ -687,7 +687,10 @@ function _ndTotalEnergy(magnitudes) {
 
 // Check whether a specific string+fret is audible in the current audio frame.
 //
-// Returns { hit: bool, bandEnergy: float, centsDiff: float|null }
+// Returns { hit: bool, bandEnergy: float, centsDiff: float|null, centsError: float|null }
+//   centsDiff  — absolute pitch deviation in cents (null when pitch check is skipped)
+//   centsError — signed pitch deviation in cents, positive = sharp (present only when
+//                pitchCheckCents > 0 and band energy passes threshold; null otherwise)
 //
 // energyThreshold  — minimum band energy fraction to count as "string is
 //                    ringing" (default 0.03, i.e. at least 3% of total
@@ -2524,8 +2527,9 @@ function createNoteDetector(options = {}) {
             // Slopsmith core exposes the arrangement string count directly.
             // Prefer it over tuning.length because RS XML pads bass tunings
             // to six entries; fall back to tuning length for older cores.
-            currentStringCount = (hw.getStringCount && Number.isFinite(hw.getStringCount()))
-                ? hw.getStringCount()
+            const stringCount = hw.getStringCount ? hw.getStringCount() : undefined;
+            currentStringCount = Number.isFinite(stringCount)
+                ? stringCount
                 : tuningOffsets.length;
         } else {
             // No tuning info — reset to 6-string zero-offset default.
