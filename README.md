@@ -41,8 +41,11 @@ Click the gear icon when detection is active to access:
 - **Input Channel** — Left (Ch 1), Right (Ch 2), or Mono (mix)
 - **Input Level** — VU meter showing signal level on the selected channel
 - **Detection Method** — YIN (default), HPS (bass with weak fundamental), or CREPE/SPICE (TensorFlow.js, ~20MB model download, better with effects). See the [Pitch Detection Methods](#pitch-detection-methods) section below for guidance.
-- **Timing Tolerance** — how close to the beat a note must be played (default ±100ms)
-- **Pitch Tolerance** — how close in pitch a note must be (default ±50 cents)
+- **Timing Tolerance** — outer timing window used to correlate an attempt to a chart note
+- **Pitch Tolerance** — outer pitch window used to correlate an attempt to a chart note
+- **Clean Timing / Clean Pitch** — stricter thresholds for a clean hit; attempts inside the outer window but outside these thresholds become EARLY/LATE/SHARP/FLAT diagnostic misses
+- **Timing/Pitch Labels** — toggles for diagnostic miss labels on the highway
+- **Miss Marker Duration** — how long failed-note markers remain visible below the now-line
 - **Input Gain** — amplify weak signals
 - **Chord Leniency** — fraction of a chord's strings that must ring for the chord to count as a hit (default 60%, range 25–100%)
 
@@ -60,20 +63,31 @@ Other plugins can listen for these `window`-scoped `CustomEvent`s:
 
 | Event | When | `detail` payload |
 |---|---|---|
-| `notedetect:hit` | A chart note is classified as a hit | `{ note, time, noteTime, expectedMidi, detectedMidi, confidence }` |
-| `notedetect:miss` | A chart note's timing window expires without a matching pitch | `{ note, time, noteTime, expectedMidi }` |
+| `notedetect:hit` | A chart note is classified as a clean hit | Full judgment object (includes legacy fields: `{ note, time, noteTime, expectedMidi, detectedMidi, confidence }`) |
+| `notedetect:miss` | A chart note's timing window expires **or** a matched-but-not-clean attempt is classified | Full judgment object (see field reference below) |
 | `notedetect:session` | End of song | aggregate stats for the full run (see [Practice Journal plugin](https://github.com/byrongamatos/slopsmith-plugin-practice) for a consumer) |
+
+When Slopsmith's event bus is available, the plugin also emits
+`window.slopsmith` events:
+
+| Event | When | Payload |
+|---|---|---|
+| `note:hit` | A chart note is classified as a clean hit | Full judgment object |
+| `note:miss` | A chart note is missed or matched with timing/pitch diagnostics | Full judgment object |
 
 Field reference for the per-note events:
 
-| Field | Meaning |
-|---|---|
-| `note` | `{ s, f }` — Rocksmith string / fret of the chart note |
-| `time` | Classification time in seconds — the plugin's view of "now" when it made the decision (derived from `highway.getTime()` plus the A/V-sync offset, minus the detector's latency compensation) |
-| `noteTime` | Chart time in seconds — when the note is scheduled on the chart |
-| `expectedMidi` | MIDI number the chart note should produce given the arrangement's tuning |
-| `detectedMidi` | MIDI number the pitch detector actually heard (hit only) |
-| `confidence` | Detector's confidence score, 0–1 (hit only) |
+| Field | Meaning | Present for |
+|---|---|---|
+| `note` | `{ s, f }` — Rocksmith string / fret of the chart note | all events |
+| `time` | Classification time in seconds — the plugin's view of "now" when it made the decision (derived from `highway.getTime()` plus the A/V-sync offset, minus the detector's latency compensation) | all events |
+| `noteTime` | Chart time in seconds — when the note is scheduled on the chart | all events |
+| `expectedMidi` | MIDI number the chart note should produce given the arrangement's tuning | all events |
+| `detectedMidi` | MIDI number the pitch detector actually heard | clean hits and matched diagnostic misses; `null` for pure misses (window expired with no pitch detected) |
+| `confidence` | Detector's confidence score, 0–1 | clean hits and matched diagnostic misses; `0` for pure misses |
+| `hit` | `true` only when timing and pitch are both clean | all events (`false` for misses) |
+| `timingState` / `pitchState` | Independent diagnostic axes: `OK`, `EARLY`, `LATE`, `SHARP`, or `FLAT` | clean hits and matched diagnostic misses; `null` for pure misses |
+| `timingError` / `pitchError` | Signed timing error in milliseconds and signed pitch error in cents; `pitchError` is octave-folded to the nearest octave (so it is not necessarily equal to `(detectedMidi - expectedMidi) * 100`) | clean hits and matched diagnostic misses; `null` for pure misses |
 
 Example — log every hit:
 

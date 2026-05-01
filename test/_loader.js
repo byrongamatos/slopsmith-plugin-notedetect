@@ -112,9 +112,10 @@ function loadDetectionCore() {
     const required = [
         '_ndYinDetect', '_ndHpsDetect', '_ndFreqToMidi',
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
-        '_ndResolveDisplayFingering',
+        '_ndResolveDisplayFingering', '_ndNearestOctaveCents',
         '_ndStringBandHz', '_ndBandEnergy',
         '_ndConstraintCheckString', '_ndScoreChord',
+        '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
         'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -181,9 +182,35 @@ function loadDetectionCore() {
         midiFromStringFret: midiFromStringFretWrapped,
         midiToStringFret: midiToStringFretWrapped,
         resolveDisplayFingering: resolveDisplayFingeringWrapped,
+        nearestOctaveCents: sandbox._ndNearestOctaveCents,
         stringBandHz: sandbox._ndStringBandHz,
         bandEnergy: sandbox._ndBandEnergy,
         constraintCheckString: sandbox._ndConstraintCheckString,
+        classifyTiming: sandbox._ndClassifyTiming,
+        classifyPitch: sandbox._ndClassifyPitch,
+        makeJudgment: (opts) => {
+            const r = sandbox._ndMakeJudgment(opts);
+            const toSF = o => (o ? { s: o.s, f: o.f } : o);
+            return {
+                chartNote: toSF(r.chartNote),
+                note: toSF(r.note),
+                notes: r.notes ? r.notes.map(toSF) : r.notes,
+                chord: r.chord,
+                hit: r.hit,
+                timingState: r.timingState,
+                timingError: r.timingError,
+                pitchState: r.pitchState,
+                pitchError: r.pitchError,
+                detectedFreq: r.detectedFreq,
+                expectedFreq: r.expectedFreq,
+                detectedAt: r.detectedAt,
+                time: r.time,
+                noteTime: r.noteTime,
+                expectedMidi: r.expectedMidi,
+                detectedMidi: r.detectedMidi,
+                confidence: r.confidence,
+            };
+        },
         scoreChord: (...args) => {
             const r = sandbox._ndScoreChord(...args);
             return {
@@ -194,6 +221,7 @@ function loadDetectionCore() {
                 results: r.results.map(x => ({
                     s: x.s, f: x.f, hit: x.hit,
                     bandEnergy: x.bandEnergy, centsDiff: x.centsDiff,
+                    centsError: x.centsError,
                 })),
             };
         },
