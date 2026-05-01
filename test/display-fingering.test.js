@@ -3,8 +3,9 @@
 //
 // Rule (from research on score-followers and our app's needs):
 //   If a candidate chart note's expected pitch is within the pitch tolerance
-//   of the detected MIDI, report that note's (s, f). Otherwise fall back to
-//   the geometric first-match on the arrangement's tuning.
+//   of the detected MIDI, including whole-octave detector mistakes, report
+//   that note's (s, f). Otherwise fall back to the geometric first-match on
+//   the arrangement's tuning.
 //
 // This avoids the need to pick between multiple geometrically-valid
 // fingerings for the same pitch — the chart already tells us which one
@@ -43,6 +44,25 @@ test('guitar: detected pitch close (30 cents) to chart note still resolves to ch
     assert.deepEqual(r, { string: 1, fret: 0 });
 });
 
+test('guitar low E octave-up detector result resolves to charted open low E', () => {
+    // YIN can lock onto the second harmonic and report E3 (MIDI 52) for
+    // open low E (MIDI 40). During a chart note, the HUD should still show
+    // the authored fingering instead of the geometric fallback (0, 12).
+    const r = core.resolveDisplayFingering(52, [{ s: 0, f: 0, t: 0 }], 'guitar', CENTS);
+    assert.deepEqual(r, { string: 0, fret: 0 });
+});
+
+test('guitar open A octave-up detector result resolves to charted open A', () => {
+    // Without octave-aware chart matching this would fall through to (0, 17).
+    const r = core.resolveDisplayFingering(57, [{ s: 1, f: 0, t: 0 }], 'guitar', CENTS);
+    assert.deepEqual(r, { string: 1, fret: 0 });
+});
+
+test('guitar octave-up pitch with no chart candidates still uses geometric fallback', () => {
+    const r = core.resolveDisplayFingering(52, [], 'guitar', CENTS);
+    assert.deepEqual(r, { string: 0, fret: 12 });
+});
+
 test('guitar: detected pitch far (120 cents) from any chart note: geometric fallback', () => {
     // Player is playing something that doesn't match the chart note; show the
     // geometric guess for the played pitch, not the chart's fingering.
@@ -67,6 +87,11 @@ test('bass A1 played, chart expects open A (string 1 fret 0): display shows (1, 
 
 test('bass E1 played with no chart candidates: falls back to (0, 0)', () => {
     const r = core.resolveDisplayFingering(28, [], 'bass', CENTS);
+    assert.deepEqual(r, { string: 0, fret: 0 });
+});
+
+test('bass low E octave-up detector result resolves to charted open low E', () => {
+    const r = core.resolveDisplayFingering(40, [{ s: 0, f: 0, t: 0 }], 'bass', CENTS);
     assert.deepEqual(r, { string: 0, fret: 0 });
 });
 

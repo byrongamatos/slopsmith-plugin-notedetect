@@ -321,23 +321,30 @@ function _ndMidiToStringFret(midiNote, arrangement, stringCount, offsets, capo) 
     return { string: bestString, fret: bestFret };
 }
 
+function _ndNearestOctaveCents(detectedMidi, expectedMidi) {
+    if (!Number.isFinite(detectedMidi) || !Number.isFinite(expectedMidi)) return Infinity;
+    const cents = (detectedMidi - expectedMidi) * 100;
+    return cents - (Math.round(cents / 1200) * 1200);
+}
+
 // Chart-context-aware fingering resolver. If any candidate chart note's
-// expected pitch is within the pitch tolerance of the detected MIDI, return
-// that note's (string, fret) — the player is hitting the charted fingering.
-// Otherwise fall back to the geometric first-match on the arrangement's
-// tuning. This mirrors what score-follower apps (e.g. Rocksmith) do: trust
-// the chart for display when the player is on-pitch, only guess when they
-// aren't.
+// expected pitch is within the pitch tolerance of the detected MIDI (allowing
+// whole-octave detector mistakes), return that note's (string, fret) — the
+// player is hitting the charted fingering. Otherwise fall back to the
+// geometric first-match on the arrangement's tuning. This mirrors what
+// score-follower apps (e.g. Rocksmith) do: trust the chart for display when
+// the player is on-pitch, only guess when they aren't.
 function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, stringCount, offsets, capo, pitchToleranceCents) {
     if (candidateNotes && candidateNotes.length > 0) {
         for (const cn of candidateNotes) {
             const expected = _ndMidiFromStringFret(cn.s, cn.f, arrangement, stringCount, offsets, capo);
-            if (Math.abs(detectedMidi - expected) * 100 <= pitchToleranceCents) {
-                return { string: cn.s, fret: cn.f };
+            if (Math.abs(_ndNearestOctaveCents(detectedMidi, expected)) <= pitchToleranceCents) {
+                return { string: cn.s, fret: cn.f, midi: expected };
             }
         }
     }
-    return _ndMidiToStringFret(detectedMidi, arrangement, stringCount, offsets, capo);
+    const fallback = _ndMidiToStringFret(detectedMidi, arrangement, stringCount, offsets, capo);
+    return { string: fallback.string, fret: fallback.fret, midi: detectedMidi };
 }
 
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
@@ -1050,6 +1057,7 @@ function createNoteDetector(options = {}) {
     let detectedConfidence = 0;
     let detectedString = -1;
     let detectedFret = -1;
+    let detectedDisplayMidi = -1;
     let underBufferWarned = false;
     // Last chord constraint result — shown in HUD when no single note is detected.
     // Reset on song change via resetScoring(). `lastChordTime` is the
@@ -1463,6 +1471,7 @@ function createNoteDetector(options = {}) {
             detectedConfidence = 0;
             detectedString = -1;
             detectedFret = -1;
+            detectedDisplayMidi = -1;
             // Fall through to matchNotes — the chord path doesn't need a
             // single confident pitch (it scores per-string energy bands),
             // and chord audio is the case where YIN/HPS most often
@@ -1640,6 +1649,7 @@ function createNoteDetector(options = {}) {
             );
             detectedString = disp.string;
             detectedFret = disp.fret;
+            detectedDisplayMidi = Number.isFinite(disp.midi) ? disp.midi : detectedMidi;
         }
 
         // ── Single-note path (existing YIN/HPS/CREPE result) ──────────
@@ -2181,10 +2191,12 @@ function createNoteDetector(options = {}) {
 
         if (detectedEl) {
             if (detectedString >= 0 && detectedConfidence > 0.3) {
-                // Derive the label from the detected MIDI (always correct)
-                // rather than indexing a guitar-6 lookup by string — bass,
-                // 7-string guitar, non-standard tuning, and capo all work.
-                detectedEl.textContent = `${_ndMidiToName(detectedMidi)} · s${detectedString} f${detectedFret}`;
+                // Use the chart-corrected display MIDI when available;
+                // otherwise use the raw detected MIDI. Bass, 7-string guitar,
+                // non-standard tuning, and capo all still route through the
+                // same MIDI-name formatter instead of string-index lookups.
+                const displayMidi = Number.isFinite(detectedDisplayMidi) ? detectedDisplayMidi : detectedMidi;
+                detectedEl.textContent = `${_ndMidiToName(displayMidi)} · s${detectedString} f${detectedFret}`;
             } else if (lastChordScore !== null) {
                 // No confident single-note detected this frame, but we
                 // have a recent chord score from the constraint path —
@@ -2459,6 +2471,7 @@ function createNoteDetector(options = {}) {
         detectedConfidence = 0;
         detectedString = -1;
         detectedFret = -1;
+        detectedDisplayMidi = -1;
         lastChordScore = null;
         lastChordHit = 0;
         lastChordTotal = 0;
