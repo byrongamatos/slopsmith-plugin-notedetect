@@ -110,12 +110,13 @@ test('constraintCheckString: energy-only path fails when band has < 3% energy', 
 test('constraintCheckString: pitch check fails when in-band signal is far off pitch', () => {
     // Expected pitch for string 0 fret 0 is E2 = 82.41 Hz. A 305 Hz sine sits
     // in the band but is ~2266 cents sharp. With a 50-cent tolerance the
-    // check must reject it.
+    // octave-folded check must still reject it because it is not close to an
+    // octave-equivalent E.
     const buf = sine(305, SR, DURATION);
     const r = core.constraintCheckString(buf, SR, 0, 0,
         'guitar', 6, GUITAR_6.offsets, 0, /*pitchCheckCents*/ 50);
     assert.equal(r.hit, false);
-    assert.ok(r.centsDiff > 1000, `centsDiff ${r.centsDiff} should be >> 50`);
+    assert.ok(r.centsDiff > 50, `centsDiff ${r.centsDiff} should be > 50`);
 });
 
 test('constraintCheckString: pitch check accepts within-tolerance signal', () => {
@@ -125,6 +126,17 @@ test('constraintCheckString: pitch check accepts within-tolerance signal', () =>
     // gives a cleaner peak at this low frequency anyway.
     const longDur = 16384 / SR;
     const buf = sine(82, SR, longDur);
+    const r = core.constraintCheckString(buf, SR, 0, 0,
+        'guitar', 6, GUITAR_6.offsets, 0, /*pitchCheckCents*/ 50);
+    assert.equal(r.hit, true);
+    assert.ok(r.centsDiff < 50, `centsDiff ${r.centsDiff} should be < 50`);
+});
+
+test('constraintCheckString: pitch check accepts octave-up detector peak', () => {
+    // E3 is an octave above the expected open low E. When the fundamental is
+    // weak and the second harmonic dominates, the string should still count.
+    const longDur = 16384 / SR;
+    const buf = sine(164.81377845643496, SR, longDur);
     const r = core.constraintCheckString(buf, SR, 0, 0,
         'guitar', 6, GUITAR_6.offsets, 0, /*pitchCheckCents*/ 50);
     assert.equal(r.hit, true);

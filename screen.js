@@ -321,10 +321,14 @@ function _ndMidiToStringFret(midiNote, arrangement, stringCount, offsets, capo) 
     return { string: bestString, fret: bestFret };
 }
 
+function _ndFoldOctaveCents(cents) {
+    if (!Number.isFinite(cents)) return Infinity;
+    return cents - (Math.round(cents / 1200) * 1200);
+}
+
 function _ndNearestOctaveCents(detectedMidi, expectedMidi) {
     if (!Number.isFinite(detectedMidi) || !Number.isFinite(expectedMidi)) return Infinity;
-    const cents = (detectedMidi - expectedMidi) * 100;
-    return cents - (Math.round(cents / 1200) * 1200);
+    return _ndFoldOctaveCents((detectedMidi - expectedMidi) * 100);
 }
 
 // Chart-context-aware fingering resolver. If any candidate chart note's
@@ -741,7 +745,8 @@ function _ndConstraintCheckString(
 
     const expectedMidi = _ndMidiFromStringFret(stringIdx, fret, arrangement, stringCount, offsets, capo);
     const expectedHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
-    const centsError = 1200 * Math.log2(detectedHz / expectedHz);
+    const rawCentsError = 1200 * Math.log2(detectedHz / expectedHz);
+    const centsError = _ndFoldOctaveCents(rawCentsError);
     const centsDiff = Math.abs(centsError);
 
     return { hit: centsDiff <= pitchCheckCents, bandEnergy, centsDiff, centsError };
@@ -1679,7 +1684,7 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
-                const detectedCents = (detectedMidi - expectedMidi) * 100;
+                const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
 
                 if (Math.abs(detectedCents) <= centsTolerance) {
                     const judgment = makeMatchedJudgment(

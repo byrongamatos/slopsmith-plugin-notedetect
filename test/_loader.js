@@ -112,7 +112,7 @@ function loadDetectionCore() {
     const required = [
         '_ndYinDetect', '_ndHpsDetect', '_ndFreqToMidi',
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
-        '_ndResolveDisplayFingering',
+        '_ndResolveDisplayFingering', '_ndNearestOctaveCents',
         '_ndStringBandHz', '_ndBandEnergy',
         '_ndConstraintCheckString', '_ndScoreChord',
         '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
@@ -182,6 +182,7 @@ function loadDetectionCore() {
         midiFromStringFret: midiFromStringFretWrapped,
         midiToStringFret: midiToStringFretWrapped,
         resolveDisplayFingering: resolveDisplayFingeringWrapped,
+        nearestOctaveCents: sandbox._ndNearestOctaveCents,
         stringBandHz: sandbox._ndStringBandHz,
         bandEnergy: sandbox._ndBandEnergy,
         constraintCheckString: sandbox._ndConstraintCheckString,

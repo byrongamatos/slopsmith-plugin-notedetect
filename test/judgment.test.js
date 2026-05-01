@@ -20,6 +20,12 @@ test('classifyPitch uses signed cent errors', () => {
     assert.equal(core.classifyPitch(null, 20), null);
 });
 
+test('nearestOctaveCents folds octave-up detector readings into hit-range pitch error', () => {
+    assert.equal(core.nearestOctaveCents(52, 40), 0);
+    assert.equal(Math.round(core.nearestOctaveCents(52.25, 40)), 25);
+    assert.equal(Math.round(core.nearestOctaveCents(51.8, 40)), -20);
+});
+
 test('makeJudgment marks a clean matched note as hit', () => {
     const j = core.makeJudgment({
         matched: true,
