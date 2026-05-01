@@ -1727,9 +1727,14 @@ function createNoteDetector(options = {}) {
                 const chordPitchError = firstFiniteCentsError !== undefined
                     ? firstFiniteCentsError
                     : (detectedMidi >= 0 ? (detectedMidi - expectedMidi) * 100 : null);
+                const chordDetectedMidi = detectedMidi >= 0
+                    ? detectedMidi
+                    : (Number.isFinite(chordPitchError)
+                        ? expectedMidi + chordPitchError / 100
+                        : null);
                 const chordJudgment = makeMatchedJudgment(
                     lead, lead.t, t, expectedMidi,
-                    detectedMidi >= 0 ? detectedMidi : expectedMidi + chordPitchError / 100,
+                    chordDetectedMidi,
                     detectedConfidence,
                     {
                         notes: group.map(cn => ({ s: cn.s, f: cn.f })),
