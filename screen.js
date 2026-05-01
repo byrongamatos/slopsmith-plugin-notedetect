@@ -1024,8 +1024,12 @@ function createNoteDetector(options = {}) {
             // the method allowlist below.
             if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
             if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
-            if (s.timingTolerance !== undefined) timingTolerance = s.timingTolerance;
-            if (s.pitchTolerance !== undefined) pitchTolerance = s.pitchTolerance;
+            // Clamp tolerances to the UI slider ranges (30–300ms, 10–100c)
+            // before deriving hit thresholds so a stale or manually-edited
+            // stored value can't produce an invalid range input or a hit
+            // threshold that exceeds the tolerance ceiling.
+            if (s.timingTolerance !== undefined) timingTolerance = Math.max(0.03, Math.min(0.3, s.timingTolerance));
+            if (s.pitchTolerance !== undefined) pitchTolerance = Math.max(10, Math.min(100, s.pitchTolerance));
             if (s.timingHitThreshold !== undefined) timingHitThreshold = Math.max(0.03, Math.min(timingTolerance, s.timingHitThreshold));
             if (s.pitchHitThreshold !== undefined) pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, s.pitchHitThreshold));
             if (s.showTimingErrors !== undefined) showTimingErrors = !!s.showTimingErrors;
@@ -1757,10 +1761,6 @@ function createNoteDetector(options = {}) {
 
                 if (!chordResult.isHit) {
                     chordJudgment.hit = false;
-                    if (chordJudgment.pitchState === 'OK') {
-                        chordJudgment.pitchState = null;
-                        chordJudgment.pitchError = null;
-                    }
                     recordJudgment(chordKey, chordJudgment);
                     for (const cn of group) {
                         const key = noteKey(cn, cn.t);
@@ -1800,9 +1800,11 @@ function createNoteDetector(options = {}) {
                     const stringJudgment = stringHit
                         ? makeMatchedJudgment(
                             cn, cn.t, t, stringExpectedMidi,
-                            stringExpectedMidi + (Number.isFinite(stringRes.centsError) ? stringRes.centsError / 100 : 0),
+                            Number.isFinite(stringRes?.centsError)
+                                ? stringExpectedMidi + stringRes.centsError / 100
+                                : null,
                             detectedConfidence,
-                            { pitchError: Number.isFinite(stringRes.centsError) ? stringRes.centsError : 0 }
+                            { pitchError: Number.isFinite(stringRes?.centsError) ? stringRes.centsError : null }
                         )
                         : makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
                     noteResults.set(key, stringJudgment);
