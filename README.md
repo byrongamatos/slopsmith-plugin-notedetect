@@ -83,8 +83,8 @@ Field reference for the per-note events:
 | `time` | Classification time in seconds — the plugin's view of "now" when it made the decision (derived from `highway.getTime()` plus the A/V-sync offset, minus the detector's latency compensation) | all events |
 | `noteTime` | Chart time in seconds — when the note is scheduled on the chart | all events |
 | `expectedMidi` | MIDI number the chart note should produce given the arrangement's tuning | all events |
-| `detectedMidi` | MIDI number the pitch detector actually heard | clean hits and matched diagnostic misses; absent for pure misses (window expired with no pitch detected) |
-| `confidence` | Detector's confidence score, 0–1 | clean hits and matched diagnostic misses; absent for pure misses |
+| `detectedMidi` | MIDI number the pitch detector actually heard | clean hits and matched diagnostic misses; `null` for pure misses (window expired with no pitch detected) |
+| `confidence` | Detector's confidence score, 0–1 | clean hits and matched diagnostic misses; `0` for pure misses |
 | `hit` | `true` only when timing and pitch are both clean | all events (`false` for misses) |
 | `timingState` / `pitchState` | Independent diagnostic axes: `OK`, `EARLY`, `LATE`, `SHARP`, or `FLAT` | clean hits and matched diagnostic misses; `null` for pure misses |
 | `timingError` / `pitchError` | Signed timing error in milliseconds and signed pitch error in cents | clean hits and matched diagnostic misses; `null` for pure misses |

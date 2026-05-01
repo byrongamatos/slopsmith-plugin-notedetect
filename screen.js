@@ -718,11 +718,11 @@ function _ndConstraintCheckString(
 
     const bandEnergy = _ndBandEnergy(magnitudes, binHz, loHz, hiHz, precomputedTotalEnergy);
     if (bandEnergy < energyThreshold) {
-        return { hit: false, bandEnergy, centsDiff: null };
+        return { hit: false, bandEnergy, centsDiff: null, centsError: null };
     }
 
     if (pitchCheckCents <= 0) {
-        return { hit: true, bandEnergy, centsDiff: null };
+        return { hit: true, bandEnergy, centsDiff: null, centsError: null };
     }
 
     // Find dominant bin in the band and refine with parabolic interpolation.
@@ -1718,9 +1718,15 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
-                const chordPitchError = Number.isFinite(chordResult.results[0]?.centsError)
-                    ? chordResult.results[0].centsError
-                    : (detectedMidi >= 0 ? (detectedMidi - expectedMidi) * 100 : 0);
+                // Derive pitch error from the first string that actually has a
+                // finite centsError measurement. Fall back to the monophonic
+                // detector if available; leave null if no pitch data exists
+                // (e.g. energy-only checks or lead string failed the pitch check).
+                const firstFiniteCentsError = chordResult.results
+                    ?.find(r => Number.isFinite(r?.centsError))?.centsError;
+                const chordPitchError = firstFiniteCentsError !== undefined
+                    ? firstFiniteCentsError
+                    : (detectedMidi >= 0 ? (detectedMidi - expectedMidi) * 100 : null);
                 const chordJudgment = makeMatchedJudgment(
                     lead, lead.t, t, expectedMidi,
                     detectedMidi >= 0 ? detectedMidi : expectedMidi + chordPitchError / 100,
@@ -1837,9 +1843,9 @@ function createNoteDetector(options = {}) {
                     continue;
                 }
                 // Multi-note chord: judge as a single unit. matchNotes()
-                // sets `<t>_chord` to 'hit' when the chord cleared the
-                // ratio threshold; if that key is set, the chord is
-                // already resolved and we leave the per-string keys alone.
+                // stores a judgment object at `<t>_chord` when the chord
+                // cleared the ratio threshold; if that key is present, the
+                // chord is already resolved and we leave the per-string keys alone.
                 const chordKey = `${c.t.toFixed(3)}_chord`;
                 if (noteResults.has(chordKey)) continue;
                 const expectedMidi = _ndMidiFromStringFret(
@@ -2260,9 +2266,10 @@ function createNoteDetector(options = {}) {
             else ctx.fillText(text, x, y);
         };
 
+        const nowPoint = hw.project(0);
+
         const drawIndicator = (s, f, noteTime, judgment) => {
             const tOff = noteTime - renderT;
-            const nowPoint = hw.project(0);
             if (!nowPoint) return;
 
             const age = Math.max(0, renderT - noteTime);
@@ -2380,10 +2387,9 @@ function createNoteDetector(options = {}) {
         }
 
         if (detectedString >= 0 && detectedConfidence > 0.3) {
-            const p = hw.project(0);
-            if (p) {
-                const x = hw.fretX(detectedFret, p.scale, W);
-                const y = p.y * H;
+            if (nowPoint) {
+                const x = hw.fretX(detectedFret, nowPoint.scale, W);
+                const y = nowPoint.y * H;
                 ctx.save();
                 ctx.globalAlpha = Math.min(1, detectedConfidence);
                 ctx.fillStyle = '#44ddff';
