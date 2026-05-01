@@ -243,6 +243,59 @@ function _ndMidiFromStringFret(string, fret, arrangement, stringCount, offsets, 
     return base[string] + offset + (capo || 0) + fret;
 }
 
+function _ndClassifyTiming(timingErrorMs, timingThresholdMs) {
+    if (!Number.isFinite(timingErrorMs)) return null;
+    return Math.abs(timingErrorMs) <= timingThresholdMs
+        ? 'OK'
+        : (timingErrorMs < 0 ? 'EARLY' : 'LATE');
+}
+
+function _ndClassifyPitch(pitchErrorCents, pitchThresholdCents) {
+    if (!Number.isFinite(pitchErrorCents)) return null;
+    return Math.abs(pitchErrorCents) <= pitchThresholdCents
+        ? 'OK'
+        : (pitchErrorCents > 0 ? 'SHARP' : 'FLAT');
+}
+
+function _ndMakeJudgment(opts) {
+    const o = opts || {};
+    const matched = !!o.matched;
+    const timingError = matched && Number.isFinite(o.judgedAt) && Number.isFinite(o.noteTime)
+        ? Math.round((o.judgedAt - o.noteTime) * 1000)
+        : null;
+    const pitchError = matched && Number.isFinite(o.pitchError)
+        ? Math.round(o.pitchError)
+        : null;
+    const timingThresholdMs = Number.isFinite(o.timingThresholdMs) ? o.timingThresholdMs : 100;
+    const pitchThresholdCents = Number.isFinite(o.pitchThresholdCents) ? o.pitchThresholdCents : 20;
+    const timingState = matched ? _ndClassifyTiming(timingError, timingThresholdMs) : null;
+    const pitchState = matched ? _ndClassifyPitch(pitchError, pitchThresholdCents) : null;
+    const hit = timingState === 'OK' && pitchState === 'OK';
+    return {
+        chartNote: o.chartNote || o.note || null,
+        note: o.note || null,
+        notes: o.notes || null,
+        chord: !!o.chord,
+        hit,
+        timingState,
+        timingError,
+        pitchState,
+        pitchError,
+        detectedFreq: Number.isFinite(o.detectedFreq) ? o.detectedFreq : null,
+        expectedFreq: Number.isFinite(o.expectedFreq) ? o.expectedFreq : null,
+        detectedAt: matched && Number.isFinite(o.judgedAt) ? o.judgedAt : null,
+        time: Number.isFinite(o.judgedAt) ? o.judgedAt : null,
+        noteTime: Number.isFinite(o.noteTime) ? o.noteTime : null,
+        expectedMidi: Number.isFinite(o.expectedMidi) ? o.expectedMidi : null,
+        detectedMidi: Number.isFinite(o.detectedMidi) ? o.detectedMidi : null,
+        confidence: Number.isFinite(o.confidence) ? o.confidence : 0,
+        hitStrings: Number.isFinite(o.hitStrings) ? o.hitStrings : undefined,
+        totalStrings: Number.isFinite(o.totalStrings) ? o.totalStrings : undefined,
+        score: Number.isFinite(o.score) ? o.score : undefined,
+        monophonicDetected: o.monophonicDetected,
+    };
+}
+
 function _ndMidiToStringFret(midiNote, arrangement, stringCount, offsets, capo) {
     // Pure geometric fallback: walk strings 0..N and return the first position
     // that matches the pitch. Used when there is no chart context available
@@ -678,9 +731,10 @@ function _ndConstraintCheckString(
 
     const expectedMidi = _ndMidiFromStringFret(stringIdx, fret, arrangement, stringCount, offsets, capo);
     const expectedHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
-    const centsDiff = Math.abs(1200 * Math.log2(detectedHz / expectedHz));
+    const centsError = 1200 * Math.log2(detectedHz / expectedHz);
+    const centsDiff = Math.abs(centsError);
 
-    return { hit: centsDiff <= pitchCheckCents, bandEnergy, centsDiff };
+    return { hit: centsDiff <= pitchCheckCents, bandEnergy, centsDiff, centsError };
 }
 
 // Score a chord by checking each of its constituent notes against their
@@ -925,6 +979,12 @@ function createNoteDetector(options = {}) {
     let detectionMethod = 'yin';
     let timingTolerance = 0.150;
     let pitchTolerance = 50;
+    let timingHitThreshold = 0.100;
+    let pitchHitThreshold = 20;
+    let showTimingErrors = true;
+    let showPitchErrors = true;
+    let missMarkerDuration = 2.0;
+    let hitGlowDuration = 0.5;
     let inputGain = 1.0;
     let selectedDeviceId = '';
     let selectedChannel = 'mono';
@@ -948,6 +1008,12 @@ function createNoteDetector(options = {}) {
             if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
             if (s.timingTolerance !== undefined) timingTolerance = s.timingTolerance;
             if (s.pitchTolerance !== undefined) pitchTolerance = s.pitchTolerance;
+            if (s.timingHitThreshold !== undefined) timingHitThreshold = Math.max(0.03, Math.min(timingTolerance, s.timingHitThreshold));
+            if (s.pitchHitThreshold !== undefined) pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, s.pitchHitThreshold));
+            if (s.showTimingErrors !== undefined) showTimingErrors = !!s.showTimingErrors;
+            if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
+            if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
+            if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
             if (s.inputGain !== undefined) inputGain = s.inputGain;
             if (s.latencyOffset !== undefined) latencyOffset = s.latencyOffset;
             // Clamp to the slider's range so a stale persisted value
@@ -977,7 +1043,7 @@ function createNoteDetector(options = {}) {
     let bestStreak = 0;
     let sectionStats = [];   // [{name, hits, misses}]
     let currentSection = null;
-    const noteResults = new Map(); // key -> 'hit'|'miss'
+    const noteResults = new Map(); // key -> judgment object
 
     // Detection state
     let detectedMidi = -1;
@@ -1056,6 +1122,12 @@ function createNoteDetector(options = {}) {
                 method: detectionMethod,
                 timingTolerance,
                 pitchTolerance,
+                timingHitThreshold,
+                pitchHitThreshold,
+                showTimingErrors,
+                showPitchErrors,
+                missMarkerDuration,
+                hitGlowDuration,
                 inputGain,
                 latencyOffset,
                 chordHitRatio,
@@ -1436,6 +1508,84 @@ function createNoteDetector(options = {}) {
         try { instanceRoot.dispatchEvent(new CustomEvent(type, init)); } catch (e) {}
     }
 
+    function emitSlopsmithJudgment(judgment) {
+        if (!window.slopsmith || typeof window.slopsmith.emit !== 'function') return;
+        try {
+            window.slopsmith.emit(judgment.hit ? 'note:hit' : 'note:miss', judgment);
+        } catch (e) {}
+    }
+
+    function dispatchJudgment(judgment) {
+        dispatchInstanceEvent(judgment.hit ? 'notedetect:hit' : 'notedetect:miss', judgment);
+        emitSlopsmithJudgment(judgment);
+    }
+
+    function makeMatchedJudgment(cn, noteTime, t, expectedMidi, detectedMidiForJudgment, confidence, extra = {}) {
+        const pitchError = Number.isFinite(extra.pitchError)
+            ? extra.pitchError
+            : (Number.isFinite(detectedMidiForJudgment) ? (detectedMidiForJudgment - expectedMidi) * 100 : null);
+        const expectedFreq = 440 * Math.pow(2, (expectedMidi - 69) / 12);
+        const detectedFreq = Number.isFinite(detectedMidiForJudgment)
+            ? 440 * Math.pow(2, (detectedMidiForJudgment - 69) / 12)
+            : null;
+        return _ndMakeJudgment({
+            matched: true,
+            note: extra.note || { s: cn.s, f: cn.f },
+            notes: extra.notes || null,
+            chord: !!extra.chord,
+            chartNote: extra.chartNote || cn,
+            noteTime,
+            judgedAt: t,
+            expectedMidi,
+            detectedMidi: detectedMidiForJudgment,
+            confidence,
+            pitchError,
+            expectedFreq,
+            detectedFreq,
+            timingThresholdMs: timingHitThreshold * 1000,
+            pitchThresholdCents: pitchHitThreshold,
+            hitStrings: extra.hitStrings,
+            totalStrings: extra.totalStrings,
+            score: extra.score,
+            monophonicDetected: extra.monophonicDetected,
+        });
+    }
+
+    function makeMissJudgment(cn, noteTime, t, expectedMidi, extra = {}) {
+        return _ndMakeJudgment({
+            matched: false,
+            note: extra.note || { s: cn.s, f: cn.f },
+            notes: extra.notes || null,
+            chord: !!extra.chord,
+            chartNote: extra.chartNote || cn,
+            noteTime,
+            judgedAt: t,
+            expectedMidi,
+            timingThresholdMs: timingHitThreshold * 1000,
+            pitchThresholdCents: pitchHitThreshold,
+            hitStrings: extra.hitStrings,
+            totalStrings: extra.totalStrings,
+            score: extra.score,
+        });
+    }
+
+    function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
+        noteResults.set(key, judgment);
+        if (count) {
+            if (judgment.hit) {
+                hits++;
+                streak++;
+                if (streak > bestStreak) bestStreak = streak;
+                updateSectionStat('hit');
+            } else {
+                misses++;
+                streak = 0;
+                updateSectionStat('miss');
+            }
+        }
+        if (emit) dispatchJudgment(judgment);
+    }
+
     function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
@@ -1519,19 +1669,11 @@ function createNoteDetector(options = {}) {
                 const detectedCents = (detectedMidi - expectedMidi) * 100;
 
                 if (Math.abs(detectedCents) <= centsTolerance) {
-                    noteResults.set(key, 'hit');
-                    hits++;
-                    streak++;
-                    if (streak > bestStreak) bestStreak = streak;
-                    updateSectionStat('hit');
-                    dispatchInstanceEvent('notedetect:hit', {
-                        note: { s: cn.s, f: cn.f },
-                        time: t,
-                        noteTime: cn.t,
-                        expectedMidi,
-                        detectedMidi,
-                        confidence: detectedConfidence,
-                    });
+                    const judgment = makeMatchedJudgment(
+                        cn, cn.t, t, expectedMidi, detectedMidi, detectedConfidence,
+                        { pitchError: detectedCents }
+                    );
+                    recordJudgment(key, judgment);
                 }
             } else {
                 // ── Chord path: constraint-based per-string band analysis ──
@@ -1559,7 +1701,43 @@ function createNoteDetector(options = {}) {
                 lastChordTotal = chordResult.totalStrings;
                 lastChordTime = group[0].t;
 
-                if (!chordResult.isHit) continue;
+                const lead = group[0];
+                const expectedMidi = _ndMidiFromStringFret(
+                    lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                );
+                const chordPitchError = Number.isFinite(chordResult.results[0]?.centsError)
+                    ? chordResult.results[0].centsError
+                    : (detectedMidi >= 0 ? (detectedMidi - expectedMidi) * 100 : 0);
+                const chordJudgment = makeMatchedJudgment(
+                    lead, lead.t, t, expectedMidi,
+                    detectedMidi >= 0 ? detectedMidi : expectedMidi + chordPitchError / 100,
+                    detectedConfidence,
+                    {
+                        notes: group.map(cn => ({ s: cn.s, f: cn.f })),
+                        chord: true,
+                        hitStrings: chordResult.hitStrings,
+                        totalStrings: chordResult.totalStrings,
+                        score: chordResult.score,
+                        pitchError: chordPitchError,
+                        monophonicDetected: detectedMidi >= 0,
+                    }
+                );
+
+                if (!chordResult.isHit) {
+                    chordJudgment.hit = false;
+                    if (chordJudgment.pitchState === 'OK') {
+                        chordJudgment.pitchState = null;
+                        chordJudgment.pitchError = null;
+                    }
+                    recordJudgment(chordKey, chordJudgment);
+                    for (const cn of group) {
+                        const key = noteKey(cn, cn.t);
+                        if (!noteResults.has(key)) noteResults.set(key, makeMissJudgment(cn, cn.t, t, _ndMidiFromStringFret(
+                            cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                        )));
+                    }
+                    continue;
+                }
 
                 // Chord cleared. Mark the chord-level key 'hit' so the
                 // miss aggregator in checkMisses() treats it as a single
@@ -1569,51 +1747,34 @@ function createNoteDetector(options = {}) {
                 // can colour gems individually (green / red per fret) on
                 // lenient chord hits where some strings rang and some
                 // didn't.
-                noteResults.set(chordKey, 'hit');
+                recordJudgment(chordKey, chordJudgment, { count: true, emit: true });
                 for (let i = 0; i < group.length; i++) {
                     const cn = group[i];
                     const key = noteKey(cn, cn.t);
                     if (noteResults.has(key)) continue;
+                    if (!chordJudgment.hit) {
+                        noteResults.set(key, {
+                            ...chordJudgment,
+                            note: { s: cn.s, f: cn.f },
+                            chartNote: cn,
+                        });
+                        continue;
+                    }
                     const stringRes = chordResult.results[i];
                     const stringHit = stringRes && stringRes.hit;
-                    noteResults.set(key, stringHit ? 'hit' : 'miss');
+                    const stringExpectedMidi = _ndMidiFromStringFret(
+                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    );
+                    const stringJudgment = stringHit
+                        ? makeMatchedJudgment(
+                            cn, cn.t, t, stringExpectedMidi,
+                            stringExpectedMidi + (Number.isFinite(stringRes.centsError) ? stringRes.centsError / 100 : 0),
+                            detectedConfidence,
+                            { pitchError: Number.isFinite(stringRes.centsError) ? stringRes.centsError : 0 }
+                        )
+                        : makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
+                    noteResults.set(key, stringJudgment);
                 }
-
-                hits++;
-                streak++;
-                if (streak > bestStreak) bestStreak = streak;
-                updateSectionStat('hit');
-
-                // Backward-compatible hit payload: keep `note`,
-                // `expectedMidi`, `detectedMidi` so existing single-note
-                // consumers (practice journal, splitscreen) still see the
-                // fields they expect — first note in the chord stands in.
-                // New chord-only fields ride alongside.
-                const lead = group[0];
-                const expectedMidi = _ndMidiFromStringFret(
-                    lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
-                );
-                // Chord hits can fire even when monophonic detection
-                // wasn't confident on this frame (chord audio routinely
-                // does that). Keep `detectedMidi` and `confidence`
-                // numeric (-1 / 0 sentinels) for backward compatibility
-                // with consumers that expect numbers — `monophonicDetected`
-                // is the discriminator for "no monophonic pitch on this
-                // frame" vs. a real -1 result.
-                dispatchInstanceEvent('notedetect:hit', {
-                    note: { s: lead.s, f: lead.f },
-                    notes: group.map(cn => ({ s: cn.s, f: cn.f })),
-                    chord: true,
-                    hitStrings: chordResult.hitStrings,
-                    totalStrings: chordResult.totalStrings,
-                    score: chordResult.score,
-                    time: t,
-                    noteTime: lead.t,
-                    expectedMidi,
-                    detectedMidi,
-                    confidence: detectedConfidence,
-                    monophonicDetected: detectedMidi >= 0,
-                });
             }
         }
     }
@@ -1631,18 +1792,13 @@ function createNoteDetector(options = {}) {
             if (noteTime > missDeadline) return;
             const key = noteKey({ s, f }, noteTime);
             if (!noteResults.has(key)) {
-                noteResults.set(key, 'miss');
-                misses++;
-                streak = 0;
-                updateSectionStat('miss');
-                dispatchInstanceEvent('notedetect:miss', {
-                    note: { s, f },
-                    time: t,
-                    noteTime,
-                    expectedMidi: _ndMidiFromStringFret(
-                        s, f, currentArrangement, currentStringCount, tuningOffsets, capo
-                    ),
-                });
+                const expectedMidi = _ndMidiFromStringFret(
+                    s, f, currentArrangement, currentStringCount, tuningOffsets, capo
+                );
+                recordJudgment(
+                    key,
+                    makeMissJudgment({ s, f }, noteTime, t, expectedMidi)
+                );
             }
         };
 
@@ -1673,25 +1829,21 @@ function createNoteDetector(options = {}) {
                 // already resolved and we leave the per-string keys alone.
                 const chordKey = `${c.t.toFixed(3)}_chord`;
                 if (noteResults.has(chordKey)) continue;
-                noteResults.set(chordKey, 'miss');
-                for (const cn of liveNotes) {
-                    const key = noteKey({ s: cn.s, f: cn.f }, c.t);
-                    if (!noteResults.has(key)) noteResults.set(key, 'miss');
-                }
-                misses++;
-                streak = 0;
-                updateSectionStat('miss');
-                dispatchInstanceEvent('notedetect:miss', {
-                    note: { s: liveNotes[0].s, f: liveNotes[0].f },
+                const expectedMidi = _ndMidiFromStringFret(
+                    liveNotes[0].s, liveNotes[0].f,
+                    currentArrangement, currentStringCount, tuningOffsets, capo
+                );
+                const chordJudgment = makeMissJudgment(liveNotes[0], c.t, t, expectedMidi, {
                     notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
                     chord: true,
-                    time: t,
-                    noteTime: c.t,
-                    expectedMidi: _ndMidiFromStringFret(
-                        liveNotes[0].s, liveNotes[0].f,
-                        currentArrangement, currentStringCount, tuningOffsets, capo
-                    ),
                 });
+                recordJudgment(chordKey, chordJudgment);
+                for (const cn of liveNotes) {
+                    const key = noteKey({ s: cn.s, f: cn.f }, c.t);
+                    if (!noteResults.has(key)) noteResults.set(key, makeMissJudgment(cn, c.t, t, _ndMidiFromStringFret(
+                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    )));
+                }
             }
         }
 
@@ -1773,11 +1925,38 @@ function createNoteDetector(options = {}) {
 
             <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span class="nd-timing-val">${Math.round(timingTolerance * 1000)}</span>ms</label>
             <input type="range" min="30" max="300" value="${Math.round(timingTolerance * 1000)}"
-                   class="nd-timing-slider w-full accent-green-400 mb-3">
+                   class="nd-timing-slider w-full accent-green-400 mb-2">
+            <div class="text-[10px] text-gray-600 mb-2 leading-tight">
+                Outer match window. Detections outside this range are ignored.
+            </div>
 
             <label class="block text-gray-400 text-xs mb-1">Pitch Tolerance: <span class="nd-pitch-val">${pitchTolerance}</span> cents</label>
             <input type="range" min="10" max="100" value="${pitchTolerance}"
-                   class="nd-pitch-slider w-full accent-green-400 mb-3">
+                   class="nd-pitch-slider w-full accent-green-400 mb-2">
+            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+                Outer pitch match window. Wider values correlate more attempts.
+            </div>
+
+            <label class="block text-gray-400 text-xs mb-1">Clean Timing: <span class="nd-timing-hit-val">${Math.round(timingHitThreshold * 1000)}</span>ms</label>
+            <input type="range" min="30" max="${Math.round(timingTolerance * 1000)}" value="${Math.round(timingHitThreshold * 1000)}"
+                   class="nd-timing-hit-slider w-full accent-blue-400 mb-2">
+
+            <label class="block text-gray-400 text-xs mb-1">Clean Pitch: <span class="nd-pitch-hit-val">${pitchHitThreshold}</span> cents</label>
+            <input type="range" min="5" max="${pitchTolerance}" value="${pitchHitThreshold}"
+                   class="nd-pitch-hit-slider w-full accent-blue-400 mb-3">
+
+            <label class="flex items-center gap-2 text-gray-400 text-xs mb-2">
+                <input type="checkbox" class="nd-show-timing accent-green-400" ${showTimingErrors ? 'checked' : ''}>
+                Show early/late labels
+            </label>
+            <label class="flex items-center gap-2 text-gray-400 text-xs mb-3">
+                <input type="checkbox" class="nd-show-pitch accent-green-400" ${showPitchErrors ? 'checked' : ''}>
+                Show sharp/flat labels
+            </label>
+
+            <label class="block text-gray-400 text-xs mb-1">Miss Marker Duration: <span class="nd-miss-duration-val">${missMarkerDuration.toFixed(1)}</span>s</label>
+            <input type="range" min="5" max="50" value="${Math.round(missMarkerDuration * 10)}"
+                   class="nd-miss-duration-slider w-full accent-red-400 mb-3">
 
             <label class="block text-gray-400 text-xs mb-1">Input Gain: <span class="nd-gain-val">${inputGain.toFixed(1)}</span>x</label>
             <input type="range" min="1" max="50" value="${Math.round(inputGain * 10)}"
@@ -1810,12 +1989,49 @@ function createNoteDetector(options = {}) {
         };
         panel.querySelector('.nd-timing-slider').oninput = (e) => {
             timingTolerance = e.target.value / 1000;
+            timingHitThreshold = Math.min(timingHitThreshold, timingTolerance);
             panel.querySelector('.nd-timing-val').textContent = e.target.value;
+            const hitSlider = panel.querySelector('.nd-timing-hit-slider');
+            if (hitSlider) {
+                hitSlider.max = e.target.value;
+                hitSlider.value = Math.round(timingHitThreshold * 1000);
+                panel.querySelector('.nd-timing-hit-val').textContent = hitSlider.value;
+            }
             saveSettings();
         };
         panel.querySelector('.nd-pitch-slider').oninput = (e) => {
             pitchTolerance = +e.target.value;
+            pitchHitThreshold = Math.min(pitchHitThreshold, pitchTolerance);
             panel.querySelector('.nd-pitch-val').textContent = e.target.value;
+            const hitSlider = panel.querySelector('.nd-pitch-hit-slider');
+            if (hitSlider) {
+                hitSlider.max = e.target.value;
+                hitSlider.value = pitchHitThreshold;
+                panel.querySelector('.nd-pitch-hit-val').textContent = hitSlider.value;
+            }
+            saveSettings();
+        };
+        panel.querySelector('.nd-timing-hit-slider').oninput = (e) => {
+            timingHitThreshold = e.target.value / 1000;
+            panel.querySelector('.nd-timing-hit-val').textContent = e.target.value;
+            saveSettings();
+        };
+        panel.querySelector('.nd-pitch-hit-slider').oninput = (e) => {
+            pitchHitThreshold = +e.target.value;
+            panel.querySelector('.nd-pitch-hit-val').textContent = e.target.value;
+            saveSettings();
+        };
+        panel.querySelector('.nd-show-timing').onchange = (e) => {
+            showTimingErrors = !!e.target.checked;
+            saveSettings();
+        };
+        panel.querySelector('.nd-show-pitch').onchange = (e) => {
+            showPitchErrors = !!e.target.checked;
+            saveSettings();
+        };
+        panel.querySelector('.nd-miss-duration-slider').oninput = (e) => {
+            missMarkerDuration = e.target.value / 10;
+            panel.querySelector('.nd-miss-duration-val').textContent = missMarkerDuration.toFixed(1);
             saveSettings();
         };
         panel.querySelector('.nd-gain-slider').oninput = (e) => {
@@ -2020,53 +2236,115 @@ function createNoteDetector(options = {}) {
         if (!hw.project || !hw.fretX) return;
 
         const t = hw.getTime();
+        const renderT = t + (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const notes = hw.getNotes();
         const chords = hw.getChords();
 
-        const drawIndicator = (s, f, noteTime, result) => {
-            const tOff = noteTime - t;
-            const p = hw.project(tOff);
-            if (!p) return;
-            const x = hw.fretX(f, p.scale, W);
-            const y = p.y * H;
+        const drawTextReadable = (text, x, y) => {
+            if (hw.fillTextUnmirrored) hw.fillTextUnmirrored(text, x, y);
+            else ctx.fillText(text, x, y);
+        };
 
-            const age = Math.abs(t - noteTime);
-            const fade = Math.max(0, 1 - age / 0.6) * p.scale;
-            if (fade <= 0) return;
+        const drawIndicator = (s, f, noteTime, judgment) => {
+            const tOff = noteTime - renderT;
+            const nowPoint = hw.project(0);
+            if (!nowPoint) return;
 
-            if (result === 'hit') {
+            const age = Math.max(0, renderT - noteTime);
+            let scale = nowPoint.scale || 1;
+            let x;
+            let y;
+            if (judgment.hit || tOff >= -0.05) {
+                const p = hw.project(tOff);
+                if (!p) return;
+                scale = p.scale || scale;
+                x = hw.fretX(f, scale, W);
+                y = p.y * H;
+            } else {
+                const nowY = nowPoint.y * H;
+                const pastArea = Math.max(40, H - nowY - 18);
+                const progress = Math.min(1, age / Math.max(0.1, missMarkerDuration));
+                x = hw.fretX(f, scale, W);
+                y = nowY + Math.min(pastArea, 28 + progress * pastArea);
+            }
+
+            if (judgment.hit) {
+                const fade = Math.max(0, 1 - age / Math.max(0.1, hitGlowDuration)) * scale;
+                if (fade <= 0) return;
                 ctx.save();
                 ctx.globalAlpha = fade * 0.7;
+                ctx.globalCompositeOperation = 'lighter';
                 ctx.shadowColor = '#00ff88';
-                ctx.shadowBlur = 20 * p.scale;
+                ctx.shadowBlur = 20 * scale;
                 ctx.strokeStyle = '#00ff88';
-                ctx.lineWidth = 3 * p.scale;
+                ctx.lineWidth = 3 * scale;
                 ctx.beginPath();
-                ctx.arc(x, y, 14 * p.scale, 0, Math.PI * 2);
+                ctx.arc(x, y, 14 * scale, 0, Math.PI * 2);
                 ctx.stroke();
                 ctx.restore();
-            } else if (result === 'miss') {
+            } else {
+                const fade = Math.max(0, 1 - age / Math.max(0.1, missMarkerDuration)) * scale;
+                if (fade <= 0) return;
                 ctx.save();
-                ctx.globalAlpha = fade * 0.5;
+                ctx.globalAlpha = fade * 0.85;
                 ctx.shadowColor = '#ff3344';
-                ctx.shadowBlur = 12 * p.scale;
+                ctx.shadowBlur = 12 * scale;
                 ctx.strokeStyle = '#ff3344';
-                ctx.lineWidth = 2 * p.scale;
-                const sz = 8 * p.scale;
+                ctx.lineWidth = 2.5 * scale;
+                const sz = 8 * scale;
                 ctx.beginPath();
                 ctx.moveTo(x - sz, y - sz);
                 ctx.lineTo(x + sz, y + sz);
                 ctx.moveTo(x + sz, y - sz);
                 ctx.lineTo(x - sz, y + sz);
                 ctx.stroke();
+
+                const pulse = Math.max(0, 1 - age / 0.2);
+                if (pulse > 0) {
+                    const nowY = nowPoint.y * H;
+                    ctx.globalAlpha = pulse * 0.5;
+                    ctx.strokeStyle = '#ff3344';
+                    ctx.lineWidth = 5 * scale;
+                    ctx.beginPath();
+                    ctx.moveTo(Math.max(0, x - 18 * scale), nowY + 4);
+                    ctx.lineTo(Math.min(W, x + 18 * scale), nowY + 4);
+                    ctx.stroke();
+                }
+
+                const labels = [];
+                if (showTimingErrors && judgment.timingState && judgment.timingState !== 'OK') {
+                    labels.push({
+                        color: '#ffb347',
+                        text: `${judgment.timingState === 'EARLY' ? '↑' : '↓'} ${judgment.timingError > 0 ? '+' : ''}${judgment.timingError}ms`,
+                    });
+                }
+                if (showPitchErrors && judgment.pitchState && judgment.pitchState !== 'OK') {
+                    labels.push({
+                        color: '#66c7ff',
+                        text: `${judgment.pitchState === 'SHARP' ? '♯' : '♭'} ${judgment.pitchError > 0 ? '+' : ''}${judgment.pitchError}¢`,
+                    });
+                }
+                if (labels.length > 0) {
+                    ctx.font = `bold ${Math.max(10, 11 * scale)}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    for (let i = 0; i < labels.length; i++) {
+                        const yy = y + (i - (labels.length - 1) / 2) * 16 * scale - 18 * scale;
+                        ctx.lineWidth = 3;
+                        ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+                        ctx.strokeText(labels[i].text, x, yy);
+                        ctx.fillStyle = labels[i].color;
+                        drawTextReadable(labels[i].text, x, yy);
+                    }
+                }
                 ctx.restore();
             }
         };
 
         if (notes) {
             for (const n of notes) {
-                if (n.t < t - 0.5) continue;
-                if (n.t > t + 3) break;
+                if (n.t < renderT - missMarkerDuration - 0.2) continue;
+                if (n.t > renderT + 3) break;
                 if (n.mt) continue;
                 const key = noteKey(n, n.t);
                 const result = noteResults.get(key);
@@ -2075,8 +2353,8 @@ function createNoteDetector(options = {}) {
         }
         if (chords) {
             for (const c of chords) {
-                if (c.t < t - 0.5) continue;
-                if (c.t > t + 3) break;
+                if (c.t < renderT - missMarkerDuration - 0.2) continue;
+                if (c.t > renderT + 3) break;
                 for (const cn of (c.notes || [])) {
                     if (cn.mt) continue;
                     const key = noteKey(cn, c.t);
@@ -2230,11 +2508,12 @@ function createNoteDetector(options = {}) {
         const info = hw.getSongInfo ? hw.getSongInfo() : null;
         if (info && info.tuning) {
             tuningOffsets = info.tuning;
-            // String count is authoritative from the tuning array length.
-            // This handles 4/5-string bass, 6/7/8-string guitar without
-            // any special-casing — _ndStandardMidiFor and the constraint
-            // checker both derive their tables from this count.
-            currentStringCount = tuningOffsets.length;
+            // Slopsmith core exposes the arrangement string count directly.
+            // Prefer it over tuning.length because RS XML pads bass tunings
+            // to six entries; fall back to tuning length for older cores.
+            currentStringCount = (hw.getStringCount && Number.isFinite(hw.getStringCount()))
+                ? hw.getStringCount()
+                : tuningOffsets.length;
         } else {
             // No tuning info — reset to 6-string zero-offset default.
             // Reassign to a fresh array rather than mutate in place: the
