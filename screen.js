@@ -1760,14 +1760,12 @@ function createNoteDetector(options = {}) {
                 );
 
                 if (!chordResult.isHit) {
-                    chordJudgment.hit = false;
-                    recordJudgment(chordKey, chordJudgment);
-                    for (const cn of group) {
-                        const key = noteKey(cn, cn.t);
-                        if (!noteResults.has(key)) noteResults.set(key, makeMissJudgment(cn, cn.t, t, _ndMidiFromStringFret(
-                            cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
-                        )));
-                    }
+                    // Do not lock in a miss while the chord is still within
+                    // its timing window. Chords can enter candidateNotes as
+                    // early as (chordTime - timingTolerance), so an early
+                    // non-hit frame may still be followed by a valid strum on
+                    // a later frame. Let checkMisses() finalize the miss only
+                    // after the window has fully elapsed.
                     continue;
                 }
 
