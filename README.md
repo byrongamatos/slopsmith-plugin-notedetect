@@ -63,7 +63,7 @@ Other plugins can listen for these `window`-scoped `CustomEvent`s:
 
 | Event | When | `detail` payload |
 |---|---|---|
-| `notedetect:hit` | A chart note is classified as a clean hit | `{ note, time, noteTime, expectedMidi, detectedMidi, confidence }` |
+| `notedetect:hit` | A chart note is classified as a clean hit | Full judgment object (includes legacy fields: `{ note, time, noteTime, expectedMidi, detectedMidi, confidence }`) |
 | `notedetect:miss` | A chart note's timing window expires **or** a matched-but-not-clean attempt is classified | Full judgment object (see field reference below) |
 | `notedetect:session` | End of song | aggregate stats for the full run (see [Practice Journal plugin](https://github.com/byrongamatos/slopsmith-plugin-practice) for a consumer) |
 

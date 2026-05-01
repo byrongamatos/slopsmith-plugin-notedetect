@@ -270,7 +270,10 @@ function _ndMakeJudgment(opts) {
     const pitchThresholdCents = Number.isFinite(o.pitchThresholdCents) ? o.pitchThresholdCents : 20;
     const timingState = matched ? _ndClassifyTiming(timingError, timingThresholdMs) : null;
     const pitchState = matched ? _ndClassifyPitch(pitchError, pitchThresholdCents) : null;
-    const hit = timingState === 'OK' && pitchState === 'OK';
+    // pitchState === null means pitch was not measured (e.g. energy-only chord
+    // check or harmonic flag).  Treat unmeasured pitch as non-blocking so a
+    // chord that passes the scorer is not incorrectly counted as a miss.
+    const hit = timingState === 'OK' && (pitchState === 'OK' || pitchState === null);
     return {
         chartNote: o.chartNote || o.note || null,
         note: o.note || null,
