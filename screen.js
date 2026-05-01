@@ -1738,7 +1738,7 @@ function createNoteDetector(options = {}) {
                     ?.find(r => Number.isFinite(r?.centsError))?.centsError;
                 const chordPitchError = firstFiniteCentsError !== undefined
                     ? firstFiniteCentsError
-                    : (detectedMidi >= 0 ? (detectedMidi - expectedMidi) * 100 : null);
+                    : (detectedMidi >= 0 ? _ndFoldOctaveCents((detectedMidi - expectedMidi) * 100) : null);
                 const chordDetectedMidi = detectedMidi >= 0
                     ? detectedMidi
                     : (Number.isFinite(chordPitchError)
@@ -1785,11 +1785,28 @@ function createNoteDetector(options = {}) {
                     const key = noteKey(cn, cn.t);
                     if (noteResults.has(key)) continue;
                     if (!chordJudgment.hit) {
-                        noteResults.set(key, {
-                            ...chordJudgment,
-                            note: { s: cn.s, f: cn.f },
-                            chartNote: cn,
-                        });
+                        // Chord passed energy/ratio threshold but missed the clean-hit
+                        // threshold. Build per-string judgments from each string's own
+                        // centsError (same as the hit path below) so diagnostic labels
+                        // reflect measured per-string errors rather than reusing the
+                        // chord-level aggregate.
+                        const stringRes = chordResult.results[i];
+                        const stringExpectedMidi = _ndMidiFromStringFret(
+                            cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                        );
+                        const stringHit = stringRes && stringRes.hit;
+                        const stringJudgment = stringHit
+                            ? makeMatchedJudgment(
+                                cn, cn.t, t, stringExpectedMidi,
+                                Number.isFinite(stringRes?.centsError)
+                                    ? stringExpectedMidi + stringRes.centsError / 100
+                                    : null,
+                                detectedConfidence,
+                                { pitchError: Number.isFinite(stringRes?.centsError) ? stringRes.centsError : null }
+                            )
+                            : makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
+                        stringJudgment.hit = false;
+                        noteResults.set(key, stringJudgment);
                         continue;
                     }
                     const stringRes = chordResult.results[i];

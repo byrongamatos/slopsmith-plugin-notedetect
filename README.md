@@ -87,7 +87,7 @@ Field reference for the per-note events:
 | `confidence` | Detector's confidence score, 0–1 | clean hits and matched diagnostic misses; `0` for pure misses |
 | `hit` | `true` only when timing and pitch are both clean | all events (`false` for misses) |
 | `timingState` / `pitchState` | Independent diagnostic axes: `OK`, `EARLY`, `LATE`, `SHARP`, or `FLAT` | clean hits and matched diagnostic misses; `null` for pure misses |
-| `timingError` / `pitchError` | Signed timing error in milliseconds and signed pitch error in cents | clean hits and matched diagnostic misses; `null` for pure misses |
+| `timingError` / `pitchError` | Signed timing error in milliseconds and signed pitch error in cents; `pitchError` is octave-folded to the nearest octave (so it is not necessarily equal to `(detectedMidi - expectedMidi) * 100`) | clean hits and matched diagnostic misses; `null` for pure misses |
 
 Example — log every hit:
 
