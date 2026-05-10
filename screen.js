@@ -1137,10 +1137,19 @@ function createNoteDetector(options = {}) {
     // Timers
     let detectInterval = null;
     let levelRaf = null;
+    let bridgeLevelTimer = null;  // setInterval for the desktop-bridge level meter
     let hudInterval = null;
     let missCheckInterval = null;
     let gcInterval = null;
     let flashTimeouts = [];
+
+    // Set to true when startAudio() routed through the slopsmith-desktop
+    // (Electron) audio bridge instead of opening its own getUserMedia
+    // stream. Used by the bridge poll/level-meter timers to bail out
+    // after their `await` resolves on a since-disabled instance — the
+    // existing Web-Audio teardown in stopAudio() is null-checked, so it
+    // doesn't need its own branch on this flag.
+    let usingDesktopBridge = false;
 
     // Visual-feedback tracking
     let lastHitCount = 0;
@@ -1197,6 +1206,92 @@ function createNoteDetector(options = {}) {
     // ── Audio pipeline ────────────────────────────────────────────────
     async function startAudio() {
         try {
+            // Desktop (Electron) bridge path. When the slopsmith-desktop
+            // shell is hosting us, the native JUCE engine already owns
+            // the audio device — see src/main/audio-bridge.ts in
+            // slopsmith-desktop. Drive monophonic detection from its
+            // `audio:getPitchDetection` IPC instead of opening a parallel
+            // getUserMedia/Web-Audio chain. That parallel path fails on
+            // Linux Electron builds (Chromium denies `media` for the
+            // localhost-served renderer with no permission handler set)
+            // and duplicates work the engine is already doing every
+            // frame. Caveat: chord scoring needs raw audio samples that
+            // the current bridge doesn't expose, so we run single-note
+            // mode only on this path; matchNotes() handles the null
+            // frameBuffer by skipping its chord branch.
+            //
+            // Borrower mode (caller supplied a stream or AudioContext)
+            // skips this branch — those callers own the lifecycle and
+            // expect a real Web-Audio graph, e.g. for tap-tempo or
+            // visualisation taps.
+            const desktop = (typeof window !== 'undefined') ? window.slopsmithDesktop : null;
+            const canUseDesktopBridge = !externalStream && !externalAudioCtx
+                && desktop && desktop.isDesktop
+                && desktop.audio
+                && typeof desktop.audio.getPitchDetection === 'function'
+                && typeof desktop.audio.isAvailable === 'function';
+            if (canUseDesktopBridge) {
+                let bridgeReady = false;
+                try {
+                    bridgeReady = await desktop.audio.isAvailable();
+                } catch (_) { /* treat as unavailable */ }
+                if (bridgeReady) {
+                    // Start the engine if the Audio Plugins panel hasn't
+                    // already done so — without it getPitchDetection
+                    // returns sentinel values (frequency: -1) forever.
+                    try {
+                        const running = typeof desktop.audio.isAudioRunning === 'function'
+                            ? await desktop.audio.isAudioRunning()
+                            : false;
+                        if (!running && typeof desktop.audio.startAudio === 'function') {
+                            await desktop.audio.startAudio();
+                        }
+                    } catch (_) { /* engine surfaces its own errors */ }
+
+                    usingDesktopBridge = true;
+                    accumBuffer = new Float32Array(0);
+                    pendingBuffer = null;
+
+                    detectInterval = setInterval(async () => {
+                        if (!enabled || processingFrame) return;
+                        processingFrame = true;
+                        const gen = sessionGen;
+                        try {
+                            const p = await desktop.audio.getPitchDetection();
+                            if (!enabled || gen !== sessionGen) return;
+                            if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
+                                && typeof p.confidence === 'number' && p.confidence >= 0.3) {
+                                detectedMidi = p.midiNote;
+                                detectedConfidence = p.confidence;
+                            } else {
+                                detectedMidi = -1;
+                                detectedConfidence = 0;
+                                detectedString = -1;
+                                detectedFret = -1;
+                            }
+                            // matchNotes(null) → single-note path runs,
+                            // chord-scoring branch bails on the null
+                            // frameBuffer guard. Miss accounting in
+                            // checkMisses() is independent of this and
+                            // keeps working.
+                            matchNotes(null);
+                        } catch (e) {
+                            console.warn('[note_detect] bridge poll failed:', e && e.message ? e.message : e);
+                        } finally {
+                            processingFrame = false;
+                        }
+                    }, 50);
+
+                    startBridgeLevelMeter(desktop);
+                    populateDevices();
+                    return true;
+                }
+                // bridge present but engine unavailable — fall through
+                // to the getUserMedia path so the user sees a concrete
+                // error (and can troubleshoot the engine separately)
+                // rather than silent failure.
+            }
+
             // Acquire the stream — use the supplied one or open
             // getUserMedia for our own.
             if (externalStream) {
@@ -1315,8 +1410,13 @@ function createNoteDetector(options = {}) {
 
     function stopAudio() {
         stopLevelMeter();
+        stopBridgeLevelMeter();
         if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
         pendingBuffer = null;
+        // Bridge path doesn't own the JUCE engine — leave audio
+        // running for the Audio Plugins panel / other features. Just
+        // clear the flag so a subsequent enable starts fresh.
+        usingDesktopBridge = false;
         // Disconnect the full node chain in reverse-connect order.
         // Critical in borrower mode (external audioCtx): we leave the
         // caller's context open, and any node we don't disconnect
@@ -1416,6 +1516,71 @@ function createNoteDetector(options = {}) {
     }
 
     // ── Level meter ───────────────────────────────────────────────────
+
+    // Desktop-bridge equivalent of startLevelMeter(). The engine already
+    // computes RMS + peak on the audio thread; here we just poll those
+    // and drive the same DOM bar the Web-Audio path drives. Polled on
+    // setInterval rather than rAF so the IPC round-trip doesn't pin
+    // requestAnimationFrame to the IPC cadence when the renderer
+    // throttles in the background.
+    function startBridgeLevelMeter(desktop) {
+        stopBridgeLevelMeter();
+        // Bail before installing the timer if the engine doesn't expose
+        // getLevels — otherwise we'd run a no-op poll forever, leak the
+        // interval, and never surface the missing capability.
+        if (!desktop || !desktop.audio || typeof desktop.audio.getLevels !== 'function') {
+            return;
+        }
+        // In-flight guard — if an IPC `getLevels()` round-trip takes
+        // longer than the 50 ms timer, queueing further calls would
+        // build up a backlog and process stale readings out-of-order.
+        // Same pattern as the pitch poll's `processingFrame` guard.
+        let levelsInFlight = false;
+        bridgeLevelTimer = setInterval(async () => {
+            if (!enabled || !usingDesktopBridge || levelsInFlight) return;
+            levelsInFlight = true;
+            try {
+                const levels = await desktop.audio.getLevels();
+                // Re-check after the await: disable()/destroy() can fire
+                // between the IPC round-trip and the resolve, and the
+                // bridge timer doesn't track sessionGen the way the
+                // pitch poller does. Without this we'd race-write
+                // inputLevel/inputPeak and touch the DOM on a torn-down
+                // instance.
+                if (!enabled || !usingDesktopBridge) return;
+                if (!levels) return;
+                // Engine reports peaks in 0..1 already; the Web-Audio
+                // branch scales RMS by 5 for headroom. Use the engine's
+                // value directly — overdriving the bar is a worse UX
+                // than a slightly conservative reading.
+                // Nullish-coalesce so a legitimate `0` reading (silence)
+                // isn't replaced by the fallback — `0 || x` falls through to
+                // x, which would inflate the bar during quiet moments.
+                const rawLevel = Number.isFinite(levels.inputLevel) ? levels.inputLevel : 0;
+                inputLevel = Math.min(1, Math.max(0, rawLevel));
+                const rawPeak = Number.isFinite(levels.inputPeak) ? levels.inputPeak : inputLevel;
+                const peak = Math.min(1, Math.max(0, rawPeak));
+                if (peak > inputPeak) {
+                    inputPeak = peak;
+                    peakDecay = 30;
+                } else if (peakDecay > 0) {
+                    peakDecay--;
+                } else {
+                    inputPeak *= 0.95;
+                }
+                drawSettingsVU();
+            } catch (_) { /* one bad poll shouldn't stop the meter */ }
+            finally { levelsInFlight = false; }
+        }, 50);
+    }
+
+    function stopBridgeLevelMeter() {
+        if (bridgeLevelTimer) {
+            clearInterval(bridgeLevelTimer);
+            bridgeLevelTimer = null;
+        }
+    }
+
     function startLevelMeter() {
         stopLevelMeter();
         // Cache the analyser read buffer across rAF ticks. At 60 fps
