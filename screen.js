@@ -1097,6 +1097,14 @@ function createNoteDetector(options = {}) {
     // would reuse `#51` indefinitely once truncation started.
     let drillNextIdx = 1;
     const DRILL_MAX_ITERATIONS = 50;  // bound the array so a long drill session doesn't grow without limit
+    // recordJudgment is on the hot path — calling getLoop() on every
+    // judgment is wasteful when updateHUD already polls at 33 ms.
+    // Throttle: only re-sync when the last sync is older than this.
+    // 16 ms is well below the 33 ms HUD cadence and gives enough
+    // resolution that judgments after enable / mid-drill bounds change
+    // still see fresh state within one frame.
+    const DRILL_SYNC_MIN_MS = 16;
+    let drillLastSyncAt = 0;
 
     // Detection state
     let detectedMidi = -1;
@@ -1633,8 +1641,13 @@ function createNoteDetector(options = {}) {
             // current activation gate — _drillSyncFromLoopState
             // otherwise only fires from updateHUD at 33ms intervals,
             // leaving a window where early judgments would be
-            // mis-attributed (or skipped).
-            _drillSyncFromLoopState();
+            // mis-attributed (or skipped). Throttle to avoid hammering
+            // the host bus on every hot-path judgment.
+            const nowMs = Date.now();
+            if (nowMs - drillLastSyncAt >= DRILL_SYNC_MIN_MS) {
+                drillLastSyncAt = nowMs;
+                _drillSyncFromLoopState();
+            }
             if (judgment.hit) {
                 hits++;
                 streak++;
@@ -2565,16 +2578,25 @@ function createNoteDetector(options = {}) {
 
     // ── Drill mode (slopsmith loop:restart) ───────────────────────────
     function _drillCurrentLoop() {
+        const fallback = { loopA: null, loopB: null };
         if (!window.slopsmith || typeof window.slopsmith.getLoop !== 'function') {
-            return { loopA: null, loopB: null };
+            return fallback;
         }
         // Guard the host call — a misbehaving slopsmith bus shouldn't
         // take down updateHUD / recordJudgment scoring with it.
+        let result;
         try {
-            return window.slopsmith.getLoop() || { loopA: null, loopB: null };
+            result = window.slopsmith.getLoop();
         } catch (e) {
-            return { loopA: null, loopB: null };
+            return fallback;
         }
+        // Require an actual object so destructuring `{ loopA, loopB }`
+        // gets meaningful values. A truthy non-object (e.g. `true`,
+        // `''`, `42`) would destructure to undefined and let
+        // _drillSyncFromLoopState read a malformed shape — better to
+        // return the inactive fallback so drill stays off.
+        if (!result || typeof result !== 'object') return fallback;
+        return result;
     }
 
     function _drillResetIteration(startT) {
@@ -2739,6 +2761,10 @@ function createNoteDetector(options = {}) {
     }
 
     function _drillSyncFromLoopState() {
+        // Update the throttle timestamp so updateHUD's polling sync
+        // also counts as "recently synced" — no double-sync if a
+        // judgment lands right after a HUD tick.
+        drillLastSyncAt = Date.now();
         const { loopA, loopB } = _drillCurrentLoop();
         // Require finite numbers, not just non-null. A malformed return
         // (e.g. {}, undefined fields) would otherwise activate drill
