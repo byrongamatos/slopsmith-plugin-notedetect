@@ -1145,8 +1145,10 @@ function createNoteDetector(options = {}) {
 
     // Set to true when startAudio() routed through the slopsmith-desktop
     // (Electron) audio bridge instead of opening its own getUserMedia
-    // stream. stopAudio() consults this so it doesn't try to disconnect
-    // Web-Audio nodes that were never created on the bridge path.
+    // stream. Used by the bridge poll/level-meter timers to bail out
+    // after their `await` resolves on a since-disabled instance — the
+    // existing Web-Audio teardown in stopAudio() is null-checked, so it
+    // doesn't need its own branch on this flag.
     let usingDesktopBridge = false;
 
     // Visual-feedback tracking
@@ -1545,8 +1547,13 @@ function createNoteDetector(options = {}) {
                 // branch scales RMS by 5 for headroom. Use the engine's
                 // value directly — overdriving the bar is a worse UX
                 // than a slightly conservative reading.
-                inputLevel = Math.min(1, Math.max(0, levels.inputLevel || 0));
-                const peak = Math.min(1, Math.max(0, levels.inputPeak || inputLevel));
+                // Nullish-coalesce so a legitimate `0` reading (silence)
+                // isn't replaced by the fallback — `0 || x` falls through to
+                // x, which would inflate the bar during quiet moments.
+                const rawLevel = Number.isFinite(levels.inputLevel) ? levels.inputLevel : 0;
+                inputLevel = Math.min(1, Math.max(0, rawLevel));
+                const rawPeak = Number.isFinite(levels.inputPeak) ? levels.inputPeak : inputLevel;
+                const peak = Math.min(1, Math.max(0, rawPeak));
                 if (peak > inputPeak) {
                     inputPeak = peak;
                     peakDecay = 30;

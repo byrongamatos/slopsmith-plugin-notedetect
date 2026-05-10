@@ -53,11 +53,13 @@ function freshSandboxWithBridge(overrides = {}) {
     return { createNoteDetector, calls };
 }
 
-// Drain the microtask queue a few times so the queued async startAudio()
-// (enable() → restartAudio() → queueAudioOp(async () => await startAudio()))
-// has a chance to reach its `await desktop.audio.isAvailable()` check before
-// the test asserts.
-async function flushMicrotasks(turns = 5) {
+// Yield a few event-loop turns so the async work queued through
+// `enable()` → `queueAudioOp(...)` → `startAudio()` has a chance to
+// reach `await desktop.audio.isAvailable()` and the subsequent bridge
+// calls before the test runs its assertions. setImmediate runs on the
+// macrotask queue, which is what we want — awaiting it gives the
+// promise chain time to drain between turns.
+async function flushPendingAsync(turns = 5) {
     for (let i = 0; i < turns; i++) {
         // eslint-disable-next-line no-await-in-loop
         await new Promise((r) => setImmediate(r));
@@ -68,7 +70,7 @@ test('bridge path: enable() consults the desktop bridge instead of getUserMedia'
     const { createNoteDetector, calls } = freshSandboxWithBridge();
     const det = createNoteDetector({ isDefault: false });
     await det.enable();
-    await flushMicrotasks();
+    await flushPendingAsync();
     assert.equal(calls.getUserMedia, 0, 'getUserMedia must not be called when the desktop bridge is available');
     assert.ok(calls.isAvailable >= 1, 'desktop.audio.isAvailable should be probed');
     // isAudioRunning + startAudio are best-effort wakes — at least one
@@ -95,7 +97,7 @@ test('bridge path: falls back to getUserMedia when audio.isAvailable() resolves 
     // checked through the override so calls.isAvailable stays 0 here;
     // instead we observe getUserMedia being invoked.
     await det.enable();
-    await flushMicrotasks();
+    await flushPendingAsync();
     assert.ok(calls.getUserMedia >= 1,
         'bridge present but engine unavailable should fall through to getUserMedia');
     det.destroy();
