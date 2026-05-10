@@ -2711,10 +2711,10 @@ function createNoteDetector(options = {}) {
         drillOnSongChangedFn = null;
     }
 
-    // Called every HUD tick to bridge slopsmith loop state into our
-    // drillEnabled flag and detect mid-drill loop changes (user picked
-    // a different saved loop). Cheap — one getLoop read + a
-    // boolean compare per tick.
+    // Render the drill HUD panel — current iteration header (live
+    // counter + accuracy) plus the last 5 completed iterations with
+    // best/worst highlighting. Hides itself entirely when drill is
+    // neither active nor has history. UI only; no state mutation.
     function _drillRender() {
         const panel = instanceRoot.querySelector('.nd-drill');
         if (!panel) return;
@@ -2770,6 +2770,11 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // Bridge slopsmith loop state into our drillEnabled flag and
+    // detect mid-drill loop bounds changes (user picked a different
+    // saved loop). Called from updateHUD every 33 ms and from
+    // recordJudgment with 16 ms throttle. Cheap — one getLoop read +
+    // a boolean compare.
     function _drillSyncFromLoopState() {
         // Update the throttle timestamp so updateHUD's polling sync
         // also counts as "recently synced" — no double-sync if a
