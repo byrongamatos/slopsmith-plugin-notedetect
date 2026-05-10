@@ -109,10 +109,15 @@ test('song:loaded clears the iteration history (new song = new passage)', () => 
     core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
 
     assert.equal(det.getDrillStats().iterations.length, 2);
+    assert.equal(det.getDrillStats().active, true);
 
     // New song fires song:loaded.
     core.slopsmith._fire('song:loaded', { filename: 'next-song.psarc' });
     assert.equal(det.getDrillStats().iterations.length, 0, 'song change must clear drill history');
+    // Active flag must also drop — callers that read getDrillStats
+    // immediately after a song transition (and before the next HUD
+    // tick re-syncs) would otherwise see stale active=true.
+    assert.equal(det.getDrillStats().active, false, 'active flag must clear on song change');
     det.destroy();
 });
 
@@ -133,6 +138,58 @@ test('destroy() unbinds slopsmith listeners — later loop:restart is a no-op', 
     assert.doesNotThrow(() => {
         core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
     });
+});
+
+test('iteration idx stays monotonic past the 50-iter truncation cap', () => {
+    // Regression: idx used to be drillIterations.length + 1, which
+    // collapsed to a constant once the array hit DRILL_MAX_ITERATIONS
+    // and started splicing from the front. Ensure successive idx
+    // values keep rising even after truncation kicks in.
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    core.slopsmith._loop = { loopA: 0, loopB: 1 };
+    det._drillSyncFromLoopState();
+
+    // Push 60 iterations (cap is 50). Each iteration: 1 hit, then wrap.
+    for (let i = 0; i < 60; i++) {
+        det._recordJudgment(`k${i}`, judgment(true));
+        core.slopsmith._fire('loop:restart', { loopA: 0, loopB: 1, time: 0 });
+    }
+    const stats = det.getDrillStats();
+    assert.equal(stats.iterations.length, 50, 'history must cap at DRILL_MAX_ITERATIONS');
+    // First retained iteration is the 11th pushed (oldest 10 truncated).
+    assert.equal(stats.iterations[0].idx, 11, 'oldest retained idx after truncation');
+    // Last retained iteration is the 60th pushed.
+    assert.equal(stats.iterations[stats.iterations.length - 1].idx, 60, 'newest idx must reflect monotonic counter');
+    det.destroy();
+});
+
+test('malformed slopsmith.getLoop() shape does NOT activate drill', () => {
+    // Defensive: if slopsmith.getLoop returns {} or
+    // { loopA: undefined, loopB: undefined } (malformed core release),
+    // drill must stay inactive — otherwise per-iter counters would
+    // mutate against bogus bounds.
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    core.slopsmith._loop = {};
+    det._drillSyncFromLoopState();
+    assert.equal(det.getDrillStats().active, false, '{} bounds must not activate drill');
+
+    core.slopsmith._loop = { loopA: undefined, loopB: undefined };
+    det._drillSyncFromLoopState();
+    assert.equal(det.getDrillStats().active, false, 'undefined bounds must not activate drill');
+
+    core.slopsmith._loop = { loopA: 'not a number', loopB: 1 };
+    det._drillSyncFromLoopState();
+    assert.equal(det.getDrillStats().active, false, 'non-numeric bounds must not activate drill');
+
+    // Only valid finite numbers activate.
+    core.slopsmith._loop = { loopA: 5, loopB: 10 };
+    det._drillSyncFromLoopState();
+    assert.equal(det.getDrillStats().active, true, 'finite numeric bounds activate drill');
+    det.destroy();
 });
 
 test('mid-drill loop bounds change clears stale iteration history', () => {

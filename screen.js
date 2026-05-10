@@ -1092,6 +1092,10 @@ function createNoteDetector(options = {}) {
     // comparing the same passage.
     let drillActiveLoopA = null;
     let drillActiveLoopB = null;
+    // Monotonic counter for iteration `idx` — survives the
+    // splice-from-front truncation. Using `drillIterations.length + 1`
+    // would reuse `#51` indefinitely once truncation started.
+    let drillNextIdx = 1;
     const DRILL_MAX_ITERATIONS = 50;  // bound the array so a long drill session doesn't grow without limit
 
     // Detection state
@@ -2228,7 +2232,7 @@ function createNoteDetector(options = {}) {
         if (!enabled) return;
 
         // Bridge slopsmith's loop state into our drill flag once per
-        // tick. Cheap (two getLoop reads); avoids a separate poll.
+        // tick. Cheap (one getLoop read); avoids a separate poll.
         _drillSyncFromLoopState();
         _drillRender();
 
@@ -2578,7 +2582,7 @@ function createNoteDetector(options = {}) {
             ? Math.max(0, endT - drillIterStartT)
             : null;
         drillIterations.push({
-            idx: drillIterations.length + 1,
+            idx: drillNextIdx++,
             hits: drillIterHits,
             misses: drillIterMisses,
             accuracy,
@@ -2603,10 +2607,15 @@ function createNoteDetector(options = {}) {
 
     function _drillOnSongChanged() {
         // New song = different passage; stale iterations don't apply.
+        // Also drop drillEnabled so getDrillStats() doesn't report
+        // active=true between this event and the next HUD sync (which
+        // may not happen at all if detection is disabled).
         drillIterations = [];
         _drillResetIteration(null);
         drillActiveLoopA = null;
         drillActiveLoopB = null;
+        drillNextIdx = 1;
+        drillEnabled = false;
     }
 
     function _drillBindEvents() {
@@ -2636,7 +2645,7 @@ function createNoteDetector(options = {}) {
 
     // Called every HUD tick to bridge slopsmith loop state into our
     // drillEnabled flag and detect mid-drill loop changes (user picked
-    // a different saved loop). Cheap — just two getLoop reads + a
+    // a different saved loop). Cheap — one getLoop read + a
     // boolean compare per tick.
     function _drillRender() {
         const panel = instanceRoot.querySelector('.nd-drill');
@@ -2655,7 +2664,10 @@ function createNoteDetector(options = {}) {
             if (drillEnabled) {
                 const liveTotal = drillIterHits + drillIterMisses;
                 const liveAcc = liveTotal > 0 ? Math.round((drillIterHits / liveTotal) * 100) : null;
-                const num = drillIterations.length + 1;
+                // Use the monotonic counter, NOT iterations.length + 1
+                // — the array splices from the front at the truncation
+                // cap, so `length + 1` would freeze at #51 forever.
+                const num = drillNextIdx;
                 headerEl.textContent = liveAcc !== null
                     ? `Drill #${num}: ${drillIterHits}/${liveTotal} (${liveAcc}%)`
                     : `Drill #${num}`;
@@ -2692,7 +2704,11 @@ function createNoteDetector(options = {}) {
 
     function _drillSyncFromLoopState() {
         const { loopA, loopB } = _drillCurrentLoop();
-        const nowEnabled = (loopA !== null && loopB !== null);
+        // Require finite numbers, not just non-null. A malformed return
+        // (e.g. {}, undefined fields) would otherwise activate drill
+        // mode and start mutating per-iteration counters against bogus
+        // bounds.
+        const nowEnabled = Number.isFinite(loopA) && Number.isFinite(loopB);
         if (nowEnabled && !drillEnabled) {
             // Drill just started — reset per-iteration counters and
             // anchor at the current chart time (which is the loop
@@ -2707,6 +2723,7 @@ function createNoteDetector(options = {}) {
             // apples to oranges.
             if (loopA !== drillActiveLoopA || loopB !== drillActiveLoopB) {
                 drillIterations = [];
+                drillNextIdx = 1;
                 drillActiveLoopA = loopA;
                 drillActiveLoopB = loopB;
                 const t0 = (hw && typeof hw.getTime === 'function') ? hw.getTime() : null;
