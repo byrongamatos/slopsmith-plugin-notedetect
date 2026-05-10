@@ -2785,13 +2785,25 @@ function createNoteDetector(options = {}) {
         // bounds.
         const nowEnabled = Number.isFinite(loopA) && Number.isFinite(loopB);
         if (nowEnabled && !drillEnabled) {
-            // Drill just started — reset per-iteration counters.
+            // Drill just (re)started. Treat re-activation after a
+            // previously-cleared loop the same way as a mid-drill
+            // bounds change: if the new bounds DIFFER from the last
+            // active bounds (drillActiveLoopA/B kept across the
+            // deactivation), the iteration history is from a
+            // different passage and must be cleared. If they match
+            // exactly, the user just reopened the same loop and the
+            // history is comparable.
+            const sameBounds = (loopA === drillActiveLoopA && loopB === drillActiveLoopB);
+            if (!sameBounds) {
+                drillIterations = [];
+                drillNextIdx = 1;
+            }
+            drillActiveLoopA = loopA;
+            drillActiveLoopB = loopB;
             // Anchor at loopA (the iteration's true start) rather
             // than hw.getTime(): the user might enable detection
             // mid-iteration, but the iteration we're starting to
             // track conceptually begins at A.
-            drillActiveLoopA = loopA;
-            drillActiveLoopB = loopB;
             _drillResetIteration(loopA);
             drillDirty = true;
         } else if (nowEnabled && drillEnabled) {

@@ -144,6 +144,57 @@ test('destroy() unbinds slopsmith listeners — later loop:restart is a no-op', 
     });
 });
 
+test('clearing then re-setting the SAME loop preserves iteration history', () => {
+    // Re-opening the exact same loop bounds (same A and same B) is
+    // logically the same passage — history should remain comparable
+    // and iteration numbering should continue.
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    core.slopsmith._loop = { loopA: 10, loopB: 20 };
+    det._drillSyncFromLoopState();
+    for (let i = 0; i < 5; i++) det._recordJudgment(`a${i}`, judgment(true));
+    core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
+    assert.equal(det.getDrillStats().iterations.length, 1);
+
+    // Clear the loop, then re-set to the SAME bounds.
+    core.slopsmith._loop = { loopA: null, loopB: null };
+    det._drillSyncFromLoopState();
+    core.slopsmith._loop = { loopA: 10, loopB: 20 };
+    det._drillSyncFromLoopState();
+
+    // History preserved (same passage); idx continues monotonically.
+    assert.equal(det.getDrillStats().iterations.length, 1, 'same-bounds re-activation must keep history');
+    for (let i = 0; i < 3; i++) det._recordJudgment(`b${i}`, judgment(true));
+    core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
+    const stats = det.getDrillStats();
+    assert.equal(stats.iterations.length, 2);
+    assert.equal(stats.iterations[1].idx, 2, 'idx continues past clear+resame');
+    det.destroy();
+});
+
+test('clearing then re-setting a DIFFERENT loop clears history', () => {
+    // Re-opening with different bounds is a new passage — old
+    // iterations don't compare.
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    core.slopsmith._loop = { loopA: 10, loopB: 20 };
+    det._drillSyncFromLoopState();
+    for (let i = 0; i < 5; i++) det._recordJudgment(`a${i}`, judgment(true));
+    core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
+    assert.equal(det.getDrillStats().iterations.length, 1);
+
+    // Clear, then set DIFFERENT bounds.
+    core.slopsmith._loop = { loopA: null, loopB: null };
+    det._drillSyncFromLoopState();
+    core.slopsmith._loop = { loopA: 30, loopB: 50 };
+    det._drillSyncFromLoopState();
+
+    assert.equal(det.getDrillStats().iterations.length, 0, 'different-bounds re-activation must clear history');
+    det.destroy();
+});
+
 test('iteration idx stays monotonic past the 50-iter truncation cap', () => {
     // Regression: idx used to be drillIterations.length + 1, which
     // collapsed to a constant once the array hit DRILL_MAX_ITERATIONS

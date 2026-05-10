@@ -89,29 +89,39 @@ function makeSandbox() {
     // `loop:restart`, `song:loaded`, `song:ended` synthetically and
     // toggle `getLoop()` between {null,null} and active bounds. Plain
     // listener registry; no EventTarget overhead.
+    // Array (not Set) so duplicate registrations are visible to
+    // _listenerCount — Set's natural dedupe would hide an accidental
+    // double-bind in production code, defeating the "binds exactly
+    // once" tests.
     const _listeners = new Map();
     sandbox.slopsmith = {
         on(event, fn) {
-            if (!_listeners.has(event)) _listeners.set(event, new Set());
-            _listeners.get(event).add(fn);
+            if (!_listeners.has(event)) _listeners.set(event, []);
+            _listeners.get(event).push(fn);
         },
         off(event, fn) {
-            const set = _listeners.get(event);
-            if (set) set.delete(fn);
+            const arr = _listeners.get(event);
+            if (!arr) return;
+            // Remove the FIRST matching listener (matches EventTarget
+            // semantics — repeated off() calls peel off one at a time).
+            const idx = arr.indexOf(fn);
+            if (idx !== -1) arr.splice(idx, 1);
         },
         // Test-time helper: fire all handlers for `event` with a
         // CustomEvent-shaped payload `{ detail }`.
         _fire(event, detail) {
-            const set = _listeners.get(event);
-            if (!set) return;
-            for (const fn of set) fn({ detail });
+            const arr = _listeners.get(event);
+            if (!arr) return;
+            // Iterate a copy so handlers that re-bind/unbind don't
+            // shift the iteration index.
+            for (const fn of arr.slice()) fn({ detail });
         },
         // Test-time helper: return the count of currently-registered
         // listeners for an event so tests can assert subscribe/unbind
-        // ordering.
+        // ordering AND catch accidental double-binds.
         _listenerCount(event) {
-            const set = _listeners.get(event);
-            return set ? set.size : 0;
+            const arr = _listeners.get(event);
+            return arr ? arr.length : 0;
         },
         // Mutable loop state — tests poke `_loop` directly. Return
         // the raw value so tests can simulate malformed shapes
