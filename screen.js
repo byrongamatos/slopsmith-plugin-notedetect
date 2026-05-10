@@ -1531,8 +1531,14 @@ function createNoteDetector(options = {}) {
         if (!desktop || !desktop.audio || typeof desktop.audio.getLevels !== 'function') {
             return;
         }
+        // In-flight guard — if an IPC `getLevels()` round-trip takes
+        // longer than the 50 ms timer, queueing further calls would
+        // build up a backlog and process stale readings out-of-order.
+        // Same pattern as the pitch poll's `processingFrame` guard.
+        let levelsInFlight = false;
         bridgeLevelTimer = setInterval(async () => {
-            if (!enabled || !usingDesktopBridge) return;
+            if (!enabled || !usingDesktopBridge || levelsInFlight) return;
+            levelsInFlight = true;
             try {
                 const levels = await desktop.audio.getLevels();
                 // Re-check after the await: disable()/destroy() can fire
@@ -1564,6 +1570,7 @@ function createNoteDetector(options = {}) {
                 }
                 drawSettingsVU();
             } catch (_) { /* one bad poll shouldn't stop the meter */ }
+            finally { levelsInFlight = false; }
         }, 50);
     }
 
