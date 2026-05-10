@@ -59,10 +59,10 @@ All settings are persisted in localStorage across sessions.
 
 ## Drill mode
 
-Set an A-B loop in slopsmith and notedetect automatically tracks each loop iteration as a separate "drill" attempt. The HUD shows your most recent iterations with per-iteration accuracy so you can see whether you're improving as you repeat the same passage.
+Set an A-B loop in Slopsmith and notedetect automatically tracks each loop iteration as a separate "drill" attempt. The HUD shows your most recent iterations with per-iteration accuracy so you can see whether you're improving as you repeat the same passage.
 
-- Activates whenever slopsmith has both loop bounds set as finite numbers (`window.slopsmith.getLoop()` returns `loopA` and `loopB` that both pass `Number.isFinite`). Null, undefined, or missing fields keep drill inactive.
-- Snapshots iteration stats on every `loop:restart` event (slopsmith emits this at every wrap)
+- Activates whenever Slopsmith has both loop bounds set as finite numbers (`window.slopsmith.getLoop()` returns `loopA` and `loopB` that both pass `Number.isFinite`). Null, undefined, or missing fields keep drill inactive.
+- Snapshots iteration stats on every `loop:restart` event (Slopsmith emits this at every wrap)
 - Per-iteration counters are independent of the global session score — your overall accuracy stays correct
 - Iteration history clears on song change or when the loop bounds change to a different passage
 - Iterations with zero judgments don't appear (idle wraps don't pollute the scoreboard)
@@ -78,7 +78,7 @@ Read the live drill state from another plugin via `noteDetector.getDrillStats()`
 }
 ```
 
-Requires slopsmith with the plugin-API series merged. Used APIs: `loop:restart` (snapshot trigger), `song:loaded` + `song:ended` (clear history), `getLoop()` (activation gate). Landed in slopsmith PRs #198 / #200 / #201.
+Requires Slopsmith with the plugin-API series merged. Used APIs: `loop:restart` (snapshot trigger), `song:loaded` + `song:ended` (clear history), `getLoop()` (activation gate). Landed in Slopsmith PRs #198 / #200 / #201.
 
 ## Events
 

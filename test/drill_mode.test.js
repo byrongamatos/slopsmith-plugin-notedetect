@@ -18,7 +18,7 @@ function judgment(hit) {
     return { hit, note: { s: 1, f: 0 }, noteTime: 0, judgedAt: 0 };
 }
 
-test('enable() binds loop:restart, song:loaded, song:ended exactly once', () => {
+test('_bindDrillEvents() binds loop:restart, song:loaded, song:ended exactly once', () => {
     const core = loadDetectionCore();
     const det = core.createNoteDetector();
     // Bind directly via the test hook; enable() requires the audio
