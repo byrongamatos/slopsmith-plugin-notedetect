@@ -85,6 +85,53 @@ function makeSandbox() {
             removeDrawHook: noop,
         },
     };
+    // Slopsmith plugin-API stub — drill-mode tests need to drive
+    // `loop:restart`, `song:loaded`, `song:ended` synthetically and
+    // toggle `getLoop()` between {null,null} and active bounds. Plain
+    // listener registry; no EventTarget overhead.
+    // Array (not Set) so duplicate registrations are visible to
+    // _listenerCount — Set's natural dedupe would hide an accidental
+    // double-bind in production code, defeating the "binds exactly
+    // once" tests.
+    const _listeners = new Map();
+    sandbox.slopsmith = {
+        on(event, fn) {
+            if (!_listeners.has(event)) _listeners.set(event, []);
+            _listeners.get(event).push(fn);
+        },
+        off(event, fn) {
+            const arr = _listeners.get(event);
+            if (!arr) return;
+            // Remove the FIRST matching listener (matches EventTarget
+            // semantics — repeated off() calls peel off one at a time).
+            const idx = arr.indexOf(fn);
+            if (idx !== -1) arr.splice(idx, 1);
+        },
+        // Test-time helper: fire all handlers for `event` with a
+        // CustomEvent-shaped payload `{ detail }`.
+        _fire(event, detail) {
+            const arr = _listeners.get(event);
+            if (!arr) return;
+            // Iterate a copy so handlers that re-bind/unbind don't
+            // shift the iteration index.
+            for (const fn of arr.slice()) fn({ detail });
+        },
+        // Test-time helper: return the count of currently-registered
+        // listeners for an event so tests can assert subscribe/unbind
+        // ordering AND catch accidental double-binds.
+        _listenerCount(event) {
+            const arr = _listeners.get(event);
+            return arr ? arr.length : 0;
+        },
+        // Mutable loop state — tests poke `_loop` directly. Return
+        // the raw value so tests can simulate malformed shapes
+        // (`{}`, non-object truthy, etc.) and exercise
+        // _drillCurrentLoop's defensive handling.
+        _loop: { loopA: null, loopB: null },
+        getLoop() {
+            return this._loop;
+        },
+    };
     // window must reference the sandbox itself so the plugin's
     // `window.playSong = ...` assignments and reads work. Some tests
     // also look up `window.noteDetect` / `window.createNoteDetector`
@@ -226,6 +273,14 @@ function loadDetectionCore() {
             };
         },
         createNoteDetector: sandbox.createNoteDetector,
+        // Drill-mode tests: expose the slopsmith stub so tests can
+        // drive synthetic `loop:restart` etc. and toggle the loop
+        // state that getLoop() returns.
+        slopsmith: sandbox.slopsmith,
+        // For the rare test that needs to manipulate the highway
+        // stub directly (e.g., make hw.getTime return non-zero so
+        // drillIterStartT comes out non-null).
+        highway: sandbox.highway,
     };
 }
 

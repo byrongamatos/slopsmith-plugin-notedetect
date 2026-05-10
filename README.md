@@ -57,6 +57,29 @@ All settings are persisted in localStorage across sessions.
 - Streak counter (consecutive hits) and best streak
 - Per-section accuracy breakdown shown when detection is stopped
 
+## Drill mode
+
+Set an A-B loop in Slopsmith and notedetect automatically tracks each loop iteration as a separate "drill" attempt. The HUD shows your most recent iterations with per-iteration accuracy so you can see whether you're improving as you repeat the same passage.
+
+- Activates whenever Slopsmith has both loop bounds set as finite numbers (`window.slopsmith.getLoop()` returns `loopA` and `loopB` that both pass `Number.isFinite`). Null, undefined, or missing fields keep drill inactive.
+- Snapshots iteration stats on every `loop:restart` event (Slopsmith emits this at every wrap)
+- Per-iteration counters are independent of the global session score — your overall accuracy stays correct
+- Iteration history clears on song change or when the loop bounds change to a different passage
+- Iterations with zero judgments don't appear (idle wraps don't pollute the scoreboard)
+- The most recent 5 iterations are shown in the HUD; up to 50 are kept in memory
+
+Read the live drill state from another plugin via `noteDetector.getDrillStats()`:
+
+```js
+{
+    active: true,                              // loop currently set
+    current: { hits, misses, streak, bestStreak, accuracy, startT },
+    iterations: [{ idx, hits, misses, accuracy, bestStreak, durationSec, ts }, ...]
+}
+```
+
+Requires Slopsmith with the plugin-API series merged. Used APIs: `loop:restart` (snapshot trigger), `song:loaded` + `song:ended` (clear history), `getLoop()` (activation gate). Landed in Slopsmith PRs #198 / #200 / #201.
+
 ## Events
 
 Other plugins can listen for these `window`-scoped `CustomEvent`s:
