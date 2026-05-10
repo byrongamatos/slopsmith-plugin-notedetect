@@ -1097,6 +1097,11 @@ function createNoteDetector(options = {}) {
     // would reuse `#51` indefinitely once truncation started.
     let drillNextIdx = 1;
     const DRILL_MAX_ITERATIONS = 50;  // bound the array so a long drill session doesn't grow without limit
+    // Render uses innerHTML which parses HTML — avoid re-parsing on
+    // every 33 ms HUD tick when nothing changed. Set by any mutation
+    // of drill state (iteration push, live counter tick, activation
+    // change); _drillRender clears it after redrawing.
+    let drillDirty = true;
 
     // Detection state
     let detectedMidi = -1;
@@ -1654,6 +1659,7 @@ function createNoteDetector(options = {}) {
                     drillIterMisses++;
                     drillIterStreak = 0;
                 }
+                drillDirty = true;
             }
         }
         if (emit) dispatchJudgment(judgment);
@@ -2624,6 +2630,7 @@ function createNoteDetector(options = {}) {
         if (drillIterations.length > DRILL_MAX_ITERATIONS) {
             drillIterations.splice(0, drillIterations.length - DRILL_MAX_ITERATIONS);
         }
+        drillDirty = true;
     }
 
     function _drillOnLoopRestart(e) {
@@ -2648,11 +2655,17 @@ function createNoteDetector(options = {}) {
         drillActiveLoopB = null;
         drillNextIdx = 1;
         drillEnabled = false;
+        drillDirty = true;
     }
 
     function _drillBindEvents() {
         if (drillSubscribed) return;
-        if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        // Require both .on and .off so we never bind handlers we
+        // can't tear down later — a host with on-only would leak
+        // listeners across destroy() / re-mount.
+        if (!window.slopsmith
+            || typeof window.slopsmith.on !== 'function'
+            || typeof window.slopsmith.off !== 'function') return;
         // Register all three first; only set drillSubscribed after the
         // .on calls succeed. If any throws mid-registration we tear
         // down what landed so a retry on the next call is clean.
@@ -2700,7 +2713,11 @@ function createNoteDetector(options = {}) {
     // counter + accuracy) plus the last 5 completed iterations with
     // best/worst highlighting. Hides itself entirely when drill is
     // neither active nor has history. UI only; no state mutation.
+    // Gated on drillDirty so we don't re-parse innerHTML on every
+    // 33 ms HUD tick when nothing changed.
     function _drillRender() {
+        if (!drillDirty) return;
+        drillDirty = false;
         const panel = instanceRoot.querySelector('.nd-drill');
         if (!panel) return;
         // Hide entirely when neither active nor populated — keeps the
@@ -2768,13 +2785,15 @@ function createNoteDetector(options = {}) {
         // bounds.
         const nowEnabled = Number.isFinite(loopA) && Number.isFinite(loopB);
         if (nowEnabled && !drillEnabled) {
-            // Drill just started — reset per-iteration counters and
-            // anchor at the current chart time (which is the loop
-            // start since the user typically jumps to A on set).
+            // Drill just started — reset per-iteration counters.
+            // Anchor at loopA (the iteration's true start) rather
+            // than hw.getTime(): the user might enable detection
+            // mid-iteration, but the iteration we're starting to
+            // track conceptually begins at A.
             drillActiveLoopA = loopA;
             drillActiveLoopB = loopB;
-            const t0 = (hw && typeof hw.getTime === 'function') ? hw.getTime() : null;
-            _drillResetIteration(t0);
+            _drillResetIteration(loopA);
+            drillDirty = true;
         } else if (nowEnabled && drillEnabled) {
             // Loop bounds changed mid-drill — different passage.
             // Clear history so the iteration list isn't comparing
@@ -2784,13 +2803,14 @@ function createNoteDetector(options = {}) {
                 drillNextIdx = 1;
                 drillActiveLoopA = loopA;
                 drillActiveLoopB = loopB;
-                const t0 = (hw && typeof hw.getTime === 'function') ? hw.getTime() : null;
-                _drillResetIteration(t0);
+                _drillResetIteration(loopA);
+                drillDirty = true;
             }
         } else if (!nowEnabled && drillEnabled) {
             // Loop cleared. Keep the iteration history visible for
             // the user to review; just stop counting.
             _drillResetIteration(null);
+            drillDirty = true;
         }
         drillEnabled = nowEnabled;
     }
