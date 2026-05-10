@@ -2568,7 +2568,13 @@ function createNoteDetector(options = {}) {
         if (!window.slopsmith || typeof window.slopsmith.getLoop !== 'function') {
             return { loopA: null, loopB: null };
         }
-        return window.slopsmith.getLoop() || { loopA: null, loopB: null };
+        // Guard the host call — a misbehaving slopsmith bus shouldn't
+        // take down updateHUD / recordJudgment scoring with it.
+        try {
+            return window.slopsmith.getLoop() || { loopA: null, loopB: null };
+        } catch (e) {
+            return { loopA: null, loopB: null };
+        }
     }
 
     function _drillResetIteration(startT) {
@@ -2636,12 +2642,27 @@ function createNoteDetector(options = {}) {
     function _drillBindEvents() {
         if (drillSubscribed) return;
         if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        // Register all three first; only set drillSubscribed after the
+        // .on calls succeed. If any throws mid-registration we tear
+        // down what landed so a retry on the next call is clean.
+        const onLoopRestart = _drillOnLoopRestart;
+        const onSongChanged = _drillOnSongChanged;
+        try {
+            window.slopsmith.on('loop:restart', onLoopRestart);
+            window.slopsmith.on('song:loaded', onSongChanged);
+            window.slopsmith.on('song:ended', onSongChanged);
+        } catch (e) {
+            // Partial registration — unwind so we don't leak handlers.
+            if (typeof window.slopsmith.off === 'function') {
+                try { window.slopsmith.off('loop:restart', onLoopRestart); } catch (_) {}
+                try { window.slopsmith.off('song:loaded', onSongChanged); } catch (_) {}
+                try { window.slopsmith.off('song:ended', onSongChanged); } catch (_) {}
+            }
+            return;
+        }
+        drillOnLoopRestartFn = onLoopRestart;
+        drillOnSongChangedFn = onSongChanged;
         drillSubscribed = true;
-        drillOnLoopRestartFn = _drillOnLoopRestart;
-        drillOnSongChangedFn = _drillOnSongChanged;
-        window.slopsmith.on('loop:restart', drillOnLoopRestartFn);
-        window.slopsmith.on('song:loaded', drillOnSongChangedFn);
-        window.slopsmith.on('song:ended', drillOnSongChangedFn);
     }
 
     function _drillUnbindEvents() {

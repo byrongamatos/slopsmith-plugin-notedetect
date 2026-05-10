@@ -78,7 +78,7 @@ Read the live drill state from another plugin via `noteDetector.getDrillStats()`
 }
 ```
 
-Requires slopsmith with the plugin-API series merged (`loop:restart`, `getLoop`, `song:loaded` — landed in PRs #198 / #200 / #201).
+Requires slopsmith with the plugin-API series merged. Used APIs: `loop:restart` (snapshot trigger), `song:loaded` + `song:ended` (clear history), `getLoop()` (activation gate). Landed in slopsmith PRs #198 / #200 / #201.
 
 ## Events
 
