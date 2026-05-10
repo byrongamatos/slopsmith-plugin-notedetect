@@ -1628,6 +1628,13 @@ function createNoteDetector(options = {}) {
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
         noteResults.set(key, judgment);
         if (count) {
+            // Sync drill state inline so judgments landing right after
+            // enable (or right after a loop bounds change) see the
+            // current activation gate — _drillSyncFromLoopState
+            // otherwise only fires from updateHUD at 33ms intervals,
+            // leaving a window where early judgments would be
+            // mis-attributed (or skipped).
+            _drillSyncFromLoopState();
             if (judgment.hit) {
                 hits++;
                 streak++;
@@ -2572,14 +2579,20 @@ function createNoteDetector(options = {}) {
         drillIterStartT = (typeof startT === 'number') ? startT : null;
     }
 
-    function _drillSnapshotIteration(endT) {
+    function _drillSnapshotIteration() {
         const total = drillIterHits + drillIterMisses;
         // Skip zero-judgment iterations so an idle loop wrap doesn't
         // pollute the scoreboard with empty rows.
         if (total === 0) return;
         const accuracy = Math.round((drillIterHits / total) * 100);
-        const durationSec = (typeof drillIterStartT === 'number' && typeof endT === 'number')
-            ? Math.max(0, endT - drillIterStartT)
+        // Iteration duration = loopB - loopA (the loop's length).
+        // The wrap event's `detail.time` is loopA (the new
+        // iteration's start), not the just-finished iteration's
+        // endpoint — so we can't derive duration from event timing.
+        // Using the cached active bounds is correct: the iteration
+        // we're snapshotting played from loopA through loopB.
+        const durationSec = (Number.isFinite(drillActiveLoopA) && Number.isFinite(drillActiveLoopB))
+            ? Math.max(0, drillActiveLoopB - drillActiveLoopA)
             : null;
         drillIterations.push({
             idx: drillNextIdx++,
@@ -2599,8 +2612,10 @@ function createNoteDetector(options = {}) {
 
     function _drillOnLoopRestart(e) {
         const wrapTime = (e && e.detail && typeof e.detail.time === 'number') ? e.detail.time : null;
-        // Snapshot the iteration that just ended.
-        _drillSnapshotIteration(wrapTime);
+        // Snapshot the iteration that just ended (duration is derived
+        // from the cached loop bounds, not the event payload — the
+        // event's `time` is loopA, the new iteration's start).
+        _drillSnapshotIteration();
         // Re-anchor at the new iteration's start (= loopA).
         _drillResetIteration(wrapTime);
     }

@@ -53,6 +53,10 @@ test('loop:restart snapshots the just-finished iteration into drillIterations', 
     assert.equal(stats.iterations[0].hits, 8);
     assert.equal(stats.iterations[0].misses, 2);
     assert.equal(stats.iterations[0].accuracy, 80);
+    // durationSec is derived from the cached bounds (loopB - loopA),
+    // not from the event payload — the event's `time` is loopA (the
+    // new iteration's start), so using it would always give 0.
+    assert.equal(stats.iterations[0].durationSec, 10, 'durationSec = loopB - loopA');
     // Live counters reset for the new iteration.
     assert.equal(stats.current.hits, 0);
     assert.equal(stats.current.misses, 0);
