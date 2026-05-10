@@ -115,12 +115,13 @@ test('song:loaded clears the iteration history (new song = new passage)', () => 
     assert.equal(det.getDrillStats().iterations.length, 2);
     assert.equal(det.getDrillStats().active, true);
 
-    // New song fires song:loaded.
+    // New song fires song:loaded. Slopsmith clears the loop bounds
+    // as part of song teardown (the loop is per-song); we model that
+    // here so getDrillStats()'s inline sync sees the actual host
+    // state rather than re-activating from stale bounds.
+    core.slopsmith._loop = { loopA: null, loopB: null };
     core.slopsmith._fire('song:loaded', { filename: 'next-song.psarc' });
     assert.equal(det.getDrillStats().iterations.length, 0, 'song change must clear drill history');
-    // Active flag must also drop — callers that read getDrillStats
-    // immediately after a song transition (and before the next HUD
-    // tick re-syncs) would otherwise see stale active=true.
     assert.equal(det.getDrillStats().active, false, 'active flag must clear on song change');
     det.destroy();
 });

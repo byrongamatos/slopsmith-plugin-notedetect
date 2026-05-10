@@ -3121,6 +3121,12 @@ function createNoteDetector(options = {}) {
         // `iterations` is a snapshot copy of completed iterations so
         // callers can't mutate the internal array.
         getDrillStats: () => {
+            // Sync inline so callers always see current loop state
+            // even when detection is disabled (when updateHUD isn't
+            // ticking) — otherwise `active` and `current.startT`
+            // could lag behind a loop clear / bounds change until
+            // the next enable() or HUD tick.
+            _drillSyncFromLoopState();
             const liveTotal = drillIterHits + drillIterMisses;
             return {
                 active: drillEnabled,
