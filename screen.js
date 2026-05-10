@@ -2604,7 +2604,10 @@ function createNoteDetector(options = {}) {
         drillIterMisses = 0;
         drillIterStreak = 0;
         drillIterBestStreak = 0;
-        drillIterStartT = (typeof startT === 'number') ? startT : null;
+        // Reject NaN / Infinity — typeof===number is true for both and
+        // they'd leak through into getDrillStats().current.startT and
+        // poison any downstream arithmetic.
+        drillIterStartT = Number.isFinite(startT) ? startT : null;
     }
 
     function _drillSnapshotIteration() {
@@ -2639,7 +2642,8 @@ function createNoteDetector(options = {}) {
     }
 
     function _drillOnLoopRestart(e) {
-        const wrapTime = (e && e.detail && typeof e.detail.time === 'number') ? e.detail.time : null;
+        const rawTime = (e && e.detail) ? e.detail.time : undefined;
+        const wrapTime = Number.isFinite(rawTime) ? rawTime : null;
         // Snapshot the iteration that just ended (duration is derived
         // from the cached loop bounds, not the event payload — the
         // event's `time` is loopA, the new iteration's start).
@@ -2689,11 +2693,17 @@ function createNoteDetector(options = {}) {
 
     function _drillUnbindEvents() {
         if (!drillSubscribed) return;
+        // destroy() calls this on teardown — a misbehaving host
+        // throwing from .off() would otherwise crash destroy and
+        // leave the instance partially torn down. Guard each call
+        // independently so one bad listener doesn't block the rest.
         if (window.slopsmith && typeof window.slopsmith.off === 'function') {
-            if (drillOnLoopRestartFn) window.slopsmith.off('loop:restart', drillOnLoopRestartFn);
+            if (drillOnLoopRestartFn) {
+                try { window.slopsmith.off('loop:restart', drillOnLoopRestartFn); } catch (e) {}
+            }
             if (drillOnSongChangedFn) {
-                window.slopsmith.off('song:loaded', drillOnSongChangedFn);
-                window.slopsmith.off('song:ended', drillOnSongChangedFn);
+                try { window.slopsmith.off('song:loaded', drillOnSongChangedFn); } catch (e) {}
+                try { window.slopsmith.off('song:ended', drillOnSongChangedFn); } catch (e) {}
             }
         }
         drillSubscribed = false;
