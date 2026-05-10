@@ -1067,6 +1067,33 @@ function createNoteDetector(options = {}) {
     let currentSection = null;
     const noteResults = new Map(); // key -> judgment object
 
+    // Drill mode (slopsmith plugin-API: loop:restart event from #198).
+    // Activates whenever slopsmith has an A-B loop set; each loop wrap
+    // snapshots the just-finished iteration's per-iteration scoring
+    // into drillIterations so the user sees iteration-by-iteration
+    // accuracy on a repeated passage. Per-iteration counters live
+    // alongside (not in place of) the global session counters above —
+    // session totals stay correct even while drilling.
+    let drillEnabled = false;       // mirrors slopsmith.getLoop() having both bounds
+    let drillIterations = [];       // captured snapshots, oldest first
+    let drillIterStartT = null;     // chartTime at the current iteration's start (loopA)
+    let drillIterHits = 0;
+    let drillIterMisses = 0;
+    let drillIterStreak = 0;
+    let drillIterBestStreak = 0;
+    let drillSubscribed = false;    // gate the slopsmith.on / .off pair
+    // Bound handler refs so destroy() can call slopsmith.off with
+    // identity that matches the original .on registration.
+    let drillOnLoopRestartFn = null;
+    let drillOnSongChangedFn = null;
+    // Bounds at iteration start; if slopsmith.getLoop() returns
+    // different bounds mid-drill (user picked another saved loop or
+    // edited A/B) we clear iterations because they're no longer
+    // comparing the same passage.
+    let drillActiveLoopA = null;
+    let drillActiveLoopB = null;
+    const DRILL_MAX_ITERATIONS = 50;  // bound the array so a long drill session doesn't grow without limit
+
     // Detection state
     let detectedMidi = -1;
     let detectedConfidence = 0;
@@ -1606,6 +1633,18 @@ function createNoteDetector(options = {}) {
                 misses++;
                 streak = 0;
                 updateSectionStat('miss');
+            }
+            // Mirror to drill counters. Independent state — global
+            // session score is unaffected by iteration boundaries.
+            if (drillEnabled) {
+                if (judgment.hit) {
+                    drillIterHits++;
+                    drillIterStreak++;
+                    if (drillIterStreak > drillIterBestStreak) drillIterBestStreak = drillIterStreak;
+                } else {
+                    drillIterMisses++;
+                    drillIterStreak = 0;
+                }
             }
         }
         if (emit) dispatchJudgment(judgment);
@@ -2148,6 +2187,10 @@ function createNoteDetector(options = {}) {
             <div class="nd-hud-streak text-xs text-gray-400 mt-0.5"></div>
             <div class="nd-hud-counts text-[10px] text-gray-600 mt-0.5"></div>
             <div class="nd-hud-detected text-[10px] text-cyan-400 mt-1 font-mono"></div>
+            <div class="nd-drill mt-2 hidden text-right">
+                <div class="nd-drill-header text-[10px] text-amber-300 font-mono"></div>
+                <div class="nd-drill-list text-[10px] text-gray-500 font-mono leading-tight mt-0.5"></div>
+            </div>
         `;
         instanceRoot.appendChild(hud);
     }
@@ -2183,6 +2226,11 @@ function createNoteDetector(options = {}) {
 
     function updateHUD() {
         if (!enabled) return;
+
+        // Bridge slopsmith's loop state into our drill flag once per
+        // tick. Cheap (two getLoop reads); avoids a separate poll.
+        _drillSyncFromLoopState();
+        _drillRender();
 
         const total = hits + misses;
         const accEl = instanceRoot.querySelector('.nd-hud-accuracy');
@@ -2504,6 +2552,174 @@ function createNoteDetector(options = {}) {
         lastChordTime = -Infinity;
     }
 
+    // ── Drill mode (slopsmith loop:restart) ───────────────────────────
+    function _drillCurrentLoop() {
+        if (!window.slopsmith || typeof window.slopsmith.getLoop !== 'function') {
+            return { loopA: null, loopB: null };
+        }
+        return window.slopsmith.getLoop() || { loopA: null, loopB: null };
+    }
+
+    function _drillResetIteration(startT) {
+        drillIterHits = 0;
+        drillIterMisses = 0;
+        drillIterStreak = 0;
+        drillIterBestStreak = 0;
+        drillIterStartT = (typeof startT === 'number') ? startT : null;
+    }
+
+    function _drillSnapshotIteration(endT) {
+        const total = drillIterHits + drillIterMisses;
+        // Skip zero-judgment iterations so an idle loop wrap doesn't
+        // pollute the scoreboard with empty rows.
+        if (total === 0) return;
+        const accuracy = Math.round((drillIterHits / total) * 100);
+        const durationSec = (typeof drillIterStartT === 'number' && typeof endT === 'number')
+            ? Math.max(0, endT - drillIterStartT)
+            : null;
+        drillIterations.push({
+            idx: drillIterations.length + 1,
+            hits: drillIterHits,
+            misses: drillIterMisses,
+            accuracy,
+            bestStreak: drillIterBestStreak,
+            durationSec,
+            ts: Date.now(),
+        });
+        // Bound the array to the most recent N — long sessions
+        // shouldn't grow memory unboundedly.
+        if (drillIterations.length > DRILL_MAX_ITERATIONS) {
+            drillIterations.splice(0, drillIterations.length - DRILL_MAX_ITERATIONS);
+        }
+    }
+
+    function _drillOnLoopRestart(e) {
+        const wrapTime = (e && e.detail && typeof e.detail.time === 'number') ? e.detail.time : null;
+        // Snapshot the iteration that just ended.
+        _drillSnapshotIteration(wrapTime);
+        // Re-anchor at the new iteration's start (= loopA).
+        _drillResetIteration(wrapTime);
+    }
+
+    function _drillOnSongChanged() {
+        // New song = different passage; stale iterations don't apply.
+        drillIterations = [];
+        _drillResetIteration(null);
+        drillActiveLoopA = null;
+        drillActiveLoopB = null;
+    }
+
+    function _drillBindEvents() {
+        if (drillSubscribed) return;
+        if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        drillSubscribed = true;
+        drillOnLoopRestartFn = _drillOnLoopRestart;
+        drillOnSongChangedFn = _drillOnSongChanged;
+        window.slopsmith.on('loop:restart', drillOnLoopRestartFn);
+        window.slopsmith.on('song:loaded', drillOnSongChangedFn);
+        window.slopsmith.on('song:ended', drillOnSongChangedFn);
+    }
+
+    function _drillUnbindEvents() {
+        if (!drillSubscribed) return;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (drillOnLoopRestartFn) window.slopsmith.off('loop:restart', drillOnLoopRestartFn);
+            if (drillOnSongChangedFn) {
+                window.slopsmith.off('song:loaded', drillOnSongChangedFn);
+                window.slopsmith.off('song:ended', drillOnSongChangedFn);
+            }
+        }
+        drillSubscribed = false;
+        drillOnLoopRestartFn = null;
+        drillOnSongChangedFn = null;
+    }
+
+    // Called every HUD tick to bridge slopsmith loop state into our
+    // drillEnabled flag and detect mid-drill loop changes (user picked
+    // a different saved loop). Cheap — just two getLoop reads + a
+    // boolean compare per tick.
+    function _drillRender() {
+        const panel = instanceRoot.querySelector('.nd-drill');
+        if (!panel) return;
+        // Hide entirely when neither active nor populated — keeps the
+        // HUD compact in non-drill use.
+        const hasHistory = drillIterations.length > 0;
+        if (!drillEnabled && !hasHistory) {
+            panel.classList.add('hidden');
+            return;
+        }
+        panel.classList.remove('hidden');
+        const headerEl = panel.querySelector('.nd-drill-header');
+        const listEl = panel.querySelector('.nd-drill-list');
+        if (headerEl) {
+            if (drillEnabled) {
+                const liveTotal = drillIterHits + drillIterMisses;
+                const liveAcc = liveTotal > 0 ? Math.round((drillIterHits / liveTotal) * 100) : null;
+                const num = drillIterations.length + 1;
+                headerEl.textContent = liveAcc !== null
+                    ? `Drill #${num}: ${drillIterHits}/${liveTotal} (${liveAcc}%)`
+                    : `Drill #${num}`;
+            } else {
+                // Drill stopped (loop cleared), but history is still
+                // visible — label it so the user knows.
+                headerEl.textContent = `Drill (last loop)`;
+            }
+        }
+        if (listEl) {
+            if (!hasHistory) {
+                listEl.textContent = '';
+            } else {
+                // Show the last 5 iterations, oldest -> newest. Find
+                // best/worst within the visible window for highlighting.
+                const recent = drillIterations.slice(-5);
+                let best = recent[0], worst = recent[0];
+                for (const it of recent) {
+                    if (it.accuracy > best.accuracy) best = it;
+                    if (it.accuracy < worst.accuracy) worst = it;
+                }
+                const parts = recent.map((it) => {
+                    const tag = it === best && recent.length > 1
+                        ? ' <span style="color:#00ff88">★</span>'
+                        : it === worst && recent.length > 1
+                            ? ' <span style="color:#ff4444">·</span>'
+                            : '';
+                    return `#${it.idx} ${it.hits}/${it.hits + it.misses} ${it.accuracy}%${tag}`;
+                });
+                listEl.innerHTML = parts.join('<br>');
+            }
+        }
+    }
+
+    function _drillSyncFromLoopState() {
+        const { loopA, loopB } = _drillCurrentLoop();
+        const nowEnabled = (loopA !== null && loopB !== null);
+        if (nowEnabled && !drillEnabled) {
+            // Drill just started — reset per-iteration counters and
+            // anchor at the current chart time (which is the loop
+            // start since the user typically jumps to A on set).
+            drillActiveLoopA = loopA;
+            drillActiveLoopB = loopB;
+            const t0 = (hw && typeof hw.getTime === 'function') ? hw.getTime() : null;
+            _drillResetIteration(t0);
+        } else if (nowEnabled && drillEnabled) {
+            // Loop bounds changed mid-drill — different passage.
+            // Clear history so the iteration list isn't comparing
+            // apples to oranges.
+            if (loopA !== drillActiveLoopA || loopB !== drillActiveLoopB) {
+                drillIterations = [];
+                drillActiveLoopA = loopA;
+                drillActiveLoopB = loopB;
+                const t0 = (hw && typeof hw.getTime === 'function') ? hw.getTime() : null;
+                _drillResetIteration(t0);
+            }
+        } else if (!nowEnabled && drillEnabled) {
+            // Loop cleared. Keep the iteration history visible for
+            // the user to review; just stop counting.
+            _drillResetIteration(null);
+        }
+        drillEnabled = nowEnabled;
+    }
+
     // Tracks an in-flight enable() promise. A second enable() call
     // while the first is still awaiting startAudio returns the
     // SAME promise rather than short-circuiting on the already-set
@@ -2536,6 +2752,12 @@ function createNoteDetector(options = {}) {
             return false;
         }
         ensureDrawHook();
+        // Subscribe to slopsmith loop / song events for drill mode.
+        // Idempotent — _drillBindEvents bails when already subscribed,
+        // so re-enabling after a disable doesn't double-bind. Listeners
+        // survive disable() (so re-enable resumes the same drill state)
+        // and only get torn down by destroy().
+        _drillBindEvents();
         enabled = true;
         // Make sure the instanceRoot is in the DOM before HUD/summary
         // rendering kicks in — `createNoteDetector({container}).enable()`
@@ -2664,6 +2886,11 @@ function createNoteDetector(options = {}) {
         // callers like splitscreen that unmount a panel without
         // meaning to end-of-song the session.
         disable({ silent: true });
+        // Unbind slopsmith drill listeners so multiple createNoteDetector()
+        // instances (splitscreen) don't accumulate handlers across mount/
+        // unmount cycles. disable() leaves them alone (resumes drill state
+        // on re-enable); destroy is the right teardown point.
+        _drillUnbindEvents();
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
         try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
@@ -2778,6 +3005,25 @@ function createNoteDetector(options = {}) {
             accuracy: (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0,
             sectionStats: sectionStats.map(s => ({ name: s.name, hits: s.hits, misses: s.misses })),
         }),
+        // Drill-mode read-only state. `current` reflects the
+        // in-progress iteration (zeroed when no drill is active).
+        // `iterations` is a snapshot copy of completed iterations so
+        // callers can't mutate the internal array.
+        getDrillStats: () => {
+            const liveTotal = drillIterHits + drillIterMisses;
+            return {
+                active: drillEnabled,
+                current: {
+                    hits: drillIterHits,
+                    misses: drillIterMisses,
+                    streak: drillIterStreak,
+                    bestStreak: drillIterBestStreak,
+                    accuracy: liveTotal > 0 ? Math.round((drillIterHits / liveTotal) * 100) : 0,
+                    startT: drillIterStartT,
+                },
+                iterations: drillIterations.map((it) => ({ ...it })),
+            };
+        },
         setChannel,
         injectButton,
         showSummary,
@@ -2794,6 +3040,15 @@ function createNoteDetector(options = {}) {
         // shared model finishes loading to refresh every instance's
         // button text. Prefixed with `_` to mark it as non-public.
         _updateButton: updateButton,
+        // Internal — drill-mode test hooks. The audio pipeline
+        // (getUserMedia, AudioContext) is unavailable in the vm test
+        // sandbox, so tests need a way to bind listeners + inject
+        // judgments + drive the loop-state poll without going through
+        // enable(). Prefixed with `_` to mark them as non-public.
+        _bindDrillEvents: _drillBindEvents,
+        _unbindDrillEvents: _drillUnbindEvents,
+        _drillSyncFromLoopState: _drillSyncFromLoopState,
+        _recordJudgment: recordJudgment,
     };
 
     // Register the draw hook once per instance. The hook early-returns

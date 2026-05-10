@@ -1,0 +1,158 @@
+// Drill-mode tests — exercise the slopsmith loop:restart wiring in
+// notedetect against a stub slopsmith bus. Uses the existing vm
+// loader; doesn't touch the audio pipeline (factory.test.js already
+// covers the audio-less API shape).
+//
+// Each test gets a fresh loader load so the slopsmith listener
+// registry, factory state, and drill iteration array don't leak
+// between cases.
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { loadDetectionCore } = require('./_loader');
+
+// Convenience: build a judgment object shaped enough to pass
+// recordJudgment's branches. The drill counters only inspect
+// `judgment.hit`; everything else is incidental.
+function judgment(hit) {
+    return { hit, note: { s: 1, f: 0 }, noteTime: 0, judgedAt: 0 };
+}
+
+test('enable() binds loop:restart, song:loaded, song:ended exactly once', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    // Bind directly via the test hook; enable() requires the audio
+    // pipeline (unavailable in vm) but the bind itself is pure.
+    det._bindDrillEvents();
+    assert.equal(core.slopsmith._listenerCount('loop:restart'), 1);
+    assert.equal(core.slopsmith._listenerCount('song:loaded'), 1);
+    assert.equal(core.slopsmith._listenerCount('song:ended'), 1);
+    // Idempotent — calling again must NOT double-bind.
+    det._bindDrillEvents();
+    assert.equal(core.slopsmith._listenerCount('loop:restart'), 1);
+    det.destroy();
+});
+
+test('loop:restart snapshots the just-finished iteration into drillIterations', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    // Activate drill via getLoop() returning real bounds, then sync.
+    core.slopsmith._loop = { loopA: 10, loopB: 20 };
+    det._drillSyncFromLoopState();
+
+    // 8 hits + 2 misses for iteration 1.
+    for (let i = 0; i < 8; i++) det._recordJudgment(`k${i}`, judgment(true));
+    for (let i = 0; i < 2; i++) det._recordJudgment(`m${i}`, judgment(false));
+
+    // Wrap to start iteration 2.
+    core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
+
+    const stats = det.getDrillStats();
+    assert.equal(stats.iterations.length, 1);
+    assert.equal(stats.iterations[0].hits, 8);
+    assert.equal(stats.iterations[0].misses, 2);
+    assert.equal(stats.iterations[0].accuracy, 80);
+    // Live counters reset for the new iteration.
+    assert.equal(stats.current.hits, 0);
+    assert.equal(stats.current.misses, 0);
+    det.destroy();
+});
+
+test('loop:restart with zero judgments does not push an empty entry', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    core.slopsmith._loop = { loopA: 5, loopB: 15 };
+    det._drillSyncFromLoopState();
+
+    // Wrap immediately without any judgments — idle iteration.
+    core.slopsmith._fire('loop:restart', { loopA: 5, loopB: 15, time: 5 });
+    core.slopsmith._fire('loop:restart', { loopA: 5, loopB: 15, time: 5 });
+
+    const stats = det.getDrillStats();
+    assert.equal(stats.iterations.length, 0, 'empty iterations must not be pushed');
+    det.destroy();
+});
+
+test('drill counters are gated on slopsmith.getLoop() — no loop = no per-iter mutation', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    // No active loop.
+    core.slopsmith._loop = { loopA: null, loopB: null };
+    det._drillSyncFromLoopState();
+    assert.equal(det.getDrillStats().active, false);
+
+    det._recordJudgment('a', judgment(true));
+    det._recordJudgment('b', judgment(false));
+
+    // Session counters advance, but drill counters do NOT.
+    assert.equal(det.getStats().hits, 1);
+    assert.equal(det.getStats().misses, 1);
+    assert.equal(det.getDrillStats().current.hits, 0);
+    assert.equal(det.getDrillStats().current.misses, 0);
+    det.destroy();
+});
+
+test('song:loaded clears the iteration history (new song = new passage)', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    core.slopsmith._loop = { loopA: 10, loopB: 20 };
+    det._drillSyncFromLoopState();
+
+    // Build up two iterations.
+    for (let i = 0; i < 5; i++) det._recordJudgment(`a${i}`, judgment(true));
+    core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
+    for (let i = 0; i < 3; i++) det._recordJudgment(`b${i}`, judgment(false));
+    core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
+
+    assert.equal(det.getDrillStats().iterations.length, 2);
+
+    // New song fires song:loaded.
+    core.slopsmith._fire('song:loaded', { filename: 'next-song.psarc' });
+    assert.equal(det.getDrillStats().iterations.length, 0, 'song change must clear drill history');
+    det.destroy();
+});
+
+test('destroy() unbinds slopsmith listeners — later loop:restart is a no-op', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+    core.slopsmith._loop = { loopA: 10, loopB: 20 };
+    det._drillSyncFromLoopState();
+    for (let i = 0; i < 3; i++) det._recordJudgment(`a${i}`, judgment(true));
+
+    det.destroy();
+    assert.equal(core.slopsmith._listenerCount('loop:restart'), 0);
+    assert.equal(core.slopsmith._listenerCount('song:loaded'), 0);
+    assert.equal(core.slopsmith._listenerCount('song:ended'), 0);
+
+    // Firing after destroy must not throw and must not affect anything.
+    assert.doesNotThrow(() => {
+        core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
+    });
+});
+
+test('mid-drill loop bounds change clears stale iteration history', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    det._bindDrillEvents();
+
+    // Drill on bounds A = (10, 20).
+    core.slopsmith._loop = { loopA: 10, loopB: 20 };
+    det._drillSyncFromLoopState();
+    for (let i = 0; i < 5; i++) det._recordJudgment(`x${i}`, judgment(true));
+    core.slopsmith._fire('loop:restart', { loopA: 10, loopB: 20, time: 10 });
+    assert.equal(det.getDrillStats().iterations.length, 1);
+
+    // User picks a different saved loop — bounds change.
+    core.slopsmith._loop = { loopA: 30, loopB: 45 };
+    det._drillSyncFromLoopState();
+
+    // Iterations cleared because we're now on a different passage.
+    assert.equal(det.getDrillStats().iterations.length, 0);
+    assert.equal(det.getDrillStats().active, true);
+    det.destroy();
+});

@@ -85,6 +85,40 @@ function makeSandbox() {
             removeDrawHook: noop,
         },
     };
+    // Slopsmith plugin-API stub — drill-mode tests need to drive
+    // `loop:restart`, `song:loaded`, `song:ended` synthetically and
+    // toggle `getLoop()` between {null,null} and active bounds. Plain
+    // listener registry; no EventTarget overhead.
+    const _listeners = new Map();
+    sandbox.slopsmith = {
+        on(event, fn) {
+            if (!_listeners.has(event)) _listeners.set(event, new Set());
+            _listeners.get(event).add(fn);
+        },
+        off(event, fn) {
+            const set = _listeners.get(event);
+            if (set) set.delete(fn);
+        },
+        // Test-time helper: fire all handlers for `event` with a
+        // CustomEvent-shaped payload `{ detail }`.
+        _fire(event, detail) {
+            const set = _listeners.get(event);
+            if (!set) return;
+            for (const fn of set) fn({ detail });
+        },
+        // Test-time helper: return the count of currently-registered
+        // listeners for an event so tests can assert subscribe/unbind
+        // ordering.
+        _listenerCount(event) {
+            const set = _listeners.get(event);
+            return set ? set.size : 0;
+        },
+        // Mutable loop state — tests poke `_loop` directly.
+        _loop: { loopA: null, loopB: null },
+        getLoop() {
+            return { loopA: this._loop.loopA, loopB: this._loop.loopB };
+        },
+    };
     // window must reference the sandbox itself so the plugin's
     // `window.playSong = ...` assignments and reads work. Some tests
     // also look up `window.noteDetect` / `window.createNoteDetector`
@@ -226,6 +260,14 @@ function loadDetectionCore() {
             };
         },
         createNoteDetector: sandbox.createNoteDetector,
+        // Drill-mode tests: expose the slopsmith stub so tests can
+        // drive synthetic `loop:restart` etc. and toggle the loop
+        // state that getLoop() returns.
+        slopsmith: sandbox.slopsmith,
+        // For the rare test that needs to manipulate the highway
+        // stub directly (e.g., make hw.getTime return non-zero so
+        // drillIterStartT comes out non-null).
+        highway: sandbox.highway,
     };
 }
 
