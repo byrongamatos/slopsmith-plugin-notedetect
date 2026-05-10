@@ -113,10 +113,13 @@ function makeSandbox() {
             const set = _listeners.get(event);
             return set ? set.size : 0;
         },
-        // Mutable loop state — tests poke `_loop` directly.
+        // Mutable loop state — tests poke `_loop` directly. Return
+        // the raw value so tests can simulate malformed shapes
+        // (`{}`, non-object truthy, etc.) and exercise
+        // _drillCurrentLoop's defensive handling.
         _loop: { loopA: null, loopB: null },
         getLoop() {
-            return { loopA: this._loop.loopA, loopB: this._loop.loopB };
+            return this._loop;
         },
     };
     // window must reference the sandbox itself so the plugin's

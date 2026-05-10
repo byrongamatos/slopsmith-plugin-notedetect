@@ -170,10 +170,10 @@ test('iteration idx stays monotonic past the 50-iter truncation cap', () => {
 });
 
 test('malformed slopsmith.getLoop() shape does NOT activate drill', () => {
-    // Defensive: if slopsmith.getLoop returns {} or
-    // { loopA: undefined, loopB: undefined } (malformed core release),
-    // drill must stay inactive — otherwise per-iter counters would
-    // mutate against bogus bounds.
+    // Defensive: if slopsmith.getLoop returns a malformed shape
+    // (empty object, undefined fields, truthy non-object, or
+    // non-numeric values), drill must stay inactive — otherwise
+    // per-iter counters would mutate against bogus bounds.
     const core = loadDetectionCore();
     const det = core.createNoteDetector();
     det._bindDrillEvents();
@@ -188,6 +188,20 @@ test('malformed slopsmith.getLoop() shape does NOT activate drill', () => {
     core.slopsmith._loop = { loopA: 'not a number', loopB: 1 };
     det._drillSyncFromLoopState();
     assert.equal(det.getDrillStats().active, false, 'non-numeric bounds must not activate drill');
+
+    // Truthy non-object values — _drillCurrentLoop must reject these
+    // so destructuring doesn't produce undefined fields downstream.
+    core.slopsmith._loop = true;
+    det._drillSyncFromLoopState();
+    assert.equal(det.getDrillStats().active, false, '`true` from getLoop must not activate drill');
+
+    core.slopsmith._loop = 42;
+    det._drillSyncFromLoopState();
+    assert.equal(det.getDrillStats().active, false, 'number from getLoop must not activate drill');
+
+    core.slopsmith._loop = 'string';
+    det._drillSyncFromLoopState();
+    assert.equal(det.getDrillStats().active, false, 'string from getLoop must not activate drill');
 
     // Only valid finite numbers activate.
     core.slopsmith._loop = { loopA: 5, loopB: 10 };

@@ -2663,6 +2663,12 @@ function createNoteDetector(options = {}) {
         drillActiveLoopB = null;
         drillNextIdx = 1;
         drillEnabled = false;
+        // Force the next recordJudgment-driven sync to actually run
+        // rather than being skipped by the 16 ms throttle — otherwise
+        // a judgment landing right after a song change with a fresh
+        // loop set could be excluded from drill counters because
+        // drillEnabled would still be false until the next sync.
+        drillLastSyncAt = 0;
     }
 
     function _drillBindEvents() {
