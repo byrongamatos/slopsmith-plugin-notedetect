@@ -71,6 +71,11 @@ function makeSandbox() {
         clearInterval: noop,
         requestAnimationFrame: () => 0,
         cancelAnimationFrame: noop,
+        // alert() is exercised by screen.js's startAudio() catch when
+        // permission denial bubbles up — tests that drive the
+        // getUserMedia fallback need this to exist or they fail with
+        // ReferenceError instead of exercising the production code path.
+        alert: noop,
         Float32Array, Int16Array, Uint8Array, Array, Map, Set, Date, Math, JSON, Error,
         Promise, CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
         // Highway API stub — plugin's IIFE at bottom reads window.playSong
@@ -143,9 +148,17 @@ function makeSandbox() {
     return sandbox;
 }
 
-function loadDetectionCore() {
+function loadDetectionCore({ sandboxBeforeRun } = {}) {
     const src = fs.readFileSync(SCRIPT_PATH, 'utf8');
     const sandbox = makeSandbox();
+    // Hook for tests that need to inject globals before the plugin's
+    // top-level code runs (e.g. window.slopsmithDesktop for the desktop
+    // bridge path). The hook receives the sandbox object directly so it
+    // can mutate navigator/window etc. without round-tripping through
+    // exports.
+    if (typeof sandboxBeforeRun === 'function') {
+        sandboxBeforeRun(sandbox);
+    }
     vm.createContext(sandbox);
     // Script may throw while executing setup code that touches DOM edge cases —
     // function declarations at top level still get hoisted onto the sandbox

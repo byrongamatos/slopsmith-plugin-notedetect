@@ -1523,10 +1523,23 @@ function createNoteDetector(options = {}) {
     // throttles in the background.
     function startBridgeLevelMeter(desktop) {
         stopBridgeLevelMeter();
+        // Bail before installing the timer if the engine doesn't expose
+        // getLevels — otherwise we'd run a no-op poll forever, leak the
+        // interval, and never surface the missing capability.
+        if (!desktop || !desktop.audio || typeof desktop.audio.getLevels !== 'function') {
+            return;
+        }
         bridgeLevelTimer = setInterval(async () => {
             if (!enabled || !usingDesktopBridge) return;
             try {
                 const levels = await desktop.audio.getLevels();
+                // Re-check after the await: disable()/destroy() can fire
+                // between the IPC round-trip and the resolve, and the
+                // bridge timer doesn't track sessionGen the way the
+                // pitch poller does. Without this we'd race-write
+                // inputLevel/inputPeak and touch the DOM on a torn-down
+                // instance.
+                if (!enabled || !usingDesktopBridge) return;
                 if (!levels) return;
                 // Engine reports peaks in 0..1 already; the Web-Audio
                 // branch scales RMS by 5 for headroom. Use the engine's
