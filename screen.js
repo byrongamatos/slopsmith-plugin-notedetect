@@ -1097,14 +1097,6 @@ function createNoteDetector(options = {}) {
     // would reuse `#51` indefinitely once truncation started.
     let drillNextIdx = 1;
     const DRILL_MAX_ITERATIONS = 50;  // bound the array so a long drill session doesn't grow without limit
-    // recordJudgment is on the hot path — calling getLoop() on every
-    // judgment is wasteful when updateHUD already polls at 33 ms.
-    // Throttle: only re-sync when the last sync is older than this.
-    // 16 ms is well below the 33 ms HUD cadence and gives enough
-    // resolution that judgments after enable / mid-drill bounds change
-    // still see fresh state within one frame.
-    const DRILL_SYNC_MIN_MS = 16;
-    let drillLastSyncAt = 0;
 
     // Detection state
     let detectedMidi = -1;
@@ -1636,18 +1628,11 @@ function createNoteDetector(options = {}) {
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
         noteResults.set(key, judgment);
         if (count) {
-            // Sync drill state inline so judgments landing right after
-            // enable (or right after a loop bounds change) see the
-            // current activation gate — _drillSyncFromLoopState
-            // otherwise only fires from updateHUD at 33ms intervals,
-            // leaving a window where early judgments would be
-            // mis-attributed (or skipped). Throttle to avoid hammering
-            // the host bus on every hot-path judgment.
-            const nowMs = Date.now();
-            if (nowMs - drillLastSyncAt >= DRILL_SYNC_MIN_MS) {
-                drillLastSyncAt = nowMs;
-                _drillSyncFromLoopState();
-            }
+            // No per-judgment sync — the host getLoop() poll would land
+            // on the scoring hot path. Instead we sync at enable()
+            // (closes the post-enable gap) and rely on updateHUD's
+            // 33 ms tick for ongoing tracking. Mid-drill bounds changes
+            // lag by at most one frame, which the user can't perceive.
             if (judgment.hit) {
                 hits++;
                 streak++;
@@ -2663,12 +2648,6 @@ function createNoteDetector(options = {}) {
         drillActiveLoopB = null;
         drillNextIdx = 1;
         drillEnabled = false;
-        // Force the next recordJudgment-driven sync to actually run
-        // rather than being skipped by the 16 ms throttle — otherwise
-        // a judgment landing right after a song change with a fresh
-        // loop set could be excluded from drill counters because
-        // drillEnabled would still be false until the next sync.
-        drillLastSyncAt = 0;
     }
 
     function _drillBindEvents() {
@@ -2779,13 +2758,9 @@ function createNoteDetector(options = {}) {
     // Bridge slopsmith loop state into our drillEnabled flag and
     // detect mid-drill loop bounds changes (user picked a different
     // saved loop). Called from updateHUD every 33 ms and from
-    // recordJudgment with 16 ms throttle. Cheap — one getLoop read +
-    // a boolean compare.
+    // enable() once at activation. Cheap — one getLoop read + a
+    // boolean compare.
     function _drillSyncFromLoopState() {
-        // Update the throttle timestamp so updateHUD's polling sync
-        // also counts as "recently synced" — no double-sync if a
-        // judgment lands right after a HUD tick.
-        drillLastSyncAt = Date.now();
         const { loopA, loopB } = _drillCurrentLoop();
         // Require finite numbers, not just non-null. A malformed return
         // (e.g. {}, undefined fields) would otherwise activate drill
@@ -2858,6 +2833,10 @@ function createNoteDetector(options = {}) {
         // survive disable() (so re-enable resumes the same drill state)
         // and only get torn down by destroy().
         _drillBindEvents();
+        // Sync drill state once at enable so a user enabling detection
+        // while a loop is already active starts counting iterations
+        // from the very next judgment, not after the first HUD tick.
+        _drillSyncFromLoopState();
         enabled = true;
         // Make sure the instanceRoot is in the DOM before HUD/summary
         // rendering kicks in — `createNoteDetector({container}).enable()`
