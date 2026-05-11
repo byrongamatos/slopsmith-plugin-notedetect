@@ -1150,6 +1150,18 @@ function createNoteDetector(options = {}) {
     // existing Web-Audio teardown in stopAudio() is null-checked, so it
     // doesn't need its own branch on this flag.
     let usingDesktopBridge = false;
+    // Cached engine sample rate for the bridge path. There's no
+    // audioCtx on this branch, so processFrame() / matchNotes()
+    // chord scoring can't read it from there — read it once at
+    // startAudio() time and consult this everywhere a sampleRate is
+    // needed. The engine rate is fixed for a session; if the user
+    // changes audio device the detector restarts via the
+    // restartAudio chain and refreshes this value.
+    let bridgeSampleRate = 48000;
+    // Cleanup closure returned by `desktop.audio.onInputFrame(...)`.
+    // Called from stopAudio() to tear down the IPC subscription
+    // when the detector disables.
+    let bridgeFrameUnsubscribe = null;
 
     // Visual-feedback tracking
     let lastHitCount = 0;
@@ -1210,15 +1222,19 @@ function createNoteDetector(options = {}) {
             // shell is hosting us, the native JUCE engine already owns
             // the audio device — see src/main/audio-bridge.ts in
             // slopsmith-desktop. Drive monophonic detection from its
-            // `audio:getPitchDetection` IPC instead of opening a parallel
-            // getUserMedia/Web-Audio chain. That parallel path fails on
-            // Linux Electron builds (Chromium denies `media` for the
-            // localhost-served renderer with no permission handler set)
-            // and duplicates work the engine is already doing every
-            // frame. Caveat: chord scoring needs raw audio samples that
-            // the current bridge doesn't expose, so we run single-note
-            // mode only on this path; matchNotes() handles the null
-            // frameBuffer by skipping its chord branch.
+            // `audio:getPitchDetection` IPC and polyphonic chord
+            // scoring from its `audio.onInputFrame` push stream,
+            // instead of opening a parallel getUserMedia/Web-Audio
+            // chain. That parallel path fails on Linux Electron builds
+            // (Chromium denies `media` for the localhost-served
+            // renderer with no permission handler set) and duplicates
+            // work the engine is already doing every frame.
+            //
+            // The bridge also feature-detects each IPC method
+            // separately, so an older slopsmith-desktop that ships
+            // only `getPitchDetection` will still get the monophonic
+            // path (chord scoring just gets skipped via the existing
+            // `matchNotes(null)` guard, same as before this version).
             //
             // Borrower mode (caller supplied a stream or AudioContext)
             // skips this branch — those callers own the lifecycle and
@@ -1252,6 +1268,39 @@ function createNoteDetector(options = {}) {
                     accumBuffer = new Float32Array(0);
                     pendingBuffer = null;
 
+                    // Cache the engine sample rate for chord scoring's
+                    // FFT bin→Hz math. processFrame() and matchNotes()
+                    // historically read it from `audioCtx.sampleRate`,
+                    // but on the bridge there is no audioCtx — the
+                    // engine's rate is what we need. Falls back to
+                    // 48000 if the desktop is an older build without
+                    // the getSampleRate IPC.
+                    if (typeof desktop.audio.getSampleRate === 'function') {
+                        try {
+                            const sr = await desktop.audio.getSampleRate();
+                            if (Number.isFinite(sr) && sr > 0) bridgeSampleRate = sr;
+                        } catch (_) { /* keep the 48000 default */ }
+                    }
+
+                    // Subscribe to raw input frames from the engine so
+                    // matchNotes() can run its polyphonic chord
+                    // branch. The push stream is feature-detected; on
+                    // an older desktop without onInputFrame we leave
+                    // pendingBuffer null and matchNotes(null) skips
+                    // chord scoring as it did before.
+                    if (typeof desktop.audio.onInputFrame === 'function') {
+                        try {
+                            bridgeFrameUnsubscribe = desktop.audio.onInputFrame((frame) => {
+                                if (!enabled || !usingDesktopBridge) return;
+                                if (!frame || !frame.samples) return;
+                                pendingBuffer = frame.samples;
+                            });
+                        } catch (e) {
+                            console.warn('[note_detect] onInputFrame subscribe failed:', e && e.message ? e.message : e);
+                            bridgeFrameUnsubscribe = null;
+                        }
+                    }
+
                     detectInterval = setInterval(async () => {
                         if (!enabled || processingFrame) return;
                         processingFrame = true;
@@ -1269,12 +1318,14 @@ function createNoteDetector(options = {}) {
                                 detectedString = -1;
                                 detectedFret = -1;
                             }
-                            // matchNotes(null) → single-note path runs,
-                            // chord-scoring branch bails on the null
-                            // frameBuffer guard. Miss accounting in
-                            // checkMisses() is independent of this and
-                            // keeps working.
-                            matchNotes(null);
+                            // Feed the latest pushed frame to matchNotes
+                            // for chord scoring. When onInputFrame is
+                            // unavailable (older desktop) this stays
+                            // null and the chord branch in matchNotes
+                            // skips itself; single-note path runs the
+                            // same way it did before. checkMisses() is
+                            // independent and keeps working regardless.
+                            matchNotes(pendingBuffer);
                         } catch (e) {
                             console.warn('[note_detect] bridge poll failed:', e && e.message ? e.message : e);
                         } finally {
@@ -1415,7 +1466,12 @@ function createNoteDetector(options = {}) {
         pendingBuffer = null;
         // Bridge path doesn't own the JUCE engine — leave audio
         // running for the Audio Plugins panel / other features. Just
-        // clear the flag so a subsequent enable starts fresh.
+        // tear down the IPC subscription and clear the flag so a
+        // subsequent enable starts fresh.
+        if (bridgeFrameUnsubscribe) {
+            try { bridgeFrameUnsubscribe(); } catch (_) { /* defensive */ }
+            bridgeFrameUnsubscribe = null;
+        }
         usingDesktopBridge = false;
         // Disconnect the full node chain in reverse-connect order.
         // Critical in borrower mode (external audioCtx): we leave the
@@ -1648,7 +1704,10 @@ function createNoteDetector(options = {}) {
         // guard a CREPE inference in flight during song switch would
         // score against the old session's chart.
         const gen = sessionGen;
-        const sr = audioCtx ? audioCtx.sampleRate : 48000;
+        // On the desktop bridge there is no audioCtx; use the engine
+        // sample rate cached at startAudio() time instead. Browser
+        // path keeps reading audioCtx.sampleRate.
+        const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
         switch (detectionMethod) {
             case 'crepe':
                 if (_ndShared.model) {
@@ -1931,7 +1990,9 @@ function createNoteDetector(options = {}) {
                 const chordKey = `${group[0].t.toFixed(3)}_chord`;
                 if (noteResults.has(chordKey)) continue;
 
-                const sr = audioCtx ? audioCtx.sampleRate : 48000;
+                // Bridge path has no audioCtx — use the engine sample
+                // rate cached at startAudio() time.
+                const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
                 const chordResult = _ndScoreChord(
                     frameBuffer, sr,
                     group, currentArrangement, currentStringCount,

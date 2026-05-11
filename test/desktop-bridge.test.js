@@ -116,3 +116,76 @@ test('bridge path: browser environment (no window.slopsmithDesktop) still uses g
     assert.equal(typeof result, 'boolean');
     det.destroy();
 });
+
+test('bridge path: chord scoring wiring — subscribes to onInputFrame and caches sample rate', async () => {
+    // The slopsmith-desktop release that unblocks polyphonic chord
+    // scoring on Electron adds two preload APIs the plugin should
+    // consume: audio.onInputFrame (push stream of raw input frames)
+    // and audio.getSampleRate (engine rate for bin→Hz math). This
+    // test pins the wiring rather than the chord-scoring math — that
+    // accuracy is covered by chord-detection.test.js.
+    const calls = {
+        isAvailable: 0,
+        isAudioRunning: 0,
+        startAudio: 0,
+        getPitchDetection: 0,
+        getLevels: 0,
+        getSampleRate: 0,
+        onInputFrame: 0,
+        unsubscribe: 0,
+        getUserMedia: 0,
+    };
+    let capturedCallback = null;
+    const { createNoteDetector } = loadDetectionCore({
+        sandboxBeforeRun(sandbox) {
+            sandbox.navigator.mediaDevices.getUserMedia = () => {
+                calls.getUserMedia++;
+                return Promise.reject(new Error('getUserMedia should not be called when bridge is fully wired'));
+            };
+            sandbox.window.slopsmithDesktop = {
+                isDesktop: true,
+                platform: 'linux',
+                audio: {
+                    isAvailable: async () => { calls.isAvailable++; return true; },
+                    isAudioRunning: async () => { calls.isAudioRunning++; return true; },
+                    startAudio: async () => { calls.startAudio++; },
+                    getPitchDetection: async () => {
+                        calls.getPitchDetection++;
+                        return { midiNote: 60, confidence: 0.9, frequency: 261.63, cents: 0, noteName: 'C4' };
+                    },
+                    getLevels: async () => {
+                        calls.getLevels++;
+                        return { inputLevel: 0.0, inputPeak: 0.0, outputLevel: 0, outputPeak: 0 };
+                    },
+                    getSampleRate: async () => { calls.getSampleRate++; return 48000; },
+                    onInputFrame: (cb) => {
+                        calls.onInputFrame++;
+                        capturedCallback = cb;
+                        return () => { calls.unsubscribe++; };
+                    },
+                },
+            };
+        },
+    });
+
+    const det = createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    assert.equal(calls.getUserMedia, 0, 'getUserMedia must not be called when the bridge is fully wired');
+    assert.ok(calls.getSampleRate >= 1, 'getSampleRate should be queried once on the bridge path');
+    assert.equal(calls.onInputFrame, 1, 'onInputFrame should be subscribed exactly once');
+    assert.equal(typeof capturedCallback, 'function', 'onInputFrame callback should be a function');
+
+    // Fire a synthetic frame — the bridge stores it on pendingBuffer
+    // for the next detect tick. The tick itself uses setInterval which
+    // the loader stubs to a no-op, so we can't observe the call from
+    // here, but the listener must accept the payload without throwing.
+    assert.doesNotThrow(() => {
+        capturedCallback({ samples: new Float32Array(4096), seq: 1 });
+    });
+
+    det.destroy();
+    await flushPendingAsync();
+    assert.equal(calls.unsubscribe, 1, 'unsubscribe should be called when the detector tears down');
+});
