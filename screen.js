@@ -2723,6 +2723,18 @@ function createNoteDetector(options = {}) {
     function drawOverlay(ctx, W, H) {
         if (!enabled) return;
         if (!hw.project || !hw.fretX) return;
+        // This overlay positions everything with the 2D highway's
+        // projection (hw.project / hw.fretX). A custom renderer (3D
+        // highway, piano, …) draws its own scene with different
+        // geometry — and fires our draw hook on its 2D overlay layer —
+        // so these markers would land in meaningless places (the stray
+        // red miss X's complaint, slopsmith#254). Bail when a non-default
+        // renderer is active; that renderer owns the per-note feedback
+        // (the 3D highway lights the note mesh on hit/active and red-
+        // outlines + labels misses, via the bundle.getNoteState path).
+        // Our HUD / screen-flash are DOM, not canvas, so they're
+        // unaffected. Older cores without isDefaultRenderer → assume 2D.
+        if (hw.isDefaultRenderer && !hw.isDefaultRenderer()) return;
 
         const t = hw.getTime();
         const renderT = t + (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
