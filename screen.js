@@ -1819,12 +1819,16 @@ function createNoteDetector(options = {}) {
         const j = noteResults.get(key);
         if (!j) return null;  // not judged yet — render normally
 
-        // The plugin's view of "now" in chart-time terms — same basis
-        // checkMisses() / drawOverlay() use (highway time + A/V offset −
-        // detector latency compensation).
+        // Renderer clock for the visual age / TTL math — `getTime() +
+        // avOffset` is the same basis `drawOverlay()` uses for its slide-
+        // down miss markers and matches when the user *sees* the note
+        // cross the strike line. The `-latencyOffset` correction is for
+        // *audio* timing (correlating mic input to chart notes in
+        // matchNotes/checkMisses); applying it here would start the
+        // post-hit fade ~latencyOffset (default 80 ms) before the gem
+        // visually arrived, shortening the visible glow window.
         const songT = ((hw && hw.getTime) ? hw.getTime() : 0)
-            + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0)
-            - latencyOffset;
+            + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
 
         if (j.hit) {
             const sus = +note.sus || 0;
@@ -2804,11 +2808,14 @@ function createNoteDetector(options = {}) {
             }
 
             if (judgment.hit) {
-                // slopsmith#254 — when the active renderer lights the gem
-                // itself (it accepts a note-state provider), the green
-                // overlay ring is redundant; skip it. Older cores keep
-                // the ring as their only on-highway hit cue.
-                if (hw && hw.setNoteStateProvider) return;
+                // slopsmith#254 — when *our* provider is the one driving
+                // the gem lighting, the green overlay ring is redundant;
+                // skip it. But if the core supports the hook yet some
+                // other plugin owns the provider (we declined to stomp it
+                // in ensureDrawHook), the gem isn't lit by us — fall
+                // through to the ring so there's still on-highway hit
+                // feedback. Older cores (no getter) also keep the ring.
+                if (hw && hw.getNoteStateProvider && hw.getNoteStateProvider() === noteStateFor) return;
                 const fade = Math.max(0, 1 - age / Math.max(0.1, hitGlowDuration)) * scale;
                 if (fade <= 0) return;
                 ctx.save();
