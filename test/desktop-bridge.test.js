@@ -265,17 +265,18 @@ test('bridge path: chord scoring wiring — calls scoreChord IPC, never subscrib
 });
 
 test('bridge path: dedup guard — chord already recorded skips scoreChord on subsequent ticks', async () => {
-    // The matchNotes() chord branch guards against double-counting
-    // by checking `noteResults.has(chordKey)` both before AND after
-    // the awaited scoreChord IPC. The pre-await check covers the
-    // case where checkMisses() (or an earlier tick that hit) has
-    // already recorded the chord; the post-await check covers the
-    // race where checkMisses() fires while scoreChord is in flight.
-    // They share the same key-existence check, so a test of the
-    // pre-await dedup pins both halves of the guard. Drive two
-    // ticks with the same chord still in the timing window — the
-    // first records a hit, the second must short-circuit before
-    // issuing a second scoreChord IPC.
+    // The matchNotes() chord branch checks `noteResults.has(chordKey)`
+    // BEFORE issuing the scoreChord IPC. This test covers exactly
+    // that pre-await dedup: drive two ticks with the same chord still
+    // in the timing window — the first records a hit, the second
+    // must short-circuit before issuing a second scoreChord IPC.
+    //
+    // The post-await chord-key re-check uses the same predicate
+    // (`noteResults.has(chordKey)`) immediately after the awaited
+    // scoreChord returns, so it's structurally identical to the
+    // pre-await branch covered here. The other post-await branch —
+    // `!enabled || gen !== sessionGen` — is exercised by the
+    // separate destroy-mid-scoreChord test below.
     const calls = { scoreChord: 0, getPitchDetection: 0 };
     const intervalCallbacks = [];
     const { createNoteDetector } = loadDetectionCore({
@@ -416,19 +417,29 @@ test('bridge path: destroy mid-scoreChord does not throw and does not record a l
     await flushPendingAsync();
 
     let detectTick = null;
+    let inFlightTickPromise = null;
     for (const cb of intervalCallbacks) {
         const before = calls.getPitchDetection;
-        // Don't await — the detect callback's chord branch will
+        // Don't await yet — the detect callback's chord branch will
         // hang on the deferred scoreChord promise. Capture the
-        // tick promise so we can resolve it later.
-        cb();
+        // returned promise so any errors thrown from the in-flight
+        // tick (after scoreChord resolves) propagate to the test
+        // instead of becoming an unhandled rejection that node:test
+        // silently absorbs.
+        const p = cb();
         await flushPendingAsync();
         if (calls.getPitchDetection > before) {
             detectTick = cb;
+            inFlightTickPromise = p;
             break;
         }
+        // Non-detect interval (e.g. level meter) — drain its promise
+        // so we don't leak unhandled rejections from probe steps.
+        await p;
     }
     assert.equal(typeof detectTick, 'function');
+    assert.ok(inFlightTickPromise && typeof inFlightTickPromise.then === 'function',
+        'detect tick should return a promise we can observe');
     assert.equal(calls.scoreChord, 1, 'scoreChord should have been invoked once');
     assert.equal(typeof resolveScoreChord, 'function',
         'scoreChord should have created a deferred we can resolve');
@@ -437,12 +448,14 @@ test('bridge path: destroy mid-scoreChord does not throw and does not record a l
     det.destroy();
     await flushPendingAsync();
 
-    // Resolve the in-flight scoreChord — the post-await guard
-    // should bail out without throwing or recording a late hit.
-    await assert.doesNotReject(async () => {
-        resolveScoreChord();
-        await flushPendingAsync();
-    }, 'late scoreChord resolution must not throw after destroy');
+    // Resolve the in-flight scoreChord. The post-await guard
+    // (!enabled || gen !== sessionGen) should bail out cleanly
+    // — the awaited tick promise must resolve without throwing,
+    // and the destroyed instance must not record a late judgment.
+    resolveScoreChord();
+    await assert.doesNotReject(inFlightTickPromise,
+        'late scoreChord resolution must not throw after destroy');
+    await flushPendingAsync();
 });
 
 test('bridge path: downlevel desktop without scoreChord — chord branch silently skips, monophonic still works', async () => {
