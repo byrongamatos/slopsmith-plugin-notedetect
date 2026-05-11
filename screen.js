@@ -2005,6 +2005,7 @@ function createNoteDetector(options = {}) {
                             b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
                         })),
                     };
+                    const gen = sessionGen;
                     try {
                         chordResult = await bridgeDesktop.audio.scoreChord(ctx);
                     } catch (e) {
@@ -2012,6 +2013,19 @@ function createNoteDetector(options = {}) {
                         continue;
                     }
                     if (!chordResult) continue; // downlevel addon returned null
+                    // Re-validate after the await. The IPC round-trip
+                    // yields the event loop, so checkMisses() can fire
+                    // on its own interval and record a miss for this
+                    // chordKey (or a per-string key in `group`) while
+                    // we're waiting on the scorer. Without this guard
+                    // a late-arriving hit would double-count against
+                    // a miss already booked for the same chord timing.
+                    // Also bail out if the instance was disabled or
+                    // session-bumped mid-await (settings change /
+                    // device restart) — the scoreChord result is
+                    // against audio from before the change.
+                    if (!enabled || gen !== sessionGen) continue;
+                    if (noteResults.has(chordKey)) continue;
                 } else {
                     // Browser path needs the just-analysed buffer.
                     // Skip if no audio buffer was passed in (e.g.
