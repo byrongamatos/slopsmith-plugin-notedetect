@@ -117,16 +117,22 @@ test('bridge path: browser environment (no window.slopsmithDesktop) still uses g
     det.destroy();
 });
 
-test('bridge path: chord scoring wiring — uses scoreChord IPC, no raw-frame subscription', async () => {
+test('bridge path: chord scoring wiring — calls scoreChord IPC, never subscribes to onInputFrame', async () => {
     // The slopsmith-desktop release that unblocks polyphonic chord
     // scoring on Electron exposes audio.scoreChord — a request/reply
     // IPC that the native JUCE ChordScorer evaluates against the
-    // engine's internal input ring. No audio buffers cross IPC, so
-    // we also assert the bridge never subscribes to onInputFrame
-    // (the removed push-stream surface) and never calls getUserMedia.
-    // This test pins the wiring; chord-scoring accuracy is covered by
-    // chord-detection.test.js, which still runs the in-JS reference
-    // implementation that backs the browser path.
+    // engine's internal input ring. No audio buffers cross IPC.
+    // We pin three things here:
+    //  1. The bridge wins (no getUserMedia / Web-Audio fallback).
+    //  2. scoreChord is actually invoked when a chord falls inside
+    //     the timing tolerance window, with a request shape that
+    //     mirrors the chart-note metadata.
+    //  3. The removed onInputFrame push-stream surface is never
+    //     subscribed — the stub throws if called so a regression
+    //     resurfacing the streaming path would trip immediately.
+    // Chord-scoring accuracy itself is covered by chord-detection.
+    // test.js against the JS reference implementation that backs the
+    // browser path.
     const calls = {
         isAvailable: 0,
         isAudioRunning: 0,
@@ -135,14 +141,44 @@ test('bridge path: chord scoring wiring — uses scoreChord IPC, no raw-frame su
         getLevels: 0,
         getSampleRate: 0,
         scoreChord: 0,
+        onInputFrame: 0,
         getUserMedia: 0,
     };
+    const scoreChordRequests = [];
+    let capturedDetectTick = null;
     const { createNoteDetector } = loadDetectionCore({
         sandboxBeforeRun(sandbox) {
             sandbox.navigator.mediaDevices.getUserMedia = () => {
                 calls.getUserMedia++;
                 return Promise.reject(new Error('getUserMedia should not be called when bridge is fully wired'));
             };
+            // Capture the bridge's detect interval callback so the
+            // test can drive a single tick synchronously. The default
+            // sandbox stub returns 0 without storing the callback,
+            // which is fine for tests that only care about enable/
+            // disable lifecycle but blocks this one from observing
+            // scoreChord being called. startAudio() also schedules
+            // a separate level-meter interval after the detect one,
+            // so we capture only the first callback (the detect tick).
+            let intervalSeq = 0;
+            sandbox.setInterval = (cb) => {
+                intervalSeq += 1;
+                if (intervalSeq === 1 && typeof cb === 'function') {
+                    capturedDetectTick = cb;
+                }
+                return intervalSeq;
+            };
+            // Highway returns a single three-note chord at t=0 inside
+            // the default 100 ms timing-tolerance window, so the
+            // bridge's detect tick routes it through matchNotes()'s
+            // chord branch (group.length >= 2).
+            sandbox.highway.getChords = () => ([
+                { t: 0, notes: [
+                    { s: 0, f: 0 },
+                    { s: 1, f: 0 },
+                    { s: 2, f: 0 },
+                ]},
+            ]);
             sandbox.window.slopsmithDesktop = {
                 isDesktop: true,
                 platform: 'linux',
@@ -152,22 +188,34 @@ test('bridge path: chord scoring wiring — uses scoreChord IPC, no raw-frame su
                     startAudio: async () => { calls.startAudio++; },
                     getPitchDetection: async () => {
                         calls.getPitchDetection++;
-                        return { midiNote: 60, confidence: 0.9, frequency: 261.63, cents: 0, noteName: 'C4' };
+                        return { midiNote: -1, confidence: 0, frequency: -1, cents: 0, noteName: '' };
                     },
                     getLevels: async () => {
                         calls.getLevels++;
                         return { inputLevel: 0.0, inputPeak: 0.0, outputLevel: 0, outputPeak: 0 };
                     },
                     getSampleRate: async () => { calls.getSampleRate++; return 48000; },
-                    scoreChord: async (_ctx) => {
+                    scoreChord: async (ctx) => {
                         calls.scoreChord++;
+                        scoreChordRequests.push(ctx);
                         return {
                             score: 0,
                             hitStrings: 0,
-                            totalStrings: 0,
+                            totalStrings: ctx.notes.length,
                             isHit: false,
-                            results: [],
+                            results: ctx.notes.map(n => ({
+                                s: n.s, f: n.f, hit: false,
+                                bandEnergy: 0, centsDiff: null, centsError: null,
+                            })),
                         };
+                    },
+                    // Regression guard: the previous implementation
+                    // subscribed to this push stream. The new path
+                    // dispatches scoreChord on demand instead, so any
+                    // call here is a bug — throw loudly.
+                    onInputFrame: () => {
+                        calls.onInputFrame++;
+                        throw new Error('bridge should not subscribe to onInputFrame on the scoreChord path');
                     },
                 },
             };
@@ -180,6 +228,29 @@ test('bridge path: chord scoring wiring — uses scoreChord IPC, no raw-frame su
 
     assert.equal(calls.getUserMedia, 0, 'getUserMedia must not be called when the bridge is fully wired');
     assert.ok(calls.getSampleRate >= 1, 'getSampleRate should still be queried on the bridge path');
+    assert.equal(calls.onInputFrame, 0, 'onInputFrame must not be invoked on the scoreChord path');
+    assert.equal(typeof capturedDetectTick, 'function',
+        'bridge detect interval should register a callback we can drive');
+
+    // Drive one detect cycle and let the awaited IPC chain settle.
+    await capturedDetectTick();
+    await flushPendingAsync();
+
+    assert.equal(calls.scoreChord, 1, 'scoreChord should be invoked exactly once for the single chord tick');
+    assert.equal(calls.onInputFrame, 0, 'onInputFrame still not called after a chord tick');
+    const req = scoreChordRequests[0];
+    assert.ok(req && Array.isArray(req.notes), 'scoreChord request should carry a notes array');
+    assert.equal(req.notes.length, 3, 'request should mirror the 3-note chord');
+    // JSON round-trip neutralises the sandbox/test realm split that
+    // makes structural deepEqual flaky on objects constructed inside
+    // the vm context (different Object.prototype). The shape and
+    // values are what matter.
+    assert.equal(
+        JSON.stringify(req.notes.map(n => ({ s: n.s, f: n.f }))),
+        JSON.stringify([{ s: 0, f: 0 }, { s: 1, f: 0 }, { s: 2, f: 0 }]),
+        'request notes should preserve chord shape',
+    );
+    assert.ok(Array.isArray(req.offsets), 'request should include tuning offsets');
 
     det.destroy();
     await flushPendingAsync();

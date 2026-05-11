@@ -2020,11 +2020,14 @@ function createNoteDetector(options = {}) {
                     // we're waiting on the scorer. Without this guard
                     // a late-arriving hit would double-count against
                     // a miss already booked for the same chord timing.
-                    // Also bail out if the instance was disabled or
-                    // session-bumped mid-await (settings change /
-                    // device restart) — the scoreChord result is
-                    // against audio from before the change.
-                    if (!enabled || gen !== sessionGen) continue;
+                    // Bail out of the whole matchNotes() pass — not
+                    // just this group — when the instance was disabled
+                    // or session-bumped mid-await (settings change /
+                    // device restart), so we don't fire more
+                    // scoreChord IPCs for subsequent groups against
+                    // an invalid session. Per-chord doublebook just
+                    // skips this group; later groups are still valid.
+                    if (!enabled || gen !== sessionGen) return;
                     if (noteResults.has(chordKey)) continue;
                 } else {
                     // Browser path needs the just-analysed buffer.
