@@ -145,28 +145,23 @@ test('bridge path: chord scoring wiring — calls scoreChord IPC, never subscrib
         getUserMedia: 0,
     };
     const scoreChordRequests = [];
-    let capturedDetectTick = null;
+    const intervalCallbacks = [];
     const { createNoteDetector } = loadDetectionCore({
         sandboxBeforeRun(sandbox) {
             sandbox.navigator.mediaDevices.getUserMedia = () => {
                 calls.getUserMedia++;
                 return Promise.reject(new Error('getUserMedia should not be called when bridge is fully wired'));
             };
-            // Capture the bridge's detect interval callback so the
-            // test can drive a single tick synchronously. The default
-            // sandbox stub returns 0 without storing the callback,
-            // which is fine for tests that only care about enable/
-            // disable lifecycle but blocks this one from observing
-            // scoreChord being called. startAudio() also schedules
-            // a separate level-meter interval after the detect one,
-            // so we capture only the first callback (the detect tick).
-            let intervalSeq = 0;
+            // Capture every setInterval callback the plugin registers
+            // — the test will pick the detect tick out by behaviour
+            // below (the one that calls getPitchDetection / scoreChord
+            // on the bridge audio mock). Earlier revisions of this
+            // test hard-coded "first registration", which broke when
+            // startAudio()'s timer ordering shifted; behaviour-based
+            // probing is robust to refactors.
             sandbox.setInterval = (cb) => {
-                intervalSeq += 1;
-                if (intervalSeq === 1 && typeof cb === 'function') {
-                    capturedDetectTick = cb;
-                }
-                return intervalSeq;
+                if (typeof cb === 'function') intervalCallbacks.push(cb);
+                return intervalCallbacks.length;
             };
             // Highway returns a single three-note chord at t=0 inside
             // the default 100 ms timing-tolerance window, so the
@@ -229,12 +224,25 @@ test('bridge path: chord scoring wiring — calls scoreChord IPC, never subscrib
     assert.equal(calls.getUserMedia, 0, 'getUserMedia must not be called when the bridge is fully wired');
     assert.ok(calls.getSampleRate >= 1, 'getSampleRate should still be queried on the bridge path');
     assert.equal(calls.onInputFrame, 0, 'onInputFrame must not be invoked on the scoreChord path');
-    assert.equal(typeof capturedDetectTick, 'function',
-        'bridge detect interval should register a callback we can drive');
+    assert.ok(intervalCallbacks.length >= 1, 'startAudio should register at least one interval');
 
-    // Drive one detect cycle and let the awaited IPC chain settle.
-    await capturedDetectTick();
-    await flushPendingAsync();
+    // Pick the detect tick by behaviour: invoke each captured
+    // callback until one increments getPitchDetection. Robust to
+    // refactors that reorder intervals or add new ones. The probe
+    // itself drives one detect cycle, which is what the assertions
+    // below need anyway.
+    let detectTick = null;
+    for (const cb of intervalCallbacks) {
+        const before = calls.getPitchDetection;
+        await cb();
+        await flushPendingAsync();
+        if (calls.getPitchDetection > before) {
+            detectTick = cb;
+            break;
+        }
+    }
+    assert.equal(typeof detectTick, 'function',
+        'one of the registered intervals should drive getPitchDetection (the detect tick)');
 
     assert.equal(calls.scoreChord, 1, 'scoreChord should be invoked exactly once for the single chord tick');
     assert.equal(calls.onInputFrame, 0, 'onInputFrame still not called after a chord tick');
@@ -256,6 +264,187 @@ test('bridge path: chord scoring wiring — calls scoreChord IPC, never subscrib
     await flushPendingAsync();
 });
 
+test('bridge path: dedup guard — chord already recorded skips scoreChord on subsequent ticks', async () => {
+    // The matchNotes() chord branch guards against double-counting
+    // by checking `noteResults.has(chordKey)` both before AND after
+    // the awaited scoreChord IPC. The pre-await check covers the
+    // case where checkMisses() (or an earlier tick that hit) has
+    // already recorded the chord; the post-await check covers the
+    // race where checkMisses() fires while scoreChord is in flight.
+    // They share the same key-existence check, so a test of the
+    // pre-await dedup pins both halves of the guard. Drive two
+    // ticks with the same chord still in the timing window — the
+    // first records a hit, the second must short-circuit before
+    // issuing a second scoreChord IPC.
+    const calls = { scoreChord: 0, getPitchDetection: 0 };
+    const intervalCallbacks = [];
+    const { createNoteDetector } = loadDetectionCore({
+        sandboxBeforeRun(sandbox) {
+            sandbox.navigator.mediaDevices.getUserMedia = () =>
+                Promise.reject(new Error('bridge should win'));
+            sandbox.setInterval = (cb) => {
+                if (typeof cb === 'function') intervalCallbacks.push(cb);
+                return intervalCallbacks.length;
+            };
+            sandbox.highway.getChords = () => ([
+                { t: 0, notes: [
+                    { s: 0, f: 0 },
+                    { s: 1, f: 0 },
+                    { s: 2, f: 0 },
+                ]},
+            ]);
+            sandbox.window.slopsmithDesktop = {
+                isDesktop: true,
+                platform: 'linux',
+                audio: {
+                    isAvailable: async () => true,
+                    isAudioRunning: async () => true,
+                    startAudio: async () => {},
+                    getPitchDetection: async () => {
+                        calls.getPitchDetection++;
+                        return { midiNote: -1, confidence: 0, frequency: -1, cents: 0, noteName: '' };
+                    },
+                    getLevels: async () => ({ inputLevel: 0, inputPeak: 0, outputLevel: 0, outputPeak: 0 }),
+                    getSampleRate: async () => 48000,
+                    // Score as a clean hit so the first tick records
+                    // the chord-level key and the second tick's
+                    // pre-await dedup check trips.
+                    scoreChord: async (ctx) => {
+                        calls.scoreChord++;
+                        return {
+                            score: 1,
+                            hitStrings: ctx.notes.length,
+                            totalStrings: ctx.notes.length,
+                            isHit: true,
+                            results: ctx.notes.map(n => ({
+                                s: n.s, f: n.f, hit: true,
+                                bandEnergy: 1, centsDiff: 0, centsError: 0,
+                            })),
+                        };
+                    },
+                },
+            };
+        },
+    });
+
+    const det = createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    let detectTick = null;
+    for (const cb of intervalCallbacks) {
+        const before = calls.getPitchDetection;
+        await cb();
+        await flushPendingAsync();
+        if (calls.getPitchDetection > before) {
+            detectTick = cb;
+            break;
+        }
+    }
+    assert.equal(typeof detectTick, 'function');
+    assert.equal(calls.scoreChord, 1, 'first tick should score the chord exactly once');
+
+    // Second tick against the same chord (still inside the default
+    // timing-tolerance window at t=0). The chord-key dedup check
+    // must short-circuit before issuing a second scoreChord IPC.
+    await detectTick();
+    await flushPendingAsync();
+    assert.equal(calls.scoreChord, 1,
+        'second tick must not re-score a chord that has already been recorded');
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
+test('bridge path: destroy mid-scoreChord does not throw and does not record a late judgment', async () => {
+    // Race guard: scoreChord is async, so checkMisses() / destroy()
+    // can fire while the await is pending. The post-await guard
+    // (`if (!enabled || gen !== sessionGen) return;`) must bail out
+    // cleanly when the instance was torn down mid-await. This test
+    // pins that behaviour by holding scoreChord open with a deferred
+    // promise, destroying the detector, then resolving — and
+    // asserting nothing throws on the now-stale resolution.
+    const calls = { scoreChord: 0, getPitchDetection: 0 };
+    const intervalCallbacks = [];
+    let resolveScoreChord = null;
+    const { createNoteDetector } = loadDetectionCore({
+        sandboxBeforeRun(sandbox) {
+            sandbox.navigator.mediaDevices.getUserMedia = () =>
+                Promise.reject(new Error('bridge should win'));
+            sandbox.setInterval = (cb) => {
+                if (typeof cb === 'function') intervalCallbacks.push(cb);
+                return intervalCallbacks.length;
+            };
+            sandbox.highway.getChords = () => ([
+                { t: 0, notes: [{ s: 0, f: 0 }, { s: 1, f: 0 }] },
+            ]);
+            sandbox.window.slopsmithDesktop = {
+                isDesktop: true,
+                platform: 'linux',
+                audio: {
+                    isAvailable: async () => true,
+                    isAudioRunning: async () => true,
+                    startAudio: async () => {},
+                    getPitchDetection: async () => {
+                        calls.getPitchDetection++;
+                        return { midiNote: -1, confidence: 0, frequency: -1, cents: 0, noteName: '' };
+                    },
+                    getLevels: async () => ({ inputLevel: 0, inputPeak: 0, outputLevel: 0, outputPeak: 0 }),
+                    getSampleRate: async () => 48000,
+                    scoreChord: (ctx) => {
+                        calls.scoreChord++;
+                        return new Promise((resolve) => {
+                            resolveScoreChord = () => resolve({
+                                score: 1,
+                                hitStrings: ctx.notes.length,
+                                totalStrings: ctx.notes.length,
+                                isHit: true,
+                                results: ctx.notes.map(n => ({
+                                    s: n.s, f: n.f, hit: true,
+                                    bandEnergy: 1, centsDiff: 0, centsError: 0,
+                                })),
+                            });
+                        });
+                    },
+                },
+            };
+        },
+    });
+
+    const det = createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    let detectTick = null;
+    for (const cb of intervalCallbacks) {
+        const before = calls.getPitchDetection;
+        // Don't await — the detect callback's chord branch will
+        // hang on the deferred scoreChord promise. Capture the
+        // tick promise so we can resolve it later.
+        cb();
+        await flushPendingAsync();
+        if (calls.getPitchDetection > before) {
+            detectTick = cb;
+            break;
+        }
+    }
+    assert.equal(typeof detectTick, 'function');
+    assert.equal(calls.scoreChord, 1, 'scoreChord should have been invoked once');
+    assert.equal(typeof resolveScoreChord, 'function',
+        'scoreChord should have created a deferred we can resolve');
+
+    // Destroy mid-await. enabled flips to false and sessionGen bumps.
+    det.destroy();
+    await flushPendingAsync();
+
+    // Resolve the in-flight scoreChord — the post-await guard
+    // should bail out without throwing or recording a late hit.
+    await assert.doesNotReject(async () => {
+        resolveScoreChord();
+        await flushPendingAsync();
+    }, 'late scoreChord resolution must not throw after destroy');
+});
+
 test('bridge path: downlevel desktop without scoreChord — chord branch silently skips, monophonic still works', async () => {
     // Compatibility guard: an older slopsmith-desktop build can
     // expose getPitchDetection (monophonic path) without yet shipping
@@ -269,20 +458,16 @@ test('bridge path: downlevel desktop without scoreChord — chord branch silentl
         getSampleRate: 0,
         getUserMedia: 0,
     };
-    let capturedDetectTick = null;
+    const intervalCallbacks = [];
     const { createNoteDetector } = loadDetectionCore({
         sandboxBeforeRun(sandbox) {
             sandbox.navigator.mediaDevices.getUserMedia = () => {
                 calls.getUserMedia++;
                 return Promise.reject(new Error('getUserMedia should not be called on the downlevel bridge path'));
             };
-            let intervalSeq = 0;
             sandbox.setInterval = (cb) => {
-                intervalSeq += 1;
-                if (intervalSeq === 1 && typeof cb === 'function') {
-                    capturedDetectTick = cb;
-                }
-                return intervalSeq;
+                if (typeof cb === 'function') intervalCallbacks.push(cb);
+                return intervalCallbacks.length;
             };
             // Same 3-note chord at t=0 as the happy-path test.
             sandbox.highway.getChords = () => ([
@@ -319,16 +504,19 @@ test('bridge path: downlevel desktop without scoreChord — chord branch silentl
     await flushPendingAsync();
 
     assert.equal(calls.getUserMedia, 0, 'downlevel bridge should still take the bridge path, not fall back to getUserMedia');
-    assert.equal(typeof capturedDetectTick, 'function', 'bridge detect interval should still register');
+    assert.ok(intervalCallbacks.length >= 1, 'startAudio should register at least one interval');
 
-    // Drive a chord tick. The chord branch must short-circuit (no
-    // scoreChord to call) without throwing. The single-note path is
-    // also a no-op (getPitchDetection returns midi=-1), so the tick
-    // completes cleanly and the test simply asserts no exception
-    // propagated out of the async call.
+    // Pick the detect tick by behaviour and drive it. The chord
+    // branch must short-circuit (no scoreChord function to call)
+    // without throwing. Test asserts no exception propagated out of
+    // the async call chain.
     await assert.doesNotReject(async () => {
-        await capturedDetectTick();
-        await flushPendingAsync();
+        for (const cb of intervalCallbacks) {
+            const before = calls.getPitchDetection;
+            await cb();
+            await flushPendingAsync();
+            if (calls.getPitchDetection > before) break;
+        }
     }, 'downlevel chord tick must not throw');
 
     det.destroy();

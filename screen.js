@@ -2110,6 +2110,24 @@ function createNoteDetector(options = {}) {
                 // lenient chord hits where some strings rang and some
                 // didn't.
                 recordJudgment(chordKey, chordJudgment, { count: true, emit: true });
+                // Build an (s,f)-keyed lookup so we don't rely on
+                // `chordResult.results[i]` being positionally aligned
+                // with `group[i]`. The browser `_ndScoreChord`
+                // preserves that ordering by construction, and the
+                // native ChordScorer does too — but treating the
+                // result as a positional-only array makes
+                // per-string gem colouring silently wrong if any
+                // future IPC implementation reorders entries. The
+                // lookup is O(N) per chord (N ≤ 8), so the
+                // defensiveness is essentially free.
+                const stringResByKey = new Map();
+                if (Array.isArray(chordResult.results)) {
+                    for (const r of chordResult.results) {
+                        if (r && typeof r.s === 'number' && typeof r.f === 'number') {
+                            stringResByKey.set(`${r.s}_${r.f}`, r);
+                        }
+                    }
+                }
                 for (let i = 0; i < group.length; i++) {
                     const cn = group[i];
                     const key = noteKey(cn, cn.t);
@@ -2125,7 +2143,7 @@ function createNoteDetector(options = {}) {
                         noteResults.set(key, makeMissJudgment(cn, cn.t, t, stringExpectedMidi));
                         continue;
                     }
-                    const stringRes = chordResult.results[i];
+                    const stringRes = stringResByKey.get(`${cn.s}_${cn.f}`);
                     const stringHit = stringRes && stringRes.hit;
                     const stringExpectedMidi = _ndMidiFromStringFret(
                         cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
