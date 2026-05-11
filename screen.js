@@ -1006,6 +1006,11 @@ function createNoteDetector(options = {}) {
     let pitchHitThreshold = 20;
     let showTimingErrors = true;
     let showPitchErrors = true;
+    // slopsmith#254 — the full-screen green/red edge flash on hit/miss.
+    // Off by default now that the highway renderer lights the note gem
+    // itself (and sizzles it); users who want the peripheral cue back can
+    // re-enable it in the gear popover.
+    let edgeFlashEnabled = false;
     let missMarkerDuration = 2.0;
     let hitGlowDuration = 0.5;
     let inputGain = 1.0;
@@ -1039,6 +1044,7 @@ function createNoteDetector(options = {}) {
             if (s.pitchHitThreshold !== undefined) pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, s.pitchHitThreshold));
             if (s.showTimingErrors !== undefined) showTimingErrors = !!s.showTimingErrors;
             if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
+            if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
             if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
             if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
             if (s.inputGain !== undefined) inputGain = s.inputGain;
@@ -1230,6 +1236,7 @@ function createNoteDetector(options = {}) {
                 pitchHitThreshold,
                 showTimingErrors,
                 showPitchErrors,
+                edgeFlash: edgeFlashEnabled,
                 missMarkerDuration,
                 hitGlowDuration,
                 inputGain,
@@ -2427,10 +2434,17 @@ function createNoteDetector(options = {}) {
                 <input type="checkbox" class="nd-show-timing accent-green-400" ${showTimingErrors ? 'checked' : ''}>
                 Show early/late labels
             </label>
-            <label class="flex items-center gap-2 text-gray-400 text-xs mb-3">
+            <label class="flex items-center gap-2 text-gray-400 text-xs mb-2">
                 <input type="checkbox" class="nd-show-pitch accent-green-400" ${showPitchErrors ? 'checked' : ''}>
                 Show sharp/flat labels
             </label>
+            <label class="flex items-center gap-2 text-gray-400 text-xs mb-1">
+                <input type="checkbox" class="nd-edge-flash accent-green-400" ${edgeFlashEnabled ? 'checked' : ''}>
+                Screen-edge flash on hit/miss
+            </label>
+            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+                Off by default — the highway now lights up the note itself on a hit. Turn on for the old full-screen green/red edge flash.
+            </div>
 
             <label class="block text-gray-400 text-xs mb-1">Miss Marker Duration: <span class="nd-miss-duration-val">${missMarkerDuration.toFixed(1)}</span>s</label>
             <input type="range" min="5" max="50" value="${Math.round(missMarkerDuration * 10)}"
@@ -2505,6 +2519,15 @@ function createNoteDetector(options = {}) {
         };
         panel.querySelector('.nd-show-pitch').onchange = (e) => {
             showPitchErrors = !!e.target.checked;
+            saveSettings();
+        };
+        panel.querySelector('.nd-edge-flash').onchange = (e) => {
+            edgeFlashEnabled = !!e.target.checked;
+            if (!edgeFlashEnabled) {
+                // Clear any flash that's mid-fade so it doesn't linger.
+                const fe = instanceRoot.querySelector('.nd-flash-overlay');
+                if (fe) fe.style.borderColor = 'transparent';
+            }
             saveSettings();
         };
         panel.querySelector('.nd-miss-duration-slider').oninput = (e) => {
@@ -2701,6 +2724,10 @@ function createNoteDetector(options = {}) {
             // session (~60 min of play at ~20 hits/min was previously
             // accumulating ~1200 stale entries before disable ran).
             const spawnFlash = (color) => {
+                // slopsmith#254 — off by default now that the highway
+                // renderer lights the note itself; opt back in via the
+                // "Screen-edge flash on hit/miss" toggle.
+                if (!edgeFlashEnabled) return;
                 flashEl.style.borderColor = color;
                 const tid = setTimeout(() => {
                     if (flashEl) flashEl.style.borderColor = 'transparent';

@@ -47,6 +47,7 @@ Click the gear icon when detection is active to access:
 - **Pitch Tolerance** — outer pitch window used to correlate an attempt to a chart note
 - **Clean Timing / Clean Pitch** — stricter thresholds for a clean hit; attempts inside the outer window but outside these thresholds become EARLY/LATE/SHARP/FLAT diagnostic misses
 - **Timing/Pitch Labels** — toggles for diagnostic miss labels on the highway
+- **Screen-edge flash on hit/miss** — the full-screen green/red border pulse. **Off by default** since the highway now lights up the note itself on a hit (slopsmith#254); tick it for the old peripheral cue
 - **Miss Marker Duration** — how long failed-note markers remain visible below the now-line
 - **Input Gain** — amplify weak signals
 - **Chord Leniency** — fraction of a chord's strings that must ring for the chord to count as a hit (default 60%, range 25–100%)
