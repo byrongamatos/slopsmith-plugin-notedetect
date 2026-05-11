@@ -1219,7 +1219,13 @@ function createNoteDetector(options = {}) {
         // and leaving it across enable/disable cycles is harmless; it's
         // only cleared in destroy(). Per-instance hw (splitscreen panels
         // each have their own createHighway()), so no cross-panel clash.
-        if (h && h.setNoteStateProvider) h.setNoteStateProvider(noteStateFor);
+        // The core API is last-wins; we still avoid stomping a provider
+        // some other plugin registered first (we'd be re-registering our
+        // own `noteStateFor` across a disable→enable, which is a no-op).
+        if (h && h.setNoteStateProvider) {
+            const existing = (typeof h.getNoteStateProvider === 'function') ? h.getNoteStateProvider() : null;
+            if (existing == null || existing === noteStateFor) h.setNoteStateProvider(noteStateFor);
+        }
     }
 
     // ── Settings persistence (only the default singleton writes) ──────
@@ -3438,11 +3444,14 @@ function createNoteDetector(options = {}) {
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
         try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
-        // Clear our note-state provider — but only if it's still ours
-        // (don't stomp a provider some other plugin registered later).
+        // Clear our note-state provider — but only when we can positively
+        // verify it's still ours (don't stomp a provider some other plugin
+        // registered later, and don't clear blindly if the core lacks the
+        // getter to confirm ownership).
         try {
             if (hw && hw.setNoteStateProvider
-                && (!hw.getNoteStateProvider || hw.getNoteStateProvider() === noteStateFor)) {
+                && typeof hw.getNoteStateProvider === 'function'
+                && hw.getNoteStateProvider() === noteStateFor) {
                 hw.setNoteStateProvider(null);
             }
         } catch (e) {}

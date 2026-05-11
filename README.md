@@ -16,10 +16,10 @@ git clone https://github.com/byrongamatos/slopsmith-plugin-notedetect.git note_d
 2. Browser requests microphone/line-in access
 3. Audio input is analyzed in real-time for pitch (YIN or CREPE)
 4. Detected pitch is compared against expected notes within a timing window
-5. The note's **gem lights up brightly** on the highway when you hit it cleanly — and a sustained note keeps glowing for as long as you keep playing it on-pitch; a miss gets a brief red wash plus a slide-down marker below the now-line
+5. The note's **gem lights up brightly** on the highway when you hit it cleanly — and a sustained note keeps glowing for as long as you keep playing it on-pitch; a miss is flagged on the note too
 6. Running accuracy and streak shown in the HUD
 
-> Step 5 needs a Slopsmith core with the note-state hook (`highway.setNoteStateProvider`, slopsmith#254 — honored by the bundled 2D and 3D highways). On older cores the plugin falls back to drawing a green hit ring / red miss marker overlay near the note instead. Other renderers can opt in via `bundle.getNoteState`.
+> **How step 5 renders depends on the active highway renderer.** The plugin publishes a per-note judgment via Slopsmith core's `highway.setNoteStateProvider` hook (slopsmith#254 — honored by the bundled 2D and 3D highways; other renderers can read the same data from the core renderer `bundle`'s `getNoteState(note, chartTime)` method). On the **default 2D highway** the plugin *also* draws its own canvas overlay — the slide-down red ✕ miss markers below the now-line, the EARLY/LATE/SHARP/FLAT diagnostic labels, and the cyan "currently detected" indicator. On a **custom renderer** (e.g. the 3D highway) that canvas overlay is suppressed — the renderer owns the per-note feedback there (the 3D highway shows hit/active glow and a red miss outline + the diagnostic labels itself). The HUD (accuracy/streak), the end-of-song summary, and the optional screen-edge flash are DOM, not canvas, so they show under any renderer. On an **older core** without the hook, the plugin falls back to the 2D-canvas green hit ring / red miss marker overlay near the note regardless of renderer.
 
 ## Audio Input Channel Selection
 
