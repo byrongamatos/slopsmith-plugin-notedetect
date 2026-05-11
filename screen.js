@@ -99,13 +99,18 @@
 // ROUTING IN matchNotes():
 //   Candidate notes (from the chart's timing window) are now bucketed by
 //   timestamp. A bucket with 1 note goes through the existing MIDI comparison
-//   against the YIN/HPS/CREPE result, unchanged. A bucket with ≥2 notes goes
-//   through _ndScoreChord using `pendingBuffer` — the same accumulated audio
-//   buffer that was handed to processFrame on the current tick. Each string's
-//   individual result is stored in noteResults so the draw overlay can colour
-//   fret gems per-note. The chord hit/miss is counted as a single judgment
-//   and fires a notedetect:hit event with { chord: true, hitStrings,
-//   totalStrings, score } instead of the usual { note, expectedMidi }.
+//   against the YIN/HPS/CREPE result, unchanged. A bucket with ≥2 notes runs
+//   polyphonic chord scoring. The browser path calls _ndScoreChord on the
+//   accumulated `pendingBuffer` (same audio just analysed for pitch). The
+//   slopsmith-desktop bridge path dispatches the chord context over the
+//   `audio:scoreChord` IPC, where the native JUCE ChordScorer reads from
+//   the engine's own input ring — no audio buffer crosses IPC. Both paths
+//   return the same { score, hitStrings, totalStrings, isHit, results[] }
+//   shape. Each string's individual result is stored in noteResults so the
+//   draw overlay can colour fret gems per-note. The chord hit/miss is
+//   counted as a single judgment and fires a notedetect:hit event with
+//   { chord: true, hitStrings, totalStrings, score } instead of the usual
+//   { note, expectedMidi }.
 //
 // ── CHANGE 4: Technique-aware thresholds ─────────────────────────────────
 //
@@ -1151,17 +1156,22 @@ function createNoteDetector(options = {}) {
     // doesn't need its own branch on this flag.
     let usingDesktopBridge = false;
     // Cached engine sample rate for the bridge path. There's no
-    // audioCtx on this branch, so processFrame() / matchNotes()
-    // chord scoring can't read it from there — read it once at
-    // startAudio() time and consult this everywhere a sampleRate is
-    // needed. The engine rate is fixed for a session; if the user
+    // audioCtx on this branch so any code that needs a sampleRate
+    // reads it from here instead. Note that chord scoring on the
+    // bridge does NOT consult this value — audio.scoreChord runs
+    // inside the engine and reads the rate natively. The cache is
+    // kept around for the monophonic detection helpers and any
+    // future bridge-side consumer that still needs the renderer
+    // view of the rate. Browser path uses audioCtx.sampleRate
+    // directly. The engine rate is fixed for a session; if the user
     // changes audio device the detector restarts via the
     // restartAudio chain and refreshes this value.
     let bridgeSampleRate = 48000;
-    // Cleanup closure returned by `desktop.audio.onInputFrame(...)`.
-    // Called from stopAudio() to tear down the IPC subscription
-    // when the detector disables.
-    let bridgeFrameUnsubscribe = null;
+    // Cached `window.slopsmithDesktop` reference captured at
+    // startAudio() when the bridge path is active, so matchNotes()'s
+    // chord branch can dispatch `audio.scoreChord(ctx)` without
+    // re-resolving from window on every tick. Cleared by stopAudio().
+    let bridgeDesktop = null;
 
     // Visual-feedback tracking
     let lastHitCount = 0;
@@ -1223,18 +1233,20 @@ function createNoteDetector(options = {}) {
             // the audio device — see src/main/audio-bridge.ts in
             // slopsmith-desktop. Drive monophonic detection from its
             // `audio:getPitchDetection` IPC and polyphonic chord
-            // scoring from its `audio.onInputFrame` push stream,
-            // instead of opening a parallel getUserMedia/Web-Audio
-            // chain. That parallel path fails on Linux Electron builds
-            // (Chromium denies `media` for the localhost-served
-            // renderer with no permission handler set) and duplicates
-            // work the engine is already doing every frame.
+            // scoring from its `audio:scoreChord` IPC (native
+            // ChordScorer + lock-free input ring), instead of opening
+            // a parallel getUserMedia/Web-Audio chain. That parallel
+            // path fails on Linux Electron builds (Chromium denies
+            // `media` for the localhost-served renderer with no
+            // permission handler set) and duplicates work the engine
+            // is already doing every frame.
             //
-            // The bridge also feature-detects each IPC method
-            // separately, so an older slopsmith-desktop that ships
-            // only `getPitchDetection` will still get the monophonic
-            // path (chord scoring just gets skipped via the existing
-            // `matchNotes(null)` guard, same as before this version).
+            // The bridge feature-detects each IPC method separately,
+            // so an older slopsmith-desktop without scoreChord still
+            // gets the monophonic path; chord scoring is skipped
+            // (the chord branch in matchNotes() short-circuits when
+            // the IPC is missing, same as the pre-bridge browser
+            // path's no-buffer guard).
             //
             // Borrower mode (caller supplied a stream or AudioContext)
             // skips this branch — those callers own the lifecycle and
@@ -1265,43 +1277,23 @@ function createNoteDetector(options = {}) {
                     } catch (_) { /* engine surfaces its own errors */ }
 
                     usingDesktopBridge = true;
+                    bridgeDesktop = desktop;
                     accumBuffer = new Float32Array(0);
-                    pendingBuffer = null;
 
-                    // Cache the engine sample rate for chord scoring's
-                    // FFT bin→Hz math. processFrame() and matchNotes()
-                    // historically read it from `audioCtx.sampleRate`,
-                    // but on the bridge there is no audioCtx — the
-                    // engine's rate is what we need. Reset to the
-                    // 48000 default first so a transient throw or a
-                    // stale cached rate from a previous session can't
-                    // leak into chord scoring's bin→Hz math after a
-                    // device-change-driven restart.
+                    // Cache the engine sample rate for any consumer
+                    // that needs the bridge-side rate (the chord
+                    // branch in matchNotes() doesn't — it dispatches
+                    // through audio:scoreChord which reads the rate
+                    // inside the engine). Reset to the 48000 default
+                    // first so a transient throw or stale cached
+                    // rate from a previous session can't leak in
+                    // after a device-change-driven restart.
                     bridgeSampleRate = 48000;
                     if (typeof desktop.audio.getSampleRate === 'function') {
                         try {
                             const sr = await desktop.audio.getSampleRate();
                             if (Number.isFinite(sr) && sr > 0) bridgeSampleRate = sr;
                         } catch (_) { /* keep the 48000 default */ }
-                    }
-
-                    // Subscribe to raw input frames from the engine so
-                    // matchNotes() can run its polyphonic chord
-                    // branch. The push stream is feature-detected; on
-                    // an older desktop without onInputFrame we leave
-                    // pendingBuffer null and matchNotes(null) skips
-                    // chord scoring as it did before.
-                    if (typeof desktop.audio.onInputFrame === 'function') {
-                        try {
-                            bridgeFrameUnsubscribe = desktop.audio.onInputFrame((frame) => {
-                                if (!enabled || !usingDesktopBridge) return;
-                                if (!frame || !frame.samples) return;
-                                pendingBuffer = frame.samples;
-                            });
-                        } catch (e) {
-                            console.warn('[note_detect] onInputFrame subscribe failed:', e && e.message ? e.message : e);
-                            bridgeFrameUnsubscribe = null;
-                        }
                     }
 
                     detectInterval = setInterval(async () => {
@@ -1321,25 +1313,17 @@ function createNoteDetector(options = {}) {
                                 detectedString = -1;
                                 detectedFret = -1;
                             }
-                            // Feed the latest pushed frame to
-                            // matchNotes for chord scoring, then
-                            // null it so a subsequent tick with no
-                            // new frame in flight doesn't rescore
-                            // the same audio. Without this, a 50ms
-                            // tick whose pushed-frame failed to
-                            // arrive (engine stall, IPC backlog)
-                            // would replay the previous frame and
-                            // could score later chart chords against
-                            // old audio. When onInputFrame is
-                            // unavailable (older desktop) the snapshot
-                            // is null and the chord branch in
-                            // matchNotes skips itself; single-note
-                            // path runs the same way it did before.
-                            // checkMisses() is independent and keeps
-                            // working regardless.
-                            const frame = pendingBuffer;
-                            pendingBuffer = null;
-                            matchNotes(frame);
+                            // The chord branch in matchNotes() now
+                            // dispatches through audio:scoreChord IPC
+                            // when usingDesktopBridge is set, so we
+                            // no longer need to thread a raw audio
+                            // buffer here — the engine reads from its
+                            // own input ring inside scoreChord. Pass
+                            // null; the single-note path is gated on
+                            // detectedMidi >= 0 and skips itself
+                            // regardless, and checkMisses() is
+                            // independent.
+                            await matchNotes(null);
                         } catch (e) {
                             console.warn('[note_detect] bridge poll failed:', e && e.message ? e.message : e);
                         } finally {
@@ -1479,14 +1463,11 @@ function createNoteDetector(options = {}) {
         if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
         pendingBuffer = null;
         // Bridge path doesn't own the JUCE engine — leave audio
-        // running for the Audio Plugins panel / other features. Just
-        // tear down the IPC subscription and clear the flag so a
-        // subsequent enable starts fresh.
-        if (bridgeFrameUnsubscribe) {
-            try { bridgeFrameUnsubscribe(); } catch (_) { /* defensive */ }
-            bridgeFrameUnsubscribe = null;
-        }
+        // running for the Audio Plugins panel / other features. Drop
+        // the cached preload reference and the flag so a subsequent
+        // enable re-resolves window.slopsmithDesktop fresh.
         usingDesktopBridge = false;
+        bridgeDesktop = null;
         // Disconnect the full node chain in reverse-connect order.
         // Critical in borrower mode (external audioCtx): we leave the
         // caller's context open, and any node we don't disconnect
@@ -1778,7 +1759,7 @@ function createNoteDetector(options = {}) {
         // (see detectInterval) before processFrame is called, so reading
         // it later from matchNotes would either skip (null) or pick up a
         // newer buffer captured mid-processing.
-        matchNotes(buffer);
+        await matchNotes(buffer);
     }
 
     // ── Note matching ─────────────────────────────────────────────────
@@ -1903,7 +1884,7 @@ function createNoteDetector(options = {}) {
         if (emit) dispatchJudgment(judgment);
     }
 
-    function matchNotes(frameBuffer) {
+    async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
@@ -1995,25 +1976,81 @@ function createNoteDetector(options = {}) {
                 }
             } else {
                 // ── Chord path: constraint-based per-string band analysis ──
-                // Skip if no audio buffer was passed in (e.g. instance
-                // restart while a stale processFrame is unwinding).
-                if (!frameBuffer) continue;
-
                 // Chord-level resolved key. checkMisses() honours this so a
                 // failed chord becomes one miss event (not one per string).
                 const chordKey = `${group[0].t.toFixed(3)}_chord`;
                 if (noteResults.has(chordKey)) continue;
 
-                // Bridge path has no audioCtx — use the engine sample
-                // rate cached at startAudio() time.
-                const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
-                const chordResult = _ndScoreChord(
-                    frameBuffer, sr,
-                    group, currentArrangement, currentStringCount,
-                    tuningOffsets, capo,
-                    centsTolerance,   // pitch check per string
-                    chordHitRatio     // min fraction of strings required
-                );
+                // Two paths:
+                //  - Browser: call _ndScoreChord against the FFT
+                //    frame the ScriptProcessor just delivered.
+                //  - Desktop bridge: dispatch audio:scoreChord IPC —
+                //    the native ChordScorer reads from the engine's
+                //    own input ring, so no audio buffer crosses IPC.
+                //    Older slopsmith-desktop builds without the IPC
+                //    skip the chord-scoring step entirely (same as
+                //    the previous frameless guard).
+                let chordResult;
+                if (usingDesktopBridge) {
+                    if (!bridgeDesktop || !bridgeDesktop.audio
+                        || typeof bridgeDesktop.audio.scoreChord !== 'function') {
+                        continue;
+                    }
+                    const ctx = {
+                        arrangement: currentArrangement,
+                        stringCount: currentStringCount,
+                        offsets: tuningOffsets.slice(0, currentStringCount),
+                        capo,
+                        pitchCheckCents: centsTolerance,
+                        minHitRatio: chordHitRatio,
+                        notes: group.map(cn => ({
+                            s: cn.s, f: cn.f,
+                            ho: !!cn.ho, po: !!cn.po,
+                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                        })),
+                    };
+                    const gen = sessionGen;
+                    try {
+                        chordResult = await bridgeDesktop.audio.scoreChord(ctx);
+                    } catch (e) {
+                        console.warn('[note_detect] scoreChord IPC failed:', e && e.message ? e.message : e);
+                        continue;
+                    }
+                    if (!chordResult) continue; // downlevel addon returned null
+                    // Re-validate after the await. The IPC round-trip
+                    // yields the event loop, so checkMisses() can fire
+                    // on its own interval and record a miss for this
+                    // chordKey while we're waiting on the scorer.
+                    // (checkMisses always books the <t>_chord key
+                    // first and short-circuits per-string for chord
+                    // groups, so only the chord-level key needs
+                    // checking here.) Without this guard a late-
+                    // arriving hit would double-count against a miss
+                    // already booked for the same chord timing.
+                    // Bail out of the whole matchNotes() pass — not
+                    // just this group — when the instance was disabled
+                    // or session-bumped mid-await (settings change /
+                    // device restart), so we don't fire more
+                    // scoreChord IPCs for subsequent groups against
+                    // an invalid session. Per-chord doublebook just
+                    // skips this group; later groups are still valid.
+                    if (!enabled || gen !== sessionGen) return;
+                    if (noteResults.has(chordKey)) continue;
+                } else {
+                    // Browser path needs the just-analysed buffer.
+                    // Skip if no audio buffer was passed in (e.g.
+                    // instance restart while a stale processFrame is
+                    // unwinding).
+                    if (!frameBuffer) continue;
+                    const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+                    chordResult = _ndScoreChord(
+                        frameBuffer, sr,
+                        group, currentArrangement, currentStringCount,
+                        tuningOffsets, capo,
+                        centsTolerance,   // pitch check per string
+                        chordHitRatio     // min fraction of strings required
+                    );
+                }
 
                 // Update HUD chord display (latest reading, hit-or-miss)
                 lastChordScore = chordResult.score;
@@ -2073,6 +2110,24 @@ function createNoteDetector(options = {}) {
                 // lenient chord hits where some strings rang and some
                 // didn't.
                 recordJudgment(chordKey, chordJudgment, { count: true, emit: true });
+                // Build an (s,f)-keyed lookup so we don't rely on
+                // `chordResult.results[i]` being positionally aligned
+                // with `group[i]`. The browser `_ndScoreChord`
+                // preserves that ordering by construction, and the
+                // native ChordScorer does too — but treating the
+                // result as a positional-only array makes
+                // per-string gem colouring silently wrong if any
+                // future IPC implementation reorders entries. The
+                // lookup is O(N) per chord (N ≤ 8), so the
+                // defensiveness is essentially free.
+                const stringResByKey = new Map();
+                if (Array.isArray(chordResult.results)) {
+                    for (const r of chordResult.results) {
+                        if (r && typeof r.s === 'number' && typeof r.f === 'number') {
+                            stringResByKey.set(`${r.s}_${r.f}`, r);
+                        }
+                    }
+                }
                 for (let i = 0; i < group.length; i++) {
                     const cn = group[i];
                     const key = noteKey(cn, cn.t);
@@ -2088,7 +2143,7 @@ function createNoteDetector(options = {}) {
                         noteResults.set(key, makeMissJudgment(cn, cn.t, t, stringExpectedMidi));
                         continue;
                     }
-                    const stringRes = chordResult.results[i];
+                    const stringRes = stringResByKey.get(`${cn.s}_${cn.f}`);
                     const stringHit = stringRes && stringRes.hit;
                     const stringExpectedMidi = _ndMidiFromStringFret(
                         cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
