@@ -16,8 +16,10 @@ git clone https://github.com/byrongamatos/slopsmith-plugin-notedetect.git note_d
 2. Browser requests microphone/line-in access
 3. Audio input is analyzed in real-time for pitch (YIN or CREPE)
 4. Detected pitch is compared against expected notes within a timing window
-5. Notes glow green (hit) or red (miss) on the highway
+5. The note's **gem lights up brightly** on the highway when you hit it cleanly — and a sustained note keeps glowing for as long as you keep playing it on-pitch; a miss gets a brief red wash plus a slide-down marker below the now-line
 6. Running accuracy and streak shown in the HUD
+
+> Step 5 needs a Slopsmith core with the note-state hook (`highway.setNoteStateProvider`, slopsmith#254 — honored by the bundled 2D and 3D highways). On older cores the plugin falls back to drawing a green hit ring / red miss marker overlay near the note instead. Other renderers can opt in via `bundle.getNoteState`.
 
 ## Audio Input Channel Selection
 

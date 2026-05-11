@@ -1071,6 +1071,12 @@ function createNoteDetector(options = {}) {
     let sectionStats = [];   // [{name, hits, misses}]
     let currentSection = null;
     const noteResults = new Map(); // key -> judgment object
+    // slopsmith#254 — per-sustained-hit-note "still being held on-pitch"
+    // grace timestamps: key -> performance.now() ms before which the
+    // sustain still counts as actively held. Smooths the gap between
+    // ~30 fps pitch frames and 60 fps highway render so the lit-gem glow
+    // doesn't flicker. Pruned alongside noteResults; cleared on reset.
+    const _susActiveUntil = new Map();
 
     // Drill mode (slopsmith plugin-API: loop:restart event from #198).
     // Activates whenever slopsmith has an A-B loop set; each loop wrap
@@ -1200,6 +1206,14 @@ function createNoteDetector(options = {}) {
             h.addDrawHook(drawHookFn);
             drawHookRegistered = true;
         }
+        // slopsmith#254 — publish per-note judgments so the active
+        // renderer lights up the gem itself (and keeps a held sustain
+        // glowing) instead of us drawing an overlay ring near it. The
+        // provider returns null while disabled, so registering it once
+        // and leaving it across enable/disable cycles is harmless; it's
+        // only cleared in destroy(). Per-instance hw (splitscreen panels
+        // each have their own createHighway()), so no cross-panel clash.
+        if (h && h.setNoteStateProvider) h.setNoteStateProvider(noteStateFor);
     }
 
     // ── Settings persistence (only the default singleton writes) ──────
@@ -1765,6 +1779,85 @@ function createNoteDetector(options = {}) {
     // ── Note matching ─────────────────────────────────────────────────
     function noteKey(note, time) {
         return `${time.toFixed(3)}_${note.s}_${note.f}`;
+    }
+
+    // ── Renderer note-state provider (slopsmith#254) ──────────────────
+    // How long (s) a missed note's gem stays red-washed on the highway.
+    // Short on purpose — the slide-down miss marker (drawOverlay) carries
+    // the longer-lived feedback; the gem wash is just an instant cue.
+    const NOTE_MISS_GEM_TTL = 0.6;
+    // Grace (ms) after an on-pitch detection during which a sustained
+    // note still counts as actively held — smooths render-vs-pitch frame
+    // rate mismatch (see _susActiveUntil).
+    const NOTE_SUS_GRACE_MS = 250;
+
+    // Registered via highway.setNoteStateProvider(). The active renderer
+    // calls this per visible chart note / chord-note. Returns null (render
+    // normally), or { state, alpha } where state ∈ {'active','hit','miss'}:
+    //   'active' — sustained note still ringing AND currently on-pitch (full glow)
+    //   'hit'    — recently struck cleanly (glow fading over hitGlowDuration)
+    //   'miss'   — recently judged a miss (brief red wash)
+    // `note` is the chart note object; for chord notes `chartTime` is the
+    // chord's time (matches how noteResults keys chord notes). Must stay
+    // cheap: called per note per renderer per frame.
+    function noteStateFor(note, chartTime) {
+        if (!enabled || !note || !Number.isFinite(chartTime)) return null;
+        const key = noteKey(note, chartTime);
+        const j = noteResults.get(key);
+        if (!j) return null;  // not judged yet — render normally
+
+        // The plugin's view of "now" in chart-time terms — same basis
+        // checkMisses() / drawOverlay() use (highway time + A/V offset −
+        // detector latency compensation).
+        const songT = ((hw && hw.getTime) ? hw.getTime() : 0)
+            + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0)
+            - latencyOffset;
+
+        if (j.hit) {
+            const sus = +note.sus || 0;
+            // Sustained note still inside its ring window AND currently
+            // being played on-pitch → hold it at full glow.
+            if (sus > 0.05 && songT < chartTime + sus + 0.05 && _sustainStillHeld(key, note)) {
+                return { state: 'active', alpha: 1 };
+            }
+            // Otherwise: brief post-strike glow that fades out over
+            // hitGlowDuration.
+            const age = songT - chartTime;
+            if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
+            const glowDur = Math.max(0.1, hitGlowDuration);
+            if (age >= glowDur) return null;
+            return { state: 'hit', alpha: 1 - age / glowDur };
+        }
+        // Missed (timing window expired, or matched-but-not-clean).
+        const age = songT - chartTime;
+        if (age < 0 || age >= NOTE_MISS_GEM_TTL) return null;
+        return { state: 'miss', alpha: 1 - age / NOTE_MISS_GEM_TTL };
+    }
+
+    // Is the live monophonic detection on target for `note`? Maintains a
+    // short grace window in _susActiveUntil so a held note doesn't flicker
+    // between audio frames. Chord notes don't get a per-frame polyphonic
+    // re-score today — for a sustained chord this returns false once the
+    // monophonic detector loses the pitch, so the chord falls through to
+    // the post-strike glow fade in noteStateFor.
+    // TODO(slopsmith#254 follow-up): re-run the constraint chord scorer
+    // per audio frame for sustained-and-hit chords so held chords glow
+    // the same way held single notes do.
+    function _sustainStillHeld(key, note) {
+        const nowMs = (typeof performance !== 'undefined' && performance.now)
+            ? performance.now() : Date.now();
+        if (detectedMidi >= 0 && detectedConfidence > 0.3) {
+            const expectedMidi = _ndMidiFromStringFret(
+                note.s, note.f, currentArrangement, currentStringCount, tuningOffsets, capo
+            );
+            if (Number.isFinite(expectedMidi)
+                && Math.abs(_ndNearestOctaveCents(detectedMidi, expectedMidi)) <= pitchTolerance) {
+                _susActiveUntil.set(key, nowMs + NOTE_SUS_GRACE_MS);
+                return true;
+            }
+        }
+        const until = _susActiveUntil.get(key);
+        return Number.isFinite(until) && until > nowMs;
     }
 
     function bsearch(arr, target) {
@@ -2666,6 +2759,11 @@ function createNoteDetector(options = {}) {
             }
 
             if (judgment.hit) {
+                // slopsmith#254 — when the active renderer lights the gem
+                // itself (it accepts a note-state provider), the green
+                // overlay ring is redundant; skip it. Older cores keep
+                // the ring as their only on-highway hit cue.
+                if (hw && hw.setNoteStateProvider) return;
                 const fade = Math.max(0, 1 - age / Math.max(0.1, hitGlowDuration)) * scale;
                 if (fade <= 0) return;
                 ctx.save();
@@ -2849,6 +2947,7 @@ function createNoteDetector(options = {}) {
         streak = 0;
         bestStreak = 0;
         noteResults.clear();
+        _susActiveUntil.clear();
         sectionStats = [];
         currentSection = null;
         detectedMidi = -1;
@@ -3247,7 +3346,7 @@ function createNoteDetector(options = {}) {
             const t = hw.getTime();
             for (const [key] of noteResults) {
                 const noteTime = parseFloat(key.split('_')[0]);
-                if (noteTime < t - 5) noteResults.delete(key);
+                if (noteTime < t - 5) { noteResults.delete(key); _susActiveUntil.delete(key); }
             }
         }, 5000);
 
@@ -3300,6 +3399,14 @@ function createNoteDetector(options = {}) {
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
         try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
+        // Clear our note-state provider — but only if it's still ours
+        // (don't stomp a provider some other plugin registered later).
+        try {
+            if (hw && hw.setNoteStateProvider
+                && (!hw.getNoteStateProvider || hw.getNoteStateProvider() === noteStateFor)) {
+                hw.setNoteStateProvider(null);
+            }
+        } catch (e) {}
         if (detectBtn) { detectBtn.remove(); detectBtn = null; }
         if (gearBtn) { gearBtn.remove(); gearBtn = null; }
         if (instanceRoot.parentNode) instanceRoot.remove();
