@@ -255,3 +255,82 @@ test('bridge path: chord scoring wiring — calls scoreChord IPC, never subscrib
     det.destroy();
     await flushPendingAsync();
 });
+
+test('bridge path: downlevel desktop without scoreChord — chord branch silently skips, monophonic still works', async () => {
+    // Compatibility guard: an older slopsmith-desktop build can
+    // expose getPitchDetection (monophonic path) without yet shipping
+    // audio.scoreChord. The plugin should still take the bridge path
+    // for monophonic detection (no getUserMedia fallback) and just
+    // skip the chord branch silently — no throws, no crashes,
+    // chord-group ticks return without recording judgments.
+    const calls = {
+        isAvailable: 0,
+        getPitchDetection: 0,
+        getSampleRate: 0,
+        getUserMedia: 0,
+    };
+    let capturedDetectTick = null;
+    const { createNoteDetector } = loadDetectionCore({
+        sandboxBeforeRun(sandbox) {
+            sandbox.navigator.mediaDevices.getUserMedia = () => {
+                calls.getUserMedia++;
+                return Promise.reject(new Error('getUserMedia should not be called on the downlevel bridge path'));
+            };
+            let intervalSeq = 0;
+            sandbox.setInterval = (cb) => {
+                intervalSeq += 1;
+                if (intervalSeq === 1 && typeof cb === 'function') {
+                    capturedDetectTick = cb;
+                }
+                return intervalSeq;
+            };
+            // Same 3-note chord at t=0 as the happy-path test.
+            sandbox.highway.getChords = () => ([
+                { t: 0, notes: [
+                    { s: 0, f: 0 },
+                    { s: 1, f: 0 },
+                    { s: 2, f: 0 },
+                ]},
+            ]);
+            sandbox.window.slopsmithDesktop = {
+                isDesktop: true,
+                platform: 'linux',
+                audio: {
+                    // Deliberately omit scoreChord (and onInputFrame —
+                    // any older build that lacked scoreChord would
+                    // also lack the streaming surface in this
+                    // configuration).
+                    isAvailable: async () => { calls.isAvailable++; return true; },
+                    isAudioRunning: async () => true,
+                    startAudio: async () => {},
+                    getPitchDetection: async () => {
+                        calls.getPitchDetection++;
+                        return { midiNote: -1, confidence: 0, frequency: -1, cents: 0, noteName: '' };
+                    },
+                    getLevels: async () => ({ inputLevel: 0, inputPeak: 0, outputLevel: 0, outputPeak: 0 }),
+                    getSampleRate: async () => { calls.getSampleRate++; return 48000; },
+                },
+            };
+        },
+    });
+
+    const det = createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    assert.equal(calls.getUserMedia, 0, 'downlevel bridge should still take the bridge path, not fall back to getUserMedia');
+    assert.equal(typeof capturedDetectTick, 'function', 'bridge detect interval should still register');
+
+    // Drive a chord tick. The chord branch must short-circuit (no
+    // scoreChord to call) without throwing. The single-note path is
+    // also a no-op (getPitchDetection returns midi=-1), so the tick
+    // completes cleanly and the test simply asserts no exception
+    // propagated out of the async call.
+    await assert.doesNotReject(async () => {
+        await capturedDetectTick();
+        await flushPendingAsync();
+    }, 'downlevel chord tick must not throw');
+
+    det.destroy();
+    await flushPendingAsync();
+});

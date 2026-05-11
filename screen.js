@@ -1156,10 +1156,14 @@ function createNoteDetector(options = {}) {
     // doesn't need its own branch on this flag.
     let usingDesktopBridge = false;
     // Cached engine sample rate for the bridge path. There's no
-    // audioCtx on this branch, so processFrame() / matchNotes()
-    // chord scoring can't read it from there — read it once at
-    // startAudio() time and consult this everywhere a sampleRate is
-    // needed. The engine rate is fixed for a session; if the user
+    // audioCtx on this branch so any code that needs a sampleRate
+    // reads it from here instead. Note that chord scoring on the
+    // bridge does NOT consult this value — audio.scoreChord runs
+    // inside the engine and reads the rate natively. The cache is
+    // kept around for the monophonic detection helpers and any
+    // future bridge-side consumer that still needs the renderer
+    // view of the rate. Browser path uses audioCtx.sampleRate
+    // directly. The engine rate is fixed for a session; if the user
     // changes audio device the detector restarts via the
     // restartAudio chain and refreshes this value.
     let bridgeSampleRate = 48000;
@@ -2016,10 +2020,13 @@ function createNoteDetector(options = {}) {
                     // Re-validate after the await. The IPC round-trip
                     // yields the event loop, so checkMisses() can fire
                     // on its own interval and record a miss for this
-                    // chordKey (or a per-string key in `group`) while
-                    // we're waiting on the scorer. Without this guard
-                    // a late-arriving hit would double-count against
-                    // a miss already booked for the same chord timing.
+                    // chordKey while we're waiting on the scorer.
+                    // (checkMisses always books the <t>_chord key
+                    // first and short-circuits per-string for chord
+                    // groups, so only the chord-level key needs
+                    // checking here.) Without this guard a late-
+                    // arriving hit would double-count against a miss
+                    // already booked for the same chord timing.
                     // Bail out of the whole matchNotes() pass — not
                     // just this group — when the instance was disabled
                     // or session-bumped mid-await (settings change /
