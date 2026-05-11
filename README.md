@@ -16,8 +16,10 @@ git clone https://github.com/byrongamatos/slopsmith-plugin-notedetect.git note_d
 2. Browser requests microphone/line-in access
 3. Audio input is analyzed in real-time for pitch (YIN or CREPE)
 4. Detected pitch is compared against expected notes within a timing window
-5. Notes glow green (hit) or red (miss) on the highway
+5. The note's **gem lights up brightly** on the highway when you hit it cleanly — and a sustained note keeps glowing for as long as you keep playing it on-pitch; a miss is flagged on the note too
 6. Running accuracy and streak shown in the HUD
+
+> **How step 5 renders depends on the active highway renderer.** The plugin publishes a per-note judgment via Slopsmith core's `highway.setNoteStateProvider` hook (slopsmith#254 — honored by the bundled 2D and 3D highways; other renderers can read the same data from the core renderer `bundle`'s `getNoteState(note, chartTime)` method). On the **default 2D highway** the plugin *also* draws its own canvas overlay — the slide-down red ✕ miss markers below the now-line, the EARLY/LATE/SHARP/FLAT diagnostic labels, and the cyan "currently detected" indicator. On a **custom renderer** (e.g. the 3D highway) that canvas overlay is suppressed — the renderer owns the per-note feedback there (the 3D highway shows hit/active glow and a red miss outline + the diagnostic labels itself). The HUD (accuracy/streak), the end-of-song summary, and the optional screen-edge flash are DOM, not canvas, so they show under any renderer. On an **older core** without the hook, the plugin falls back to the 2D-canvas green hit ring / red miss marker overlay near the note regardless of renderer.
 
 ## Audio Input Channel Selection
 
@@ -45,6 +47,7 @@ Click the gear icon when detection is active to access:
 - **Pitch Tolerance** — outer pitch window used to correlate an attempt to a chart note
 - **Clean Timing / Clean Pitch** — stricter thresholds for a clean hit; attempts inside the outer window but outside these thresholds become EARLY/LATE/SHARP/FLAT diagnostic misses
 - **Timing/Pitch Labels** — toggles for diagnostic miss labels on the highway
+- **Screen-edge flash on hit/miss** — the full-screen green/red border pulse. **Off by default** since the highway now lights up the note itself on a hit (slopsmith#254); tick it for the old peripheral cue
 - **Miss Marker Duration** — how long failed-note markers remain visible below the now-line
 - **Input Gain** — amplify weak signals
 - **Chord Leniency** — fraction of a chord's strings that must ring for the chord to count as a hit (default 60%, range 25–100%)

@@ -93,3 +93,81 @@ test('setChannel() does not throw on a disabled instance', () => {
     assert.doesNotThrow(() => det.setChannel(-1));
     det.destroy();
 });
+
+// --- highway.setNoteStateProvider integration (slopsmith#254) ----------
+//
+// ensureDrawHook() registers our noteStateFor as the highway's note-state
+// provider; destroy() clears it. The new core API is last-wins by
+// contract, but we made the plugin a "good neighbour": skip registration
+// when another plugin already owns the slot, and only clear at destroy
+// when we can positively verify the active provider is still ours.
+//
+// The audio pipeline never runs in the vm harness (no AudioContext /
+// getUserMedia), so enable() resolves to false — but ensureDrawHook()
+// runs in the synchronous prefix of enableImpl(), *before* the first
+// await, so the provider gets installed regardless. We pass a custom
+// `highway` stub via opts so each test owns its own provider slot and
+// nothing leaks across.
+
+function mkHwStub() {
+    const stub = {
+        addDrawHook() {},
+        removeDrawHook() {},
+        getTime: () => 0,
+        getAvOffset: () => 0,
+        getNotes: () => [],
+        getChords: () => [],
+        getSections: () => [],
+        getSongInfo: () => ({}),
+        _provider: null,
+        setNoteStateProvider(fn) { this._provider = fn; },
+        getNoteStateProvider() { return this._provider; },
+    };
+    return stub;
+}
+
+test('enable() registers noteStateFor as the note-state provider when the slot is empty', async () => {
+    const hw = mkHwStub();
+    const det = createNoteDetector({ highway: hw });
+    // startAudio() rejects in the vm — enable() resolves to false. But
+    // ensureDrawHook() ran in the synchronous prefix, so the provider is
+    // already installed by the time enable() settles.
+    await det.enable().catch(() => {});
+    assert.equal(typeof hw._provider, 'function', 'should register a function provider');
+    det.destroy();
+});
+
+test('enable() does not stomp a pre-existing provider that isn\'t ours', async () => {
+    const hw = mkHwStub();
+    const incumbent = () => null;
+    hw._provider = incumbent;                              // some other plugin got there first
+    const det = createNoteDetector({ highway: hw });
+    await det.enable().catch(() => {});
+    assert.strictEqual(hw._provider, incumbent, 'must leave the incumbent provider in place');
+    det.destroy();
+    // destroy() must also leave the incumbent untouched (not ours).
+    assert.strictEqual(hw._provider, incumbent, 'destroy() must not clear someone else\'s provider');
+});
+
+test('destroy() clears the provider only when it\'s still ours', async () => {
+    // Case A — slot is still ours: destroy() should clear it.
+    {
+        const hw = mkHwStub();
+        const det = createNoteDetector({ highway: hw });
+        await det.enable().catch(() => {});
+        assert.equal(typeof hw._provider, 'function');
+        det.destroy();
+        assert.equal(hw._provider, null, 'destroy() should clear our own provider');
+    }
+    // Case B — someone took the slot after us: destroy() must NOT clear it.
+    {
+        const hw = mkHwStub();
+        const det = createNoteDetector({ highway: hw });
+        await det.enable().catch(() => {});
+        assert.equal(typeof hw._provider, 'function');
+        const usurper = () => null;
+        hw._provider = usurper;                            // simulate another plugin taking over
+        det.destroy();
+        assert.strictEqual(hw._provider, usurper, 'destroy() must not stomp a provider another plugin installed after us');
+    }
+});
