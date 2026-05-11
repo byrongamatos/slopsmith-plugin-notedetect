@@ -117,13 +117,16 @@ test('bridge path: browser environment (no window.slopsmithDesktop) still uses g
     det.destroy();
 });
 
-test('bridge path: chord scoring wiring — subscribes to onInputFrame and caches sample rate', async () => {
+test('bridge path: chord scoring wiring — uses scoreChord IPC, no raw-frame subscription', async () => {
     // The slopsmith-desktop release that unblocks polyphonic chord
-    // scoring on Electron adds two preload APIs the plugin should
-    // consume: audio.onInputFrame (push stream of raw input frames)
-    // and audio.getSampleRate (engine rate for bin→Hz math). This
-    // test pins the wiring rather than the chord-scoring math — that
-    // accuracy is covered by chord-detection.test.js.
+    // scoring on Electron exposes audio.scoreChord — a request/reply
+    // IPC that the native JUCE ChordScorer evaluates against the
+    // engine's internal input ring. No audio buffers cross IPC, so
+    // we also assert the bridge never subscribes to onInputFrame
+    // (the removed push-stream surface) and never calls getUserMedia.
+    // This test pins the wiring; chord-scoring accuracy is covered by
+    // chord-detection.test.js, which still runs the in-JS reference
+    // implementation that backs the browser path.
     const calls = {
         isAvailable: 0,
         isAudioRunning: 0,
@@ -131,11 +134,9 @@ test('bridge path: chord scoring wiring — subscribes to onInputFrame and cache
         getPitchDetection: 0,
         getLevels: 0,
         getSampleRate: 0,
-        onInputFrame: 0,
-        unsubscribe: 0,
+        scoreChord: 0,
         getUserMedia: 0,
     };
-    let capturedCallback = null;
     const { createNoteDetector } = loadDetectionCore({
         sandboxBeforeRun(sandbox) {
             sandbox.navigator.mediaDevices.getUserMedia = () => {
@@ -158,10 +159,15 @@ test('bridge path: chord scoring wiring — subscribes to onInputFrame and cache
                         return { inputLevel: 0.0, inputPeak: 0.0, outputLevel: 0, outputPeak: 0 };
                     },
                     getSampleRate: async () => { calls.getSampleRate++; return 48000; },
-                    onInputFrame: (cb) => {
-                        calls.onInputFrame++;
-                        capturedCallback = cb;
-                        return () => { calls.unsubscribe++; };
+                    scoreChord: async (_ctx) => {
+                        calls.scoreChord++;
+                        return {
+                            score: 0,
+                            hitStrings: 0,
+                            totalStrings: 0,
+                            isHit: false,
+                            results: [],
+                        };
                     },
                 },
             };
@@ -173,19 +179,8 @@ test('bridge path: chord scoring wiring — subscribes to onInputFrame and cache
     await flushPendingAsync();
 
     assert.equal(calls.getUserMedia, 0, 'getUserMedia must not be called when the bridge is fully wired');
-    assert.ok(calls.getSampleRate >= 1, 'getSampleRate should be queried once on the bridge path');
-    assert.equal(calls.onInputFrame, 1, 'onInputFrame should be subscribed exactly once');
-    assert.equal(typeof capturedCallback, 'function', 'onInputFrame callback should be a function');
-
-    // Fire a synthetic frame — the bridge stores it on pendingBuffer
-    // for the next detect tick. The tick itself uses setInterval which
-    // the loader stubs to a no-op, so we can't observe the call from
-    // here, but the listener must accept the payload without throwing.
-    assert.doesNotThrow(() => {
-        capturedCallback({ samples: new Float32Array(4096), seq: 1 });
-    });
+    assert.ok(calls.getSampleRate >= 1, 'getSampleRate should still be queried on the bridge path');
 
     det.destroy();
     await flushPendingAsync();
-    assert.equal(calls.unsubscribe, 1, 'unsubscribe should be called when the detector tears down');
 });
