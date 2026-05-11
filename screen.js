@@ -1272,9 +1272,12 @@ function createNoteDetector(options = {}) {
                     // FFT bin→Hz math. processFrame() and matchNotes()
                     // historically read it from `audioCtx.sampleRate`,
                     // but on the bridge there is no audioCtx — the
-                    // engine's rate is what we need. Falls back to
-                    // 48000 if the desktop is an older build without
-                    // the getSampleRate IPC.
+                    // engine's rate is what we need. Reset to the
+                    // 48000 default first so a transient throw or a
+                    // stale cached rate from a previous session can't
+                    // leak into chord scoring's bin→Hz math after a
+                    // device-change-driven restart.
+                    bridgeSampleRate = 48000;
                     if (typeof desktop.audio.getSampleRate === 'function') {
                         try {
                             const sr = await desktop.audio.getSampleRate();
@@ -1318,14 +1321,25 @@ function createNoteDetector(options = {}) {
                                 detectedString = -1;
                                 detectedFret = -1;
                             }
-                            // Feed the latest pushed frame to matchNotes
-                            // for chord scoring. When onInputFrame is
-                            // unavailable (older desktop) this stays
-                            // null and the chord branch in matchNotes
-                            // skips itself; single-note path runs the
-                            // same way it did before. checkMisses() is
-                            // independent and keeps working regardless.
-                            matchNotes(pendingBuffer);
+                            // Feed the latest pushed frame to
+                            // matchNotes for chord scoring, then
+                            // null it so a subsequent tick with no
+                            // new frame in flight doesn't rescore
+                            // the same audio. Without this, a 50ms
+                            // tick whose pushed-frame failed to
+                            // arrive (engine stall, IPC backlog)
+                            // would replay the previous frame and
+                            // could score later chart chords against
+                            // old audio. When onInputFrame is
+                            // unavailable (older desktop) the snapshot
+                            // is null and the chord branch in
+                            // matchNotes skips itself; single-note
+                            // path runs the same way it did before.
+                            // checkMisses() is independent and keeps
+                            // working regardless.
+                            const frame = pendingBuffer;
+                            pendingBuffer = null;
+                            matchNotes(frame);
                         } catch (e) {
                             console.warn('[note_detect] bridge poll failed:', e && e.message ? e.message : e);
                         } finally {
