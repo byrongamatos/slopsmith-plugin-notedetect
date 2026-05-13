@@ -11,6 +11,13 @@
  * in Node, so we feed Float32 frames in directly via the `_harness`
  * hooks on the createNoteDetector API.
  *
+ * From inside this plugin repo:
+ *
+ *   node tools/harness.js \
+ *     --audio  path/to/recording.{wav,ogg,mp3,...} \
+ *
+ * From the parent slopsmith repo (plugin checked out under plugins/):
+ *
  *   node plugins/note_detect/tools/harness.js \
  *     --audio  path/to/recording.{wav,ogg,mp3,...} \
  *     --chart  path/to/arrangements/lead.json     \
@@ -364,10 +371,14 @@ async function main() {
     detector._resetScoring();
     detector._harness.setEnabled(true);
 
-    // checkMisses runs on a 100 ms interval in production; mirror that
-    // cadence here so the timing window math behaves identically.
-    const samplesPerTick = Math.round(0.1 * sampleRate);
-    const framesPerTick = Math.max(1, Math.round(samplesPerTick / frameSize));
+    // checkMisses runs on a 100 ms interval in production. Drive ticks
+    // off the playhead instead of frame counts — `0.1 * sampleRate`
+    // isn't always an integer multiple of frameSize (44.1 kHz / 1024
+    // → 4 frames per tick ≈ 92.9 ms, which would shift miss-deadline
+    // arithmetic vs production). Crossing a 0.1 s boundary fires
+    // exactly one tick.
+    const TICK_INTERVAL_S = 0.1;
+    let nextTickT = 0;
 
     for (let i = 0; i < totalFrames; i++) {
         currentTimeS = (i * frameSize) / sampleRate;
@@ -383,8 +394,15 @@ async function main() {
         for (let j = 0; start + j < stop; j++) frame[j] = samples[start + j];
         // eslint-disable-next-line no-await-in-loop
         await detector._harness.feedFrame(frame, sampleRate);
-        if ((i % framesPerTick) === 0) detector._harness.tick();
-        if (args.verbose && (i % (framesPerTick * 10)) === 0) {
+        // Tick on every 100 ms boundary the playhead has just crossed.
+        // A while-loop handles the (unlikely) case where frameSize is
+        // larger than TICK_INTERVAL_S worth of samples and the playhead
+        // jumps multiple ticks at once.
+        while (currentTimeS >= nextTickT) {
+            detector._harness.tick();
+            nextTickT += TICK_INTERVAL_S;
+        }
+        if (args.verbose && (i % Math.max(1, Math.round(TICK_INTERVAL_S * 10 * sampleRate / frameSize))) === 0) {
             process.stderr.write(`  ..${currentTimeS.toFixed(1)}s\r`);
         }
     }
