@@ -33,36 +33,18 @@
 
     <div id="nd-tuning-panels" class="space-y-6 hidden">
 
+    <!-- Reference Recording: the actual Arm / Save / Discard controls
+         live in the gear popover next to Detect (a during-play action),
+         not here. This block is a read-only breadcrumb so you can see
+         where your last take landed without re-opening the popover. -->
     <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
-        <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center justify-between mb-2">
             <h4 class="text-sm font-semibold text-gray-300">Reference Recording</h4>
-            <span id="nd-rec-state" class="text-[10px] uppercase tracking-wider text-gray-500">idle</span>
         </div>
-
-        <p class="text-[11px] text-gray-400 leading-relaxed mb-3">
-            Captures the same audio the detector hears, while a song plays. Auto-starts on Play, auto-saves a WAV on song end. <strong>Detect must be enabled</strong> for any audio to flow. Pairs with the headless harness for offline tuning.
+        <p class="text-[11px] text-gray-400 leading-relaxed mb-2">
+            Arming + saving live in the <strong>gear popover</strong> next to Detect on the player. This block just shows where your most recent take landed.
         </p>
-
-        <div id="nd-rec-info" class="text-xs text-gray-400 mb-3 leading-snug">Click <em>Arm</em>, then play the song from the start.</div>
-
-        <div class="flex gap-2 mb-3">
-            <button id="nd-rec-arm"
-                    class="flex-1 bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-4 py-2 rounded-lg text-sm font-semibold text-white transition">
-                Arm Recording
-            </button>
-            <button id="nd-rec-save"
-                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed"
-                    disabled title="Save what's been captured so far without waiting for song:ended">
-                Save now
-            </button>
-            <button id="nd-rec-discard"
-                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed"
-                    disabled title="Throw away what's been captured so far and disarm">
-                Discard
-            </button>
-        </div>
-
-        <div id="nd-rec-saved" class="text-[11px] text-gray-500 mb-1 break-all"></div>
+        <div id="nd-rec-saved" class="text-[11px] text-gray-500 break-all">No recording saved this session yet.</div>
     </div>
 
     <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
@@ -134,69 +116,25 @@
     function _q(id) { return document.getElementById(id); }
     function _fmt(n) { return (n == null) ? '—' : String(n); }
 
+    // Read-only mirror of the most recent save path. The arm / save /
+    // discard controls live in the gear popover, not here, so the
+    // settings page is a between-runs review surface, not a live
+    // recording panel.
     function renderRecording(nd) {
-        const armBtn  = _q('nd-rec-arm');
-        const saveBtn = _q('nd-rec-save');
-        const discBtn = _q('nd-rec-discard');
-        const stateEl = _q('nd-rec-state');
-        const infoEl  = _q('nd-rec-info');
         const savedEl = _q('nd-rec-saved');
+        if (!savedEl) return;
         if (!nd || typeof nd.getRecordingState !== 'function') {
-            if (stateEl) stateEl.textContent = 'plugin not loaded';
-            if (armBtn)  armBtn.disabled  = true;
-            if (saveBtn) saveBtn.disabled = true;
-            if (discBtn) discBtn.disabled = true;
+            savedEl.textContent = 'plugin not loaded.';
             return;
         }
         const r = nd.getRecordingState();
-        const hasBuffer = r.samples > 0;
-
-        // State chip + info line
-        let label, info;
-        if (r.saveInFlight) {
-            label = 'saving…';
-            info  = 'Encoding and uploading the WAV…';
-        } else if (r.lastError) {
-            label = 'error';
-            info  = 'Last attempt failed: ' + r.lastError;
-        } else if (r.armed && r.songPlaying) {
-            label = 'recording';
-            info  = `Capturing… ${r.durationS.toFixed(1)} s (${r.samples} samples @ ${r.sampleRate} Hz). Auto-saves on song end.`;
-        } else if (r.armed && !r.detectEnabled) {
-            label = 'armed (Detect off)';
-            info  = 'Armed, but Detect isn\'t enabled — no audio will flow until you click Detect on the player.';
-        } else if (r.armed) {
-            label = 'armed';
-            info  = 'Armed. Press Play on the song to start capturing.';
-        } else if (hasBuffer) {
-            // Reachable if disarmed mid-recording — unusual; keep the buffer alive
-            label = 'paused';
-            info  = `${r.durationS.toFixed(1)} s captured; click Save to keep it or Discard to throw it out.`;
+        if (r.lastError) {
+            savedEl.innerHTML = '<span class="text-red-400">Last save failed: ' + r.lastError + '</span>';
         } else if (r.lastSavePath) {
-            label = 'idle';
-            info  = 'Ready. Click Arm to record the next play.';
+            savedEl.innerHTML = 'Latest: <code class="text-gray-300">' + r.lastSavePath + '</code>';
         } else {
-            label = 'idle';
-            info  = 'Click Arm, then play the song from the start.';
+            savedEl.textContent = 'No recording saved this session yet — arm + save from the gear popover.';
         }
-        if (stateEl) stateEl.textContent = label;
-        if (infoEl) {
-            infoEl.textContent = info;
-            infoEl.className = 'text-xs mb-3 leading-snug ' + (r.lastError ? 'text-red-400' : 'text-gray-400');
-        }
-        if (savedEl) {
-            if (r.lastSavePath && !r.armed && !r.lastError) {
-                savedEl.innerHTML = 'Saved: <code class="text-gray-300">' + r.lastSavePath + '</code>';
-            } else {
-                savedEl.textContent = '';
-            }
-        }
-        if (armBtn) {
-            armBtn.textContent = r.armed ? 'Disarm' : 'Arm Recording';
-            armBtn.disabled    = r.saveInFlight;
-        }
-        if (saveBtn) saveBtn.disabled = !hasBuffer || r.saveInFlight;
-        if (discBtn) discBtn.disabled = !(r.armed || hasBuffer) || r.saveInFlight;
     }
 
     function render() {
@@ -319,40 +257,8 @@
         };
     }
 
-    // Recording buttons
-    const armBtn  = _q('nd-rec-arm');
-    const saveBtn = _q('nd-rec-save');
-    const discBtn = _q('nd-rec-discard');
-    if (armBtn) {
-        armBtn.onclick = () => {
-            const nd = window.noteDetect;
-            if (!nd) return;
-            const r = nd.getRecordingState && nd.getRecordingState();
-            if (r && r.armed) {
-                // Currently armed → button means Disarm
-                nd.disarmRecording && nd.disarmRecording();
-            } else {
-                nd.armRecording && nd.armRecording();
-            }
-            render();
-        };
-    }
-    if (saveBtn) {
-        saveBtn.onclick = async () => {
-            const nd = window.noteDetect;
-            if (!nd || typeof nd.saveRecordingNow !== 'function') return;
-            saveBtn.disabled = true;
-            await nd.saveRecordingNow();
-            render();
-        };
-    }
-    if (discBtn) {
-        discBtn.onclick = () => {
-            const nd = window.noteDetect;
-            if (nd && typeof nd.disarmRecording === 'function') nd.disarmRecording();
-            render();
-        };
-    }
+    // (Recording buttons moved to the gear popover — this page is the
+    // read-only "latest save path" mirror, no click handlers.)
 
     render();
     // Auto-refresh while the section is in the DOM. Cheap (one

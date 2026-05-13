@@ -2592,6 +2592,28 @@ function createNoteDetector(options = {}) {
                 <button class="nd-settings-close text-gray-500 hover:text-white">&times;</button>
             </div>
 
+            ${tuningMode ? `
+            <div class="nd-rec-block bg-dark-600/40 border border-gray-700 rounded-lg p-3 mb-3">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="text-gray-200 text-xs font-semibold uppercase tracking-wider">Reference Recording</span>
+                    <span class="nd-rec-state text-[10px] uppercase tracking-wider text-gray-500">idle</span>
+                </div>
+                <div class="nd-rec-info text-[11px] text-gray-400 leading-snug mb-2">Click Arm, then press Play on the song.</div>
+                <div class="flex gap-1.5">
+                    <button class="nd-rec-arm flex-1 bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-2 py-1.5 rounded text-xs font-semibold text-white transition">
+                        Arm
+                    </button>
+                    <button class="nd-rec-save px-3 py-1.5 bg-dark-500 hover:bg-dark-400 rounded text-xs text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed" title="Save what's captured so far">
+                        Save
+                    </button>
+                    <button class="nd-rec-discard px-3 py-1.5 bg-dark-500 hover:bg-dark-400 rounded text-xs text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed" title="Throw out the in-flight buffer">
+                        Discard
+                    </button>
+                </div>
+                <div class="nd-rec-saved text-[10px] text-gray-500 mt-2 break-all"></div>
+            </div>
+            ` : ''}
+
             <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
             <select class="nd-device-select w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2">
                 <option value="">Default</option>
@@ -2690,6 +2712,63 @@ function createNoteDetector(options = {}) {
 
         // Wire up controls
         panel.querySelector('.nd-settings-close').onclick = () => panel.remove();
+
+        // Reference-recording controls — present only when tuningMode is
+        // on (the .nd-rec-block element is conditional in the template
+        // above). Status updates on a self-cancelling 1s interval so the
+        // duration tick + "Saved to ..." path appear in real time while
+        // the popover is open.
+        const recBlock = panel.querySelector('.nd-rec-block');
+        if (recBlock) {
+            const armBtn  = recBlock.querySelector('.nd-rec-arm');
+            const saveBtn = recBlock.querySelector('.nd-rec-save');
+            const discBtn = recBlock.querySelector('.nd-rec-discard');
+            const stateEl = recBlock.querySelector('.nd-rec-state');
+            const infoEl  = recBlock.querySelector('.nd-rec-info');
+            const savedEl = recBlock.querySelector('.nd-rec-saved');
+
+            function renderRec() {
+                if (!document.body.contains(panel)) { clearInterval(tick); return; }
+                const r = getRecordingState();
+                const hasBuffer = r.samples > 0;
+                let label, info;
+                if (r.saveInFlight) { label = 'saving…'; info = 'Encoding + uploading the WAV…'; }
+                else if (r.lastError) { label = 'error'; info = 'Last attempt failed: ' + r.lastError; }
+                else if (r.armed && r.songPlaying) { label = 'recording'; info = `Capturing… ${r.durationS.toFixed(1)} s (${r.samples} samples @ ${r.sampleRate} Hz). Auto-saves on song end.`; }
+                else if (r.armed && !r.detectEnabled) { label = 'armed (Detect off)'; info = 'Armed, but Detect isn\'t on — no audio is flowing.'; }
+                else if (r.armed) { label = 'armed'; info = 'Armed. Press Play to start capturing.'; }
+                else if (hasBuffer) { label = 'paused'; info = `${r.durationS.toFixed(1)} s captured; Save to keep it or Discard to throw it out.`; }
+                else if (r.lastSavePath) { label = 'idle'; info = 'Ready. Click Arm for the next take.'; }
+                else { label = 'idle'; info = 'Click Arm, then press Play.'; }
+                if (stateEl) stateEl.textContent = label;
+                if (infoEl)  {
+                    infoEl.textContent = info;
+                    infoEl.className = 'nd-rec-info text-[11px] leading-snug mb-2 ' + (r.lastError ? 'text-red-400' : 'text-gray-400');
+                }
+                if (savedEl) {
+                    if (r.lastSavePath && !r.armed && !r.lastError) {
+                        savedEl.innerHTML = 'Saved: <code class="text-gray-300">' + r.lastSavePath + '</code>';
+                    } else {
+                        savedEl.textContent = '';
+                    }
+                }
+                if (armBtn)  { armBtn.textContent = r.armed ? 'Disarm' : 'Arm'; armBtn.disabled = r.saveInFlight; }
+                if (saveBtn) saveBtn.disabled = !hasBuffer || r.saveInFlight;
+                if (discBtn) discBtn.disabled = !(r.armed || hasBuffer) || r.saveInFlight;
+            }
+            if (armBtn) armBtn.onclick = () => {
+                const r = getRecordingState();
+                if (r.armed) disarmRecording(); else armRecording();
+                renderRec();
+            };
+            if (saveBtn) saveBtn.onclick = async () => {
+                await saveRecordingNow();
+                renderRec();
+            };
+            if (discBtn) discBtn.onclick = () => { disarmRecording(); renderRec(); };
+            renderRec();
+            const tick = setInterval(renderRec, 1000);
+        }
         panel.querySelector('.nd-device-select').onchange = (e) => onDeviceChange(e.target.value);
         panel.querySelector('.nd-channel-select').onchange = (e) => onChannelChange(e.target.value);
         panel.querySelector('.nd-method-select').onchange = (e) => setMethod(e.target.value);
