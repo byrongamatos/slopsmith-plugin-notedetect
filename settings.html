@@ -45,14 +45,19 @@
                     disabled>
                 Download Diagnostic JSON
             </button>
+            <button id="nd-diag-reset"
+                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    disabled>
+                Reset
+            </button>
             <button id="nd-diag-refresh"
-                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
-                Refresh
+                    class="px-3 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition" title="Refresh now (auto-refreshes every 1.5s anyway)">
+                ↻
             </button>
         </div>
 
         <p class="text-[10px] text-gray-600 mt-3 leading-relaxed">
-            Captures the current session's per-category miss breakdown, per-string hit rate, signed timing / pitch error percentiles, settings snapshot, and a capped per-judgment event log — schema <code class="text-gray-500">note_detect.diagnostic.v1</code>. Share it back with whoever's tuning your detection (or attach it to a benchmark run).
+            Captures the current session's per-category miss breakdown, per-string hit rate, signed timing / pitch error percentiles, settings snapshot, and a capped per-judgment event log — schema <code class="text-gray-500">note_detect.diagnostic.v1</code>. <strong>Reset</strong> zeroes the counters mid-session without disabling Detect — seek to a specific section (arrow keys, or click a label in the highway), hit Reset, play just that section, then Download for a per-section report. Share it back with whoever's tuning your detection (or attach it to a benchmark run).
         </p>
     </div>
 </div>
@@ -80,10 +85,12 @@
         const nd = window.noteDetect;
         const ready = !!(nd && typeof nd.getDiagnostic === 'function');
         const btn = _q('nd-diag-download');
+        const rsBtn = _q('nd-diag-reset');
         const state = _q('nd-diag-state');
         if (!ready) {
             if (state) state.textContent = 'plugin not loaded';
             if (btn) btn.disabled = true;
+            if (rsBtn) rsBtn.disabled = true;
             return;
         }
         const d = nd.getDiagnostic();
@@ -94,6 +101,7 @@
             ? (enabled ? 'detecting — no judgments yet' : 'no data yet')
             : `${total} judgments${enabled ? ' (live)' : ''}`;
         if (btn) btn.disabled = total === 0;
+        if (rsBtn) rsBtn.disabled = total === 0;
 
         _q('nd-diag-acc').textContent = total > 0 ? Math.round(d.summary.accuracy * 100) + '%' : '—';
         _q('nd-diag-acc').className = total === 0
@@ -153,6 +161,16 @@
         dlBtn.onclick = () => {
             const nd = window.noteDetect;
             if (nd && typeof nd.downloadDiagnostic === 'function') nd.downloadDiagnostic();
+        };
+    }
+    const rsBtn = _q('nd-diag-reset');
+    if (rsBtn) {
+        rsBtn.onclick = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.resetDiagnostic === 'function') {
+                nd.resetDiagnostic();
+                render();   // immediate visual feedback that the counters cleared
+            }
         };
     }
     const rfBtn = _q('nd-diag-refresh');

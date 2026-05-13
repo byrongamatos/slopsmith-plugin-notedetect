@@ -246,6 +246,33 @@ See `test/README.md` for the full rationale. Adding tests when changing
 detection or mapping logic is encouraged — the `vm` loader means tests
 exercise the actual shipping code, not a parallel copy.
 
+## Headless harness
+
+    node tools/harness.js \
+        --audio  recording.wav \
+        --chart  path/to/arrangements/lead.json \
+        --out    result.json [--verbose]
+
+Runs the **same** `processFrame` / `matchNotes` / `checkMisses` pipeline the
+browser uses, off a recorded audio file + an arrangement JSON, and writes a
+diagnostic JSON identical to the Settings-page "Download Diagnostic JSON"
+export (plus a small `harness` block stamping the audio file, frame size,
+total frames, etc.). Detector knobs are CLI flags
+(`--method yin|hps`, `--pitch-tolerance`, `--chord-hit-ratio`, …).
+
+Used for offline tuning + regression testing: change a parameter, re-run,
+diff two JSONs. No browser, no microphone, no human. Pairs naturally with
+[the Note Detect Benchmark sloppak](https://github.com/byrongamatos/slopsmith/tree/main/docs/benchmarks/note_detect_v1)
+— record yourself once playing the benchmark cleanly, then sweep settings
+against that single recording.
+
+Reads WAVs (int16 / int24 / float32; any sample rate; any channel count —
+mixed down to mono and resampled) natively. For other formats (ogg, mp3,
+flac, …) it shells out to `ffmpeg` on `$PATH`. Drives detection via the
+detector's `_harness` test-only hooks. CREPE isn't supported in the
+harness (its TF.js backend wants WebGL) — YIN + HPS + the chord scorer
+cover what we'd tune against.
+
 ## License
 
 MIT

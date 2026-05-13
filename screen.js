@@ -3899,9 +3899,13 @@ function createNoteDetector(options = {}) {
         // triggers a browser file save of the current session's
         // breakdown + capped event log; `getDiagnostic()` returns the
         // same payload for in-page display / programmatic use. Schema
-        // is `note_detect.diagnostic.v1`.
+        // is `note_detect.diagnostic.v1`. `resetDiagnostic()` zeroes
+        // all the counters mid-session (without touching audio /
+        // enabled / button state) so you can navigate to a specific
+        // section, reset, and capture *only* that section's events.
         downloadDiagnostic: _downloadDiagnostic,
         getDiagnostic: _buildDiagnosticPayload,
+        resetDiagnostic: resetScoring,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
@@ -3924,6 +3928,43 @@ function createNoteDetector(options = {}) {
         _unbindDrillEvents: _drillUnbindEvents,
         _drillSyncFromLoopState: _drillSyncFromLoopState,
         _recordJudgment: recordJudgment,
+
+        // Internal — headless-harness hooks. Lets a Node CLI tool
+        // (plugins/note_detect/tools/harness.js) drive the exact same
+        // processFrame / matchNotes / checkMisses pipeline the browser
+        // uses, without going through getUserMedia / AudioContext.
+        // Required because the matching + judgment logic is closure-
+        // internal and 300+ lines of nuance we don't want to
+        // reimplement out-of-process. Each entry is a no-arg / small-
+        // arg method; the harness composes them. Production code
+        // never touches `_harness`.
+        _harness: {
+            feedFrame: async (buffer, sampleRate) => {
+                if (Number.isFinite(sampleRate)) bridgeSampleRate = sampleRate;
+                await processFrame(buffer);
+            },
+            tick: () => { checkMisses(); },
+            setEnabled: (v) => { enabled = !!v; },
+            setContext: (ctx) => {
+                ctx = ctx || {};
+                if (typeof ctx.arrangement === 'string') currentArrangement = ctx.arrangement;
+                if (Number.isFinite(ctx.stringCount))   currentStringCount = ctx.stringCount;
+                if (Array.isArray(ctx.tuningOffsets))   tuningOffsets = ctx.tuningOffsets.slice();
+                if (Number.isFinite(ctx.capo))          capo = ctx.capo;
+            },
+            setSettings: (s) => {
+                s = s || {};
+                if (typeof s.method === 'string' && ['yin', 'hps', 'crepe'].includes(s.method))
+                    detectionMethod = s.method;
+                if (Number.isFinite(s.pitchTolerance))      pitchTolerance      = s.pitchTolerance;
+                if (Number.isFinite(s.pitchHitThreshold))   pitchHitThreshold   = s.pitchHitThreshold;
+                if (Number.isFinite(s.timingTolerance))     timingTolerance     = s.timingTolerance;
+                if (Number.isFinite(s.timingHitThreshold))  timingHitThreshold  = s.timingHitThreshold;
+                if (Number.isFinite(s.chordHitRatio))       chordHitRatio       = s.chordHitRatio;
+                if (Number.isFinite(s.latencyOffset))       latencyOffset       = s.latencyOffset;
+                if (Number.isFinite(s.inputGain))           inputGain           = s.inputGain;
+            },
+        },
     };
 
     // Register the draw hook once per instance. The hook early-returns
