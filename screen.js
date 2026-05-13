@@ -1051,6 +1051,14 @@ function createNoteDetector(options = {}) {
 
     // ── Per-instance state ────────────────────────────────────────────
     let enabled = false;
+    // User preference for whether detection should be running. Default
+    // is true (Detect on out of the box) — overridden by localStorage
+    // when the user has explicitly toggled. Distinct from `enabled`
+    // because the audio pipeline can't be claimed during construction
+    // (highway may not be ready, mic permissions may not be cached),
+    // so this is the *intent* and `enabled` is the *current run state*.
+    // The plugin auto-calls enable() on next tick if this is true.
+    let detectPreference = true;
     // Session generation — incremented on every disable(). A frame
     // that captures the value at the start of processing and re-checks
     // after an `await _ndCrepeDetect(...)` can drop its result rather
@@ -1145,6 +1153,9 @@ function createNoteDetector(options = {}) {
             if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
             if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
             if (s.tuningMode !== undefined) tuningMode = !!s.tuningMode;
+            // Persisted on/off preference. Absence keeps the default
+            // (true), so fresh installs get Detect on out of the box.
+            if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
             if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
             if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
             if (s.inputGain !== undefined) inputGain = s.inputGain;
@@ -1435,6 +1446,7 @@ function createNoteDetector(options = {}) {
                 showPitchErrors,
                 edgeFlash: edgeFlashEnabled,
                 tuningMode,
+                detectEnabled: detectPreference,
                 missMarkerDuration,
                 hitGlowDuration,
                 inputGain,
@@ -3992,8 +4004,15 @@ function createNoteDetector(options = {}) {
     }
 
     async function toggle() {
-        if (enabled) disable();
-        else await enable();
+        if (enabled) {
+            disable();
+            detectPreference = false;
+            saveSettings();
+        } else {
+            await enable();
+            detectPreference = true;
+            saveSettings();
+        }
     }
 
     // Builds a self-contained snapshot of the current session — counters,
@@ -4609,6 +4628,31 @@ function createNoteDetector(options = {}) {
     // bind so song:play mints a session id without requiring a
     // setTuningMode toggle. setTuningMode handles the dynamic case.
     if (tuningMode) _liveBindEvents();
+
+    // Auto-enable detection on construct when the persisted preference
+    // says so. Default singletons only — splitscreen panels mount /
+    // unmount on demand and shouldn't claim the audio device the
+    // moment they're constructed. Deferred to next tick so plugin
+    // construction returns first; enableImpl() bails cleanly if the
+    // highway isn't resolvable yet (it'll keep showing the off-state
+    // button until the user clicks).
+    //
+    // Gated on `window.AudioContext` (or the webkit-prefixed alias) so
+    // the vm test sandbox — which stubs the highway but has no audio
+    // — doesn't trigger a phantom enable() that binds drill listeners
+    // before the test gets to make its assertions.
+    const _hasAudio = typeof window !== 'undefined'
+        && (typeof window.AudioContext === 'function'
+            || typeof window.webkitAudioContext === 'function');
+    if (isDefault && detectPreference && _hasAudio) {
+        setTimeout(() => {
+            // Re-check enabled — a fast user click during the timeout
+            // could have already enabled (or explicitly disabled) us.
+            if (!enabled) enable().catch((e) => {
+                console.warn('[note_detect] auto-enable failed:', e && e.message ? e.message : e);
+            });
+        }, 0);
+    }
 
     _ndInstances.add(api);
     return api;
