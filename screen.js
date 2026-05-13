@@ -1203,6 +1203,35 @@ function createNoteDetector(options = {}) {
     const _DIAG_EVENT_CAP = 2000;
     const _diagEvents = [];
 
+    // Live-streaming state. When tuning mode is on, every judgment is
+    // also POSTed to /api/plugins/note_detect/live-judgment so an
+    // off-device reader (the host iterating against this code) can
+    // watch a session unfold in real time. The session id changes on
+    // every `song:play` so each take produces its own JSONL file; the
+    // value is used directly as a filename slug server-side, so it
+    // sticks to filesystem-safe characters. Off (null) until the first
+    // song:play fires with tuning mode on.
+    let _liveSessionId = null;
+    function _streamLiveJudgment(eventObj) {
+        // Fire-and-forget — the network round-trip MUST NOT block the
+        // detection hot path. We don't even await the promise: any
+        // failure (server down, file capped, etc.) is silently
+        // swallowed so the in-memory diagnostic remains the source of
+        // truth and detection keeps running.
+        try {
+            fetch(
+                '/api/plugins/note_detect/live-judgment?session='
+                    + encodeURIComponent(_liveSessionId),
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(eventObj),
+                    keepalive: true,   // survives page nav / song-end teardown
+                },
+            ).catch(() => {});
+        } catch (e) { /* swallow — see comment above */ }
+    }
+
     // ── Reference-recording capture (#254 follow-up) ──────────────────
     // Captures the SAME Float32 audio frames the detector is running its
     // analysis on, while a song is playing, so the headless harness has
@@ -2159,28 +2188,37 @@ function createNoteDetector(options = {}) {
         if (Number.isFinite(judgment.pitchError) && _diagPitchErrors.length < _DIAG_ERROR_CAP) {
             _diagPitchErrors.push(judgment.pitchError);
         }
+        // Build the event object once; push to in-memory log (capped)
+        // AND stream to the backend live-judgment endpoint when tuning
+        // mode is on. The streaming path is fire-and-forget — failures
+        // are swallowed since they shouldn't disrupt detection or
+        // bookkeeping.
+        const nn = judgment.chartNote || judgment.note || {};
+        const eventObj = {
+            t:   Number.isFinite(judgment.noteTime) ? +judgment.noteTime.toFixed(3) : null,
+            at:  Number.isFinite(judgment.time)     ? +judgment.time.toFixed(3)     : null,
+            s:   Number.isInteger(nn.s) ? nn.s : null,
+            f:   Number.isInteger(nn.f) ? nn.f : null,
+            sus: Number.isFinite(nn.sus) ? +(+nn.sus).toFixed(3) : 0,
+            hit:   !!judgment.hit,
+            chord: !!judgment.chord,
+            ts:  judgment.timingState || null,
+            ps:  judgment.pitchState  || null,
+            te:  Number.isFinite(judgment.timingError) ? judgment.timingError : null,
+            pe:  Number.isFinite(judgment.pitchError)  ? judgment.pitchError  : null,
+            ex:  Number.isFinite(judgment.expectedMidi) ? judgment.expectedMidi : null,
+            dx:  Number.isFinite(judgment.detectedMidi) ? judgment.detectedMidi : null,
+            cnf: Number.isFinite(judgment.confidence) ? +judgment.confidence.toFixed(3) : 0,
+            hs:  Number.isFinite(judgment.hitStrings)   ? judgment.hitStrings   : undefined,
+            tt:  Number.isFinite(judgment.totalStrings) ? judgment.totalStrings : undefined,
+            sc:  Number.isFinite(judgment.score) ? +judgment.score.toFixed(3) : undefined,
+            tf:  _diagTechFlags(nn),
+        };
         if (_diagEvents.length < _DIAG_EVENT_CAP) {
-            const nn = judgment.chartNote || judgment.note || {};
-            _diagEvents.push({
-                t:   Number.isFinite(judgment.noteTime) ? +judgment.noteTime.toFixed(3) : null,
-                at:  Number.isFinite(judgment.time)     ? +judgment.time.toFixed(3)     : null,
-                s:   Number.isInteger(nn.s) ? nn.s : null,
-                f:   Number.isInteger(nn.f) ? nn.f : null,
-                sus: Number.isFinite(nn.sus) ? +(+nn.sus).toFixed(3) : 0,
-                hit:   !!judgment.hit,
-                chord: !!judgment.chord,
-                ts:  judgment.timingState || null,
-                ps:  judgment.pitchState  || null,
-                te:  Number.isFinite(judgment.timingError) ? judgment.timingError : null,
-                pe:  Number.isFinite(judgment.pitchError)  ? judgment.pitchError  : null,
-                ex:  Number.isFinite(judgment.expectedMidi) ? judgment.expectedMidi : null,
-                dx:  Number.isFinite(judgment.detectedMidi) ? judgment.detectedMidi : null,
-                cnf: Number.isFinite(judgment.confidence) ? +judgment.confidence.toFixed(3) : 0,
-                hs:  Number.isFinite(judgment.hitStrings)   ? judgment.hitStrings   : undefined,
-                tt:  Number.isFinite(judgment.totalStrings) ? judgment.totalStrings : undefined,
-                sc:  Number.isFinite(judgment.score) ? +judgment.score.toFixed(3) : undefined,
-                tf:  _diagTechFlags(nn),
-            });
+            _diagEvents.push(eventObj);
+        }
+        if (tuningMode && _liveSessionId) {
+            _streamLiveJudgment(eventObj);
         }
     }
 
@@ -3841,6 +3879,7 @@ function createNoteDetector(options = {}) {
         // on re-enable); destroy is the right teardown point.
         _drillUnbindEvents();
         _recUnbindEvents();
+        _liveUnbindEvents();
         // Discard any unsaved recording state — destroying the instance
         // shouldn't write a half-captured WAV.
         _recArmed = false;
@@ -4121,6 +4160,58 @@ function createNoteDetector(options = {}) {
         _recSubscribed = false;
     }
 
+    // Live-streaming event bindings — only active while tuning mode is
+    // on. Mints a fresh session id on song:play so every take produces
+    // its own `live_<id>.jsonl` file server-side; clears it on song:end
+    // so judgments fired after a song ends don't trickle into a stale
+    // file. Independent of recording arm state — the user gets live
+    // streaming even without arming a WAV capture.
+    let _liveOnPlay = null, _liveOnEnded = null;
+    let _liveSubscribed = false;
+    function _liveBindEvents() {
+        if (_liveSubscribed) return;
+        if (!window.slopsmith
+            || typeof window.slopsmith.on !== 'function'
+            || typeof window.slopsmith.off !== 'function') return;
+        _liveOnPlay = () => {
+            // Match the recording route's filename convention so live
+            // JSONL and recorded WAV pair up cleanly under
+            // static/note_detect_recordings/.
+            const now = new Date();
+            const pad = (n) => String(n).padStart(2, '0');
+            const ts = now.getFullYear()
+                + pad(now.getMonth() + 1) + pad(now.getDate()) + '_'
+                + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+            // Short random suffix avoids collisions when two panels
+            // emit a song:play in the same second (splitscreen).
+            const rand = Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
+            _liveSessionId = `${ts}_${rand}`;
+        };
+        _liveOnEnded = () => {
+            _liveSessionId = null;
+        };
+        try {
+            window.slopsmith.on('song:play',  _liveOnPlay);
+            window.slopsmith.on('song:ended', _liveOnEnded);
+        } catch (e) {
+            try { window.slopsmith.off('song:play',  _liveOnPlay); }  catch (_) {}
+            try { window.slopsmith.off('song:ended', _liveOnEnded); } catch (_) {}
+            _liveOnPlay = _liveOnEnded = null;
+            return;
+        }
+        _liveSubscribed = true;
+    }
+    function _liveUnbindEvents() {
+        if (!_liveSubscribed) return;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_liveOnPlay)  { try { window.slopsmith.off('song:play',  _liveOnPlay); }  catch (e) {} }
+            if (_liveOnEnded) { try { window.slopsmith.off('song:ended', _liveOnEnded); } catch (e) {} }
+        }
+        _liveOnPlay = _liveOnEnded = null;
+        _liveSubscribed = false;
+        _liveSessionId = null;
+    }
+
     function showSummary() {
         const total = hits + misses;
         if (total < 5) return;
@@ -4333,6 +4424,12 @@ function createNoteDetector(options = {}) {
             if (!tuningMode && (_recArmed || _recChunks.length > 0)) {
                 discardRecording();
             }
+            // Live JSONL streaming binds/unbinds with tuning mode so
+            // non-tuning users don't pollute the slopsmith event bus.
+            // The drill-mode tests assert exactly one song:ended
+            // listener after their own bind — adding an always-on
+            // live-stream listener would break that contract.
+            if (tuningMode) _liveBindEvents(); else _liveUnbindEvents();
             saveSettings();
         },
         // Reference-recording capture for the headless harness. Arms
@@ -4419,6 +4516,12 @@ function createNoteDetector(options = {}) {
     // a clean per-instance listener count, and we shouldn't be on the
     // slopsmith event bus when no recording is armed anyway. We bind
     // on armRecording(), unbind on disarm / save / destroy.
+
+    // Live-stream listeners follow the same rule but key off tuning
+    // mode: if the user already has tuning mode on from localStorage,
+    // bind so song:play mints a session id without requiring a
+    // setTuningMode toggle. setTuningMode handles the dynamic case.
+    if (tuningMode) _liveBindEvents();
 
     _ndInstances.add(api);
     return api;

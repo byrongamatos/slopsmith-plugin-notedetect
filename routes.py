@@ -6,11 +6,20 @@ POST /api/plugins/note_detect/recording
     Query: ?slug=<safe-filename-slug>   (optional, defaults to "recording").
     Returns JSON: { path_in_container, relative_path, filename, bytes }.
 
-The WAV lands under ``static/note_detect_recordings/`` (under the
-slopsmith static tree, which is bind-mounted in the dev container).
-That means the headless harness (``plugins/note_detect/tools/harness.js``)
-running on the host can read the same file the browser just saved, with
-zero copy / drag-and-drop step. The directory is created on demand.
+POST /api/plugins/note_detect/live-judgment
+    Body: JSON object — one judgment record produced by the detector.
+    Query: ?session=<id>   (sanitised; defaults to "default").
+    Returns JSON: { ok: true, appended: <bytes> }.
+    Appends one JSON line to
+    ``static/note_detect_recordings/live_<session>.jsonl``. The plugin
+    streams judgments here only when tuning mode is on, so steady-state
+    play has zero overhead. Each line is a self-contained record —
+    safe to tail / read partially / replay.
+
+Both endpoints write under ``static/note_detect_recordings/`` (the
+slopsmith static tree, bind-mounted in the dev container). That means
+contributors on the host see the files appear in real time without
+docker cp / drag-and-drop. The directory is created on demand.
 
 We deliberately don't write to ``config_dir`` here even though it's the
 "correct" home for plugin state — config_dir is a named Docker volume in
@@ -18,6 +27,7 @@ the dev compose, so the host can't reach files inside it from outside
 the container. ``static/`` IS bind-mounted, which is what we need.
 """
 
+import json
 import re
 import secrets
 import time
@@ -39,6 +49,16 @@ _SLUG_MAX = 40
 # leaves headroom for higher sample rates / longer takes while still
 # refusing to write multi-GB blobs.
 _MAX_BYTES = 32 * 1024 * 1024
+
+# Per-judgment payloads are small (~150 bytes typical), but a buggy
+# client could spam huge blobs. Cap individual payloads so the JSONL
+# file can't be DoSed into millions of bytes per line.
+_LIVE_JUDGMENT_MAX_BYTES = 8 * 1024
+
+# JSONL files for a single session shouldn't exceed this — caps total
+# accumulation per session. A 2-minute song produces ~60 KB; this gives
+# 100× headroom while still bounding pathological cases.
+_LIVE_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _sanitize_slug(s: str) -> str:
@@ -94,3 +114,46 @@ def setup(app, context):
             "filename": filename,
             "bytes": len(body),
         }
+
+    @app.post("/api/plugins/note_detect/live-judgment")
+    async def append_live_judgment(request: Request):
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty body (expected a JSON judgment object)")
+        if len(body) > _LIVE_JUDGMENT_MAX_BYTES:
+            raise HTTPException(
+                413,
+                f"judgment too large ({len(body)} bytes > {_LIVE_JUDGMENT_MAX_BYTES})",
+            )
+        # Parse + re-emit so we (a) reject malformed JSON early and (b)
+        # guarantee one self-contained record per line. A buggy client
+        # POSTing a multi-line string would otherwise corrupt the JSONL
+        # contract (each line = one valid object).
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, f"body is not valid JSON: {e}")
+        if not isinstance(obj, dict):
+            raise HTTPException(400, "judgment body must be a JSON object")
+
+        session = _sanitize_slug(request.query_params.get("session", "default"))
+        path = out_dir / f"live_{session}.jsonl"
+
+        # Hard cap on file size — refuse the append rather than truncating
+        # existing data, so a buggy client can't lose history.
+        try:
+            existing = path.stat().st_size
+        except FileNotFoundError:
+            existing = 0
+        line = json.dumps(obj, separators=(",", ":")) + "\n"
+        line_bytes = line.encode("utf-8")
+        if existing + len(line_bytes) > _LIVE_FILE_MAX_BYTES:
+            raise HTTPException(
+                413,
+                f"live judgment file at cap ({existing} + {len(line_bytes)} > {_LIVE_FILE_MAX_BYTES})",
+            )
+        # Append-mode write — POSIX `O_APPEND` makes this atomic per-line
+        # even under concurrent requests from a split-screen scenario.
+        with path.open("ab") as f:
+            f.write(line_bytes)
+        return {"ok": True, "appended": len(line_bytes), "file": f"static/{_RECORDINGS_REL}/{path.name}"}
