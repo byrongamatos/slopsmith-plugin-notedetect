@@ -128,10 +128,15 @@ def setup(app, context):
         # Parse + re-emit so we (a) reject malformed JSON early and (b)
         # guarantee one self-contained record per line. A buggy client
         # POSTing a multi-line string would otherwise corrupt the JSONL
-        # contract (each line = one valid object).
+        # contract (each line = one valid object). Handle both
+        # JSONDecodeError (well-formed UTF-8, bad JSON) AND
+        # UnicodeDecodeError (raw bytes that aren't valid UTF-8) as
+        # 400s — otherwise the latter trickles up as a 500 from
+        # `json.loads`, which is misleading to a client sending bad
+        # input.
         try:
             obj = json.loads(body)
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise HTTPException(400, f"body is not valid JSON: {e}")
         if not isinstance(obj, dict):
             raise HTTPException(400, "judgment body must be a JSON object")
@@ -140,7 +145,15 @@ def setup(app, context):
         path = out_dir / f"live_{session}.jsonl"
 
         # Hard cap on file size — refuse the append rather than truncating
-        # existing data, so a buggy client can't lose history.
+        # existing data, so a buggy client can't lose history. NOTE: the
+        # pre-check + append is racy across concurrent POSTs to the same
+        # session — two requests can both see `existing` below the cap
+        # and then both write, briefly exceeding it. In practice this is
+        # bounded by (concurrent-clients × _LIVE_JUDGMENT_MAX_BYTES), and
+        # a typical live session has one client per session id, so the
+        # race is theoretical. If a future scenario (shared session
+        # across multiple panels) makes it real, the fix is to hold a
+        # per-session asyncio.Lock around the stat + append.
         try:
             existing = path.stat().st_size
         except FileNotFoundError:

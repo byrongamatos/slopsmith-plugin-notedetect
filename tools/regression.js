@@ -70,46 +70,108 @@ if (!Array.isArray(fixtures) || fixtures.length === 0) {
 const harnessJs = path.resolve(__dirname, 'harness.js');
 const results = [];
 
-for (const fx of fixtures) {
+for (const [idx, fx] of fixtures.entries()) {
+    // Validate the fixture's shape BEFORE path.resolve, which throws
+    // TypeError on a non-string and would crash the whole run for the
+    // one malformed entry. Surface a clear error instead so the user
+    // can fix that line and re-run.
+    const fxName = (typeof fx?.name === 'string' && fx.name) || `<unnamed fixture #${idx}>`;
+    if (!fx || typeof fx !== 'object') {
+        process.stdout.write(`[skip] ${fxName}  (fixture is not an object)\n`);
+        results.push({ name: fxName, status: 'skipped', reason: 'invalid-fixture' });
+        continue;
+    }
+    if (typeof fx.audio !== 'string' || !fx.audio
+        || typeof fx.chart !== 'string' || !fx.chart) {
+        process.stdout.write(`[skip] ${fxName}  (fixture missing required string field: audio | chart)\n`);
+        results.push({ name: fxName, status: 'skipped', reason: 'invalid-fixture' });
+        continue;
+    }
+    if (fx.args !== undefined && !Array.isArray(fx.args)) {
+        process.stdout.write(`[skip] ${fxName}  (fixture 'args' must be an array if present)\n`);
+        results.push({ name: fxName, status: 'skipped', reason: 'invalid-fixture' });
+        continue;
+    }
     const audio = path.resolve(repoRoot, fx.audio);
     const chart = path.resolve(repoRoot, fx.chart);
     if (!fs.existsSync(audio)) {
-        process.stdout.write(`[skip] ${fx.name}  (audio missing: ${fx.audio})\n`);
-        results.push({ name: fx.name, status: 'skipped', reason: 'audio-missing' });
+        process.stdout.write(`[skip] ${fxName}  (audio missing: ${fx.audio})\n`);
+        results.push({ name: fxName, status: 'skipped', reason: 'audio-missing' });
         continue;
     }
     if (!fs.existsSync(chart)) {
-        process.stdout.write(`[skip] ${fx.name}  (chart missing: ${fx.chart})\n`);
-        results.push({ name: fx.name, status: 'skipped', reason: 'chart-missing' });
+        process.stdout.write(`[skip] ${fxName}  (chart missing: ${fx.chart})\n`);
+        results.push({ name: fxName, status: 'skipped', reason: 'chart-missing' });
         continue;
     }
     const tmpOut = path.join(require('node:os').tmpdir(), `regression_${process.pid}_${results.length}.json`);
     const argv = [harnessJs, '--audio', audio, '--chart', chart, '--out', tmpOut, ...(fx.args || [])];
     if (args.verbose) argv.push('--verbose');
-    const run = spawnSync(process.execPath, argv, { encoding: 'utf8' });
-    if (run.status !== 0) {
-        process.stdout.write(`[fail] ${fx.name}  (harness exit ${run.status})\n`);
-        if (args.verbose) process.stderr.write(run.stderr || '');
-        results.push({ name: fx.name, status: 'error', reason: run.stderr || 'unknown' });
-        continue;
+    try {
+        const run = spawnSync(process.execPath, argv, { encoding: 'utf8' });
+        // spawnSync reports failure two ways: `run.error` is set when
+        // the spawn itself failed (bad execPath, EACCES, ENOENT), and
+        // `run.status` is non-zero when the child started but exited
+        // unhappily. We were only checking the latter — a spawn
+        // failure showed up as a misleading "harness exit null".
+        if (run.error) {
+            process.stdout.write(`[fail] ${fxName}  (spawn failed: ${run.error.message})\n`);
+            results.push({ name: fxName, status: 'error', reason: `spawn: ${run.error.message}` });
+            continue;
+        }
+        if (run.status !== 0) {
+            process.stdout.write(`[fail] ${fxName}  (harness exit ${run.status})\n`);
+            if (args.verbose) process.stderr.write(run.stderr || '');
+            results.push({ name: fxName, status: 'error', reason: run.stderr || 'unknown' });
+            continue;
+        }
+        // Try/finally so a malformed harness output (truncated write,
+        // un-parseable JSON) doesn't leak the temp file across runs.
+        let diag;
+        try {
+            diag = JSON.parse(fs.readFileSync(tmpOut, 'utf8'));
+        } catch (e) {
+            process.stdout.write(`[fail] ${fxName}  (could not parse harness output: ${e.message})\n`);
+            results.push({ name: fxName, status: 'error', reason: `parse: ${e.message}` });
+            continue;
+        }
+        const hits = diag.summary.hits;
+        const total = diag.summary.total;
+        const pure = (diag.miss_breakdown || {}).pure || 0;
+        const chord = (diag.miss_breakdown || {}).chordPartial || 0;
+        results.push({
+            name: fxName, status: 'ok',
+            hits, total, accuracy: total > 0 ? hits / total : 0,
+            pure, chord,
+        });
+    } finally {
+        // Always clean up the temp file, regardless of how the run
+        // exited. Previously the unlink only fired after a successful
+        // parse, so parse failures + spawn errors left growing crud
+        // in /tmp across runs.
+        try { fs.unlinkSync(tmpOut); } catch (_) { /* already gone */ }
     }
-    const diag = JSON.parse(fs.readFileSync(tmpOut, 'utf8'));
-    fs.unlinkSync(tmpOut);
-    const hits = diag.summary.hits;
-    const total = diag.summary.total;
-    const pure = (diag.miss_breakdown || {}).pure || 0;
-    const chord = (diag.miss_breakdown || {}).chordPartial || 0;
-    results.push({
-        name: fx.name, status: 'ok',
-        hits, total, accuracy: total > 0 ? hits / total : 0,
-        pure, chord,
-    });
 }
 
-// Build comparison table.
-const baseline = (args.baseline && fs.existsSync(path.resolve(repoRoot, args.baseline)))
-    ? JSON.parse(fs.readFileSync(path.resolve(repoRoot, args.baseline), 'utf8'))
-    : null;
+// Build comparison table. If --baseline was supplied but the file
+// doesn't exist, error out — silently degrading to "no baseline, exit 0"
+// turns a typo'd path into a clean-looking run that secretly compared
+// nothing. Far worse than just shouting at the user.
+let baseline = null;
+if (args.baseline) {
+    const baselinePath = path.resolve(repoRoot, args.baseline);
+    if (!fs.existsSync(baselinePath)) {
+        process.stderr.write(`[regression] --baseline file not found: ${baselinePath}\n`);
+        process.stderr.write(`             (run with --update-baseline first to create one)\n`);
+        process.exit(2);
+    }
+    try {
+        baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8'));
+    } catch (e) {
+        process.stderr.write(`[regression] --baseline file is not valid JSON: ${e.message}\n`);
+        process.exit(2);
+    }
+}
 const baselineMap = new Map();
 if (baseline && baseline.results) {
     for (const r of baseline.results) baselineMap.set(r.name, r);

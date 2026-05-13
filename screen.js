@@ -1311,6 +1311,7 @@ function createNoteDetector(options = {}) {
     let _recLastSavePath = null;      // host-visible relative path of the most recent save
     let _recLastSaveError = null;     // surfaced in the UI when a save fails
     let _recSaveInFlight = false;     // de-dupe rapid saves
+    let _recCappedAt = null;          // seconds into the take where the client-side cap kicked in (null = no cap hit)
     // slopsmith#254 — per-sustained-hit-note "still being held on-pitch"
     // grace timestamps: key -> performance.now() ms before which the
     // sustain still counts as actively held. Smooths the gap between
@@ -2037,9 +2038,26 @@ function createNoteDetector(options = {}) {
         // the home screen.
         if (_recArmed && _recSongPlaying) {
             _recSampleRate = audioCtx ? audioCtx.sampleRate : (bridgeSampleRate || _recSampleRate);
-            // slice() because the analyser may overwrite the buffer the
-            // next time processFrame fires.
-            _recChunks.push(buffer.slice());
+            // Client-side cap mirrors the routes.py 32 MB / 8 min ceiling so
+            // a runaway arm (user walks away with Detect still capturing) can't
+            // balloon the page's heap before the server-side cap rejects the
+            // upload. 32 MB / (sr * 4 bytes per Float32) ≈ 190 s at 44.1 kHz
+            // — well past a single benchmark take. When we hit it, the buffer
+            // stays at the cap and `_recCappedAt` flips so the save path can
+            // surface a "truncated" note on the resulting WAV.
+            const totalSamples = _recChunks.reduce((s, c) => s + c.length, 0);
+            const sr = _recSampleRate || 44100;
+            const maxSamples = Math.floor((32 * 1024 * 1024) / 4);   // bytes / 4 = Float32 samples
+            if (totalSamples >= maxSamples) {
+                if (!_recCappedAt) _recCappedAt = totalSamples / sr;
+                // Silently drop further frames — the cap is the upper bound
+                // and we'd rather keep the first N minutes than truncate the
+                // tail of a long take.
+            } else {
+                // slice() because the analyser may overwrite the buffer the
+                // next time processFrame fires.
+                _recChunks.push(buffer.slice());
+            }
         }
     }
 
@@ -4177,6 +4195,7 @@ function createNoteDetector(options = {}) {
         _recArmed = true;
         _recChunks = [];
         _recLastSaveError = null;
+        _recCappedAt = null;
         // Bind song-event listeners lazily so an idle plugin instance
         // doesn't sit on the slopsmith bus. Unbind in disarm / save /
         // destroy. Idempotent.
@@ -4195,6 +4214,7 @@ function createNoteDetector(options = {}) {
         _recArmed = false;
         _recChunks = [];
         _recLastSaveError = null;
+        _recCappedAt = null;
         _recUnbindEvents();
     }
     async function saveRecordingNow() {
@@ -4203,12 +4223,16 @@ function createNoteDetector(options = {}) {
             _recLastSaveError = 'no audio captured (Detect off, or song never played)';
             return null;
         }
+        // Snapshot the buffer (alias, not copy) and disarm so any
+        // song:ended fired mid-upload doesn't re-enter this path. We
+        // intentionally DO NOT clear _recChunks here — if the POST
+        // fails the user keeps their take and can retry via the Save
+        // button. Earlier behaviour cleared synchronously, which meant
+        // a network error or 413 from the server-side cap silently
+        // destroyed a recorded session with no way to recover.
         const chunks = _recChunks;
         const sr = _recSampleRate;
-        // Disarm + clear synchronously so a song:ended fired mid-save
-        // doesn't double-encode the same buffer.
         _recArmed = false;
-        _recChunks = [];
         _recSaveInFlight = true;
         try {
             const wav = _ndEncodeWavPcm16(chunks, sr);
@@ -4223,10 +4247,18 @@ function createNoteDetector(options = {}) {
             const data = await resp.json();
             _recLastSavePath = data && data.relative_path || null;
             _recLastSaveError = null;
+            // SUCCESS — only NOW clear the buffer, so a failed upload
+            // doesn't lose the user's audio. _recCappedAt also resets
+            // since the take that was capped has shipped.
+            _recChunks = [];
+            _recCappedAt = null;
             return data;
         } catch (e) {
             _recLastSaveError = String(e && e.message || e);
             console.warn('[note_detect] saveRecording failed:', e);
+            // Buffer intentionally left in _recChunks so the user can
+            // retry via the Save button after fixing the underlying
+            // issue (server restart, larger cap, etc.).
             return null;
         } finally {
             _recSaveInFlight = false;
@@ -4246,6 +4278,10 @@ function createNoteDetector(options = {}) {
             saveInFlight: _recSaveInFlight,
             lastSavePath: _recLastSavePath,
             lastError:    _recLastSaveError,
+            // null = no cap hit; otherwise the second-mark where the client-
+            // side 32 MB cap kicked in. UI can surface "your take was
+            // truncated at X s".
+            cappedAtS:    _recCappedAt,
             // Recording requires the audio pipeline to be live — surface
             // it here so the UI can prompt the user to enable Detect.
             detectEnabled: enabled,
