@@ -2680,14 +2680,6 @@ function createNoteDetector(options = {}) {
                 Chord detection uses per-string band analysis. This sets how many strings must ring to count as a hit (e.g. 60% = 4 of 6). Lower for beginners or dense voicings.
             </div>
 
-            <label class="flex items-center gap-2 text-gray-400 text-xs mb-1 mt-1">
-                <input type="checkbox" class="nd-tuning-mode accent-green-400" ${tuningMode ? 'checked' : ''}>
-                Detection tuning (advanced)
-            </label>
-            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-                Off by default. Turns on the developer surfaces for tuning detection: <strong>Reference Recording</strong> capture, <strong>Diagnostic JSON</strong> export, the miss-category breakdown on the end-of-song summary. Pair with the headless harness (<code>tools/harness.js</code>) for offline parameter sweeps.
-            </div>
-
             <div class="text-[10px] text-gray-600 mt-1 leading-tight">
                 Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
                 See the <b>Pitch Detection Methods</b> section of the plugin README for guidance on choosing between YIN, HPS, and CREPE.
@@ -2754,15 +2746,6 @@ function createNoteDetector(options = {}) {
                 // Clear any flash that's mid-fade so it doesn't linger.
                 const fe = instanceRoot.querySelector('.nd-flash-overlay');
                 if (fe) fe.style.borderColor = 'transparent';
-            }
-            saveSettings();
-        };
-        panel.querySelector('.nd-tuning-mode').onchange = (e) => {
-            tuningMode = !!e.target.checked;
-            // If the user disarms tuning mid-recording, drop any captured
-            // audio and disarm — the UI for it is about to disappear.
-            if (!tuningMode && (_recArmed || _recChunks.length > 0)) {
-                disarmRecording();
             }
             saveSettings();
         };
@@ -4134,10 +4117,24 @@ function createNoteDetector(options = {}) {
         downloadDiagnostic: _downloadDiagnostic,
         getDiagnostic: _buildDiagnosticPayload,
         resetDiagnostic: resetScoring,
-        // Tuning-mode gate. Off by default; flipped in the gear popover.
-        // Other UI (settings.html, the summary modal's breakdown) polls
-        // this to decide whether to show the developer-only surfaces.
+        // Tuning-mode gate. Off by default; flipped on/off from the
+        // Settings page (the developer surfaces it gates live there too,
+        // so the toggle and the panels it reveals are in one place).
+        // Other UI — the summary modal's breakdown / Download button —
+        // polls this to decide whether to render the dev-only surfaces.
         isTuningMode: () => tuningMode,
+        setTuningMode: (v) => {
+            const next = !!v;
+            if (next === tuningMode) return;
+            tuningMode = next;
+            // If the user disables tuning mid-recording, drop the
+            // in-flight buffer + disarm — the UI for it is about to
+            // disappear and we don't want a half-captured WAV trailing.
+            if (!tuningMode && (_recArmed || _recChunks.length > 0)) {
+                disarmRecording();
+            }
+            saveSettings();
+        },
         // Reference-recording capture for the headless harness. Arms
         // the next song-play to capture the detector's input audio,
         // auto-saves on song:ended. POSTs the WAV to the plugin's

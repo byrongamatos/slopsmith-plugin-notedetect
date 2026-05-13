@@ -10,15 +10,25 @@
 <div class="space-y-6">
     <div>
         <p class="text-xs text-gray-500 leading-relaxed">
-            Detection options (device, channel, tolerances, label toggles, screen-edge flash, chord leniency) live in the gear popover next to the <strong>Detect</strong> button on the player screen — open while a song is loaded.
+            Detection options for live play (device, channel, tolerances, label toggles, screen-edge flash, chord leniency) live in the gear popover next to the <strong>Detect</strong> button on the player screen.
         </p>
     </div>
 
-    <!-- Tuning-mode notice: shown only when tuning mode is OFF. The
-         Reference Recording + Diagnostic panels below are hidden until
-         the user opts in via the gear popover. -->
-    <div id="nd-tuning-off-hint" class="hidden bg-dark-700/40 border border-dashed border-gray-800 rounded-xl p-4 text-xs text-gray-500 leading-relaxed">
-        Detection-tuning surfaces (Reference Recording, Diagnostic JSON export, the miss-category breakdown on the end-of-session summary) are <strong>off by default</strong>. Open the player, click the <strong>gear icon</strong> next to Detect, and tick <strong>"Detection tuning (advanced)"</strong> to reveal them here.
+    <!-- Tuning-mode toggle. Lives here (where the panels it gates also
+         live) so the user doesn't have to bounce between the gear
+         popover and this page just to reveal developer surfaces.
+         Persisted in localStorage via the plugin's saveSettings(). -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
+        <label class="flex items-start gap-3 cursor-pointer select-none">
+            <input type="checkbox" id="nd-tuning-mode"
+                   class="mt-0.5 rounded border-gray-600 bg-dark-700 text-accent focus:ring-accent/40">
+            <span class="text-sm text-gray-300">
+                Detection tuning (advanced)
+                <span class="block text-[11px] text-gray-500 leading-relaxed mt-1">
+                    Off by default. Turns on the developer surfaces: <strong>Reference Recording</strong> capture, <strong>Diagnostic JSON</strong> export + Reset, and the miss-category breakdown on the end-of-session summary. Pair with the headless harness (<code>plugins/note_detect/tools/harness.js</code>) for offline parameter sweeps.
+                </span>
+            </span>
+        </label>
     </div>
 
     <div id="nd-tuning-panels" class="space-y-6 hidden">
@@ -192,13 +202,15 @@
     function render() {
         const nd = window.noteDetect;
 
-        // Tuning-mode gate. Off by default → show a one-line hint, hide
-        // the developer panels entirely. The gate auto-updates when the
-        // user flips the checkbox in the gear popover and we re-render.
+        // Tuning-mode gate. Off by default → just the toggle is visible;
+        // the Reference Recording + Diagnostic panels stay hidden. The
+        // checkbox state is sourced from the plugin singleton (not the
+        // DOM) so it stays in sync if some other surface flips the flag.
         const tuning = !!(nd && typeof nd.isTuningMode === 'function' && nd.isTuningMode());
-        const hint   = _q('nd-tuning-off-hint');
+        const cb     = _q('nd-tuning-mode');
         const panels = _q('nd-tuning-panels');
-        if (hint)   hint.classList.toggle('hidden', tuning);
+        if (cb && cb.checked !== tuning) cb.checked = tuning;
+        if (cb) cb.disabled = !nd;
         if (panels) panels.classList.toggle('hidden', !tuning);
         if (!tuning) return;   // nothing else to render — panels are hidden
 
@@ -296,6 +308,16 @@
     }
     const rfBtn = _q('nd-diag-refresh');
     if (rfBtn) rfBtn.onclick = render;
+
+    // Tuning-mode toggle — drives whether the panels below show.
+    const tuneCb = _q('nd-tuning-mode');
+    if (tuneCb) {
+        tuneCb.onchange = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.setTuningMode === 'function') nd.setTuningMode(tuneCb.checked);
+            render();
+        };
+    }
 
     // Recording buttons
     const armBtn  = _q('nd-rec-arm');
