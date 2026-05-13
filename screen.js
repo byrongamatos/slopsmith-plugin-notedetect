@@ -255,11 +255,21 @@ function _ndMidiFromStringFret(string, fret, arrangement, stringCount, offsets, 
     return base[string] + offset + (capo || 0) + fret;
 }
 
-function _ndClassifyTiming(timingErrorMs, timingThresholdMs) {
+function _ndClassifyTiming(timingErrorMs, timingThresholdMs, lateGraceMs) {
     if (!Number.isFinite(timingErrorMs)) return null;
-    return Math.abs(timingErrorMs) <= timingThresholdMs
-        ? 'OK'
-        : (timingErrorMs < 0 ? 'EARLY' : 'LATE');
+    const grace = Number.isFinite(lateGraceMs) && lateGraceMs > 0 ? lateGraceMs : 0;
+    // Asymmetric for sus-marked notes (caller passes grace > 0): the
+    // EARLY side stays strict — playing before the note is always
+    // wrong — but late detection within the sustain envelope is still
+    // a hit, because the note is *audibly* the right one. Without this,
+    // a player who plucks a few hundred ms after the chart time on a
+    // half-note (which YIN may take ~100 ms to confidently lock) gets
+    // a LATE miss even though they're hearing themselves play the
+    // correct note over the strike-line ring.
+    if (timingErrorMs < 0) {
+        return Math.abs(timingErrorMs) <= timingThresholdMs ? 'OK' : 'EARLY';
+    }
+    return timingErrorMs <= timingThresholdMs + grace ? 'OK' : 'LATE';
 }
 
 function _ndClassifyPitch(pitchErrorCents, pitchThresholdCents) {
@@ -280,7 +290,14 @@ function _ndMakeJudgment(opts) {
         : null;
     const timingThresholdMs = Number.isFinite(o.timingThresholdMs) ? o.timingThresholdMs : 100;
     const pitchThresholdCents = Number.isFinite(o.pitchThresholdCents) ? o.pitchThresholdCents : 20;
-    const timingState = matched ? _ndClassifyTiming(timingError, timingThresholdMs) : null;
+    // Derive late-side grace from the chart note's sustain. Capped at
+    // 1 s so a 4-second held note doesn't accept detections nearly 4
+    // seconds late as "on time" — at some point the player has clearly
+    // missed the strike and is just holding the previous note's ring.
+    const chartNote = o.chartNote || o.note || null;
+    const susSec = chartNote && Number.isFinite(chartNote.sus) ? chartNote.sus : 0;
+    const lateGraceMs = susSec > 0 ? Math.min(susSec * 1000, 1000) : 0;
+    const timingState = matched ? _ndClassifyTiming(timingError, timingThresholdMs, lateGraceMs) : null;
     const pitchState = matched ? _ndClassifyPitch(pitchError, pitchThresholdCents) : null;
     // pitchState === null means pitch was not measured (e.g. energy-only chord
     // check or harmonic flag).  Treat unmeasured pitch as non-blocking so a
@@ -2243,12 +2260,32 @@ function createNoteDetector(options = {}) {
 
         const candidateNotes = [];
 
+        // For sus-marked chart notes, allow late detection — the note is
+        // still audibly ringing past its nominal `t + tolerance`, and
+        // YIN may need ~80–100 ms of accumulated buffer to confidently
+        // lock on (longer for low E). Without this, players who pluck
+        // slightly late on a half- or whole-note get no judgment recorded
+        // at all (pure miss) instead of a hit-while-ringing. Cap the
+        // grace at MAX_SUS_LATE_GRACE so a 4-second sustain doesn't
+        // accept detections seconds after the strike.
+        const MAX_SUS_LATE_GRACE = 1.0;  // seconds
         if (notes && notes.length > 0) {
-            const start = bsearch(notes, t - tolerance);
+            // Bsearch from `t - tolerance - MAX_SUS_LATE_GRACE` so the
+            // scan picks up sus-marked notes whose nominal window has
+            // already closed but whose sustain envelope hasn't. The
+            // per-note filter below ensures non-sus notes still age out
+            // at the strict ±tolerance boundary.
+            const start = bsearch(notes, t - tolerance - MAX_SUS_LATE_GRACE);
             for (let i = start; i < notes.length; i++) {
                 const n = notes[i];
                 if (n.t > t + tolerance) break;
                 if (n.mt) continue;
+                // Non-sus notes use the strict past edge; sus notes get
+                // a grace bounded by both the chart's declared sustain
+                // and the global cap.
+                const susSec = Number.isFinite(n.sus) && n.sus > 0 ? n.sus : 0;
+                const lateGrace = susSec > 0 ? Math.min(susSec, MAX_SUS_LATE_GRACE) : 0;
+                if (n.t < t - tolerance - lateGrace) continue;
                 // Spread the chart note so technique flags (ho/po/b/sl/hm)
                 // travel with the candidate. _ndScoreChord reads these to
                 // adjust per-string thresholds, so dropping them here would
@@ -2514,6 +2551,13 @@ function createNoteDetector(options = {}) {
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         const tolerance = timingTolerance;
         const missDeadline = t - tolerance * 2;
+        // Mirror matchNotes' sus-late-grace policy. Without this, a sus
+        // note whose match window matchNotes is willing to extend gets
+        // retired here as a miss before that extended window has even
+        // closed — matchNotes never gets a chance to record the late
+        // hit. Cap matches matchNotes (kept loosely in sync via the
+        // same constant pattern so both paths shift together).
+        const MAX_SUS_LATE_GRACE = 1.0;
         const notes = hw.getNotes();
         const chords = hw.getChords();
 
@@ -2524,7 +2568,12 @@ function createNoteDetector(options = {}) {
         // the chart said it was sustained, which corrupts any
         // sus-conditioned analysis downstream.
         const checkNote = (chartNote, noteTime) => {
-            if (noteTime > missDeadline) return;
+            const susSec = Number.isFinite(chartNote.sus) && chartNote.sus > 0 ? chartNote.sus : 0;
+            const lateGrace = susSec > 0 ? Math.min(susSec, MAX_SUS_LATE_GRACE) : 0;
+            // Effective retire threshold: a sus note isn't retired
+            // until its sustain envelope has clearly elapsed, giving
+            // matchNotes the same grace period to lock on.
+            if (noteTime > missDeadline - lateGrace) return;
             const key = noteKey(chartNote, noteTime);
             if (!noteResults.has(key)) {
                 const expectedMidi = _ndMidiFromStringFret(
@@ -2537,8 +2586,15 @@ function createNoteDetector(options = {}) {
             }
         };
 
+        // Look back far enough that sus-marked notes whose grace just
+        // expired are still visited by this scan. Without this, the
+        // bsearch start moves forward each tick and overruns notes that
+        // were intentionally held past their normal retire window — they
+        // never get retired at all. The `+ 1` is the existing lookback
+        // slack; `MAX_SUS_LATE_GRACE` is the per-note extension we added.
+        const scanStartT = missDeadline - 1 - MAX_SUS_LATE_GRACE;
         if (notes && notes.length > 0) {
-            const start = bsearch(notes, missDeadline - 1);
+            const start = bsearch(notes, scanStartT);
             for (let i = start; i < notes.length; i++) {
                 const n = notes[i];
                 if (n.t > missDeadline) break;
@@ -2547,7 +2603,7 @@ function createNoteDetector(options = {}) {
             }
         }
         if (chords && chords.length > 0) {
-            const start = bsearch(chords, missDeadline - 1);
+            const start = bsearch(chords, scanStartT);
             for (let i = start; i < chords.length; i++) {
                 const c = chords[i];
                 if (c.t > missDeadline) break;
