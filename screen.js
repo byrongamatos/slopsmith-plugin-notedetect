@@ -1077,6 +1077,38 @@ function createNoteDetector(options = {}) {
     let sectionStats = [];   // [{name, hits, misses}]
     let currentSection = null;
     const noteResults = new Map(); // key -> judgment object
+
+    // ── Miss-category diagnostic (#254 follow-up) ─────────────────────
+    // Counts WHY a judgment missed so a session report can isolate the
+    // dominant failure mode — pure misses → mic/audio chain; chord-partial
+    // → leniency too tight; timing → window too narrow; pitch → tolerance
+    // too narrow. Each miss falls into exactly one primary bin (chord
+    // events into chordPartial regardless of axis); per-string + signed-
+    // error arrays let us see which strings the player is losing on and
+    // whether they trend sharp/flat or early/late. Reset alongside
+    // hits/misses in resetScoring(); refs stay stable across reset.
+    const _diagBreakdown = {
+        pure: 0,           // miss, no pitch detected within the timing window
+        chordPartial: 0,   // chord event below the chord-leniency threshold
+        early: 0,
+        late: 0,
+        sharp: 0,
+        flat: 0,
+    };
+    const _diagSingles = { hits: 0, misses: 0 };
+    const _diagChords  = { hits: 0, misses: 0 };
+    // Per-string. 8 covers 4/5/6/7/8-string arrangements without resizing.
+    const _diagPerString = Array.from({ length: 8 }, () => ({ hits: 0, misses: 0 }));
+    // Signed errors for matched judgments (excludes pure misses where no
+    // measurement exists). Capped to keep memory bounded across long
+    // sessions; percentiles in the summary run on the raw array.
+    const _DIAG_ERROR_CAP = 2000;
+    const _diagTimingErrors = [];   // milliseconds, sign = positive late / negative early
+    const _diagPitchErrors  = [];   // cents,        sign = positive sharp / negative flat
+    // Per-judgment event capture for the downloadable JSON. Capped at a
+    // size that keeps the JSON small enough to share via copy-paste.
+    const _DIAG_EVENT_CAP = 2000;
+    const _diagEvents = [];
     // slopsmith#254 — per-sustained-hit-note "still being held on-pitch"
     // grace timestamps: key -> performance.now() ms before which the
     // sustain still counts as actively held. Smooths the gap between
@@ -1959,9 +1991,112 @@ function createNoteDetector(options = {}) {
         });
     }
 
+    // Bin one judgment into the diagnostic counters. Called from inside
+    // recordJudgment under the same `count` gate so this never double-
+    // counts (chord events fire one chord-level judgment plus per-string
+    // ones; only the chord-level passes count=true). One miss → exactly
+    // one primary-cause bin (chord events into chordPartial regardless
+    // of axis; non-chord misses chosen as pure → timing → pitch in that
+    // priority, so a single bar height adds up to total misses).
+    function _recordDiagnostic(judgment) {
+        const isChord = !!judgment.chord;
+        if (judgment.hit) {
+            (isChord ? _diagChords : _diagSingles).hits++;
+        } else {
+            (isChord ? _diagChords : _diagSingles).misses++;
+            if (isChord) {
+                _diagBreakdown.chordPartial++;
+            } else if (judgment.detectedMidi == null) {
+                _diagBreakdown.pure++;
+            } else if (judgment.timingState === 'EARLY') {
+                _diagBreakdown.early++;
+            } else if (judgment.timingState === 'LATE') {
+                _diagBreakdown.late++;
+            } else if (judgment.pitchState === 'SHARP') {
+                _diagBreakdown.sharp++;
+            } else if (judgment.pitchState === 'FLAT') {
+                _diagBreakdown.flat++;
+            } else {
+                // Defensive fallback — keep totals balanced if a future
+                // judgment shape doesn't trip any axis (shouldn't happen
+                // today). Land it in pure so the bin sums still match.
+                _diagBreakdown.pure++;
+            }
+        }
+        const n = judgment.chartNote || judgment.note;
+        if (n && Number.isInteger(n.s) && n.s >= 0 && n.s < _diagPerString.length) {
+            const slot = _diagPerString[n.s];
+            if (judgment.hit) slot.hits++; else slot.misses++;
+        }
+        if (Number.isFinite(judgment.timingError) && _diagTimingErrors.length < _DIAG_ERROR_CAP) {
+            _diagTimingErrors.push(judgment.timingError);
+        }
+        if (Number.isFinite(judgment.pitchError) && _diagPitchErrors.length < _DIAG_ERROR_CAP) {
+            _diagPitchErrors.push(judgment.pitchError);
+        }
+        if (_diagEvents.length < _DIAG_EVENT_CAP) {
+            const nn = judgment.chartNote || judgment.note || {};
+            _diagEvents.push({
+                t:   Number.isFinite(judgment.noteTime) ? +judgment.noteTime.toFixed(3) : null,
+                at:  Number.isFinite(judgment.time)     ? +judgment.time.toFixed(3)     : null,
+                s:   Number.isInteger(nn.s) ? nn.s : null,
+                f:   Number.isInteger(nn.f) ? nn.f : null,
+                sus: Number.isFinite(nn.sus) ? +(+nn.sus).toFixed(3) : 0,
+                hit:   !!judgment.hit,
+                chord: !!judgment.chord,
+                ts:  judgment.timingState || null,
+                ps:  judgment.pitchState  || null,
+                te:  Number.isFinite(judgment.timingError) ? judgment.timingError : null,
+                pe:  Number.isFinite(judgment.pitchError)  ? judgment.pitchError  : null,
+                ex:  Number.isFinite(judgment.expectedMidi) ? judgment.expectedMidi : null,
+                dx:  Number.isFinite(judgment.detectedMidi) ? judgment.detectedMidi : null,
+                cnf: Number.isFinite(judgment.confidence) ? +judgment.confidence.toFixed(3) : 0,
+                hs:  Number.isFinite(judgment.hitStrings)   ? judgment.hitStrings   : undefined,
+                tt:  Number.isFinite(judgment.totalStrings) ? judgment.totalStrings : undefined,
+                sc:  Number.isFinite(judgment.score) ? +judgment.score.toFixed(3) : undefined,
+                tf:  _diagTechFlags(nn),
+            });
+        }
+    }
+
+    function _diagTechFlags(n) {
+        if (!n) return null;
+        const flags = [];
+        if (n.bn)               flags.push('B');    // bend
+        if (n.sl != null && n.sl >= 0) flags.push('S');    // slide
+        if (n.hm || n.hp)       flags.push('H');    // harmonic / pinch
+        if (n.ho)               flags.push('h');    // hammer-on
+        if (n.po)               flags.push('p');    // pull-off
+        if (n.tp)               flags.push('t');    // tap
+        if (n.pm)               flags.push('PM');   // palm mute
+        if (n.mt)               flags.push('M');    // muted
+        if (n.tr)               flags.push('TR');   // tremolo
+        if (n.ac)               flags.push('A');    // accent
+        if ((+n.sus || 0) > 0)  flags.push('SUS');
+        return flags.length ? flags.join(',') : null;
+    }
+
+    function _diagPercentile(arr, p) {
+        if (!arr || !arr.length) return null;
+        const sorted = arr.slice().sort((a, b) => a - b);
+        const idx = Math.max(0, Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length)));
+        return sorted[idx];
+    }
+
+    function _diagResetCounters() {
+        for (const k of Object.keys(_diagBreakdown)) _diagBreakdown[k] = 0;
+        _diagSingles.hits = 0; _diagSingles.misses = 0;
+        _diagChords.hits  = 0; _diagChords.misses  = 0;
+        for (const slot of _diagPerString) { slot.hits = 0; slot.misses = 0; }
+        _diagTimingErrors.length = 0;
+        _diagPitchErrors.length  = 0;
+        _diagEvents.length       = 0;
+    }
+
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
         noteResults.set(key, judgment);
         if (count) {
+            _recordDiagnostic(judgment);
             // No per-judgment sync — the host getLoop() poll would land
             // on the scoring hot path. Instead we sync at enable()
             // (closes the post-enable gap) and rely on updateHUD's
@@ -3000,6 +3135,7 @@ function createNoteDetector(options = {}) {
         bestStreak = 0;
         noteResults.clear();
         _susActiveUntil.clear();
+        _diagResetCounters();
         sectionStats = [];
         currentSection = null;
         detectedMidi = -1;
@@ -3473,6 +3609,111 @@ function createNoteDetector(options = {}) {
         else await enable();
     }
 
+    // Builds a self-contained snapshot of the current session — counters,
+    // miss-category breakdown, per-string hit rate, signed error
+    // percentiles, the song/arrangement/tuning, the detector settings,
+    // and a capped per-judgment event log. Schema is versioned so future
+    // tooling can dispatch. `benchmark_hint` carries the song's title/
+    // artist/arrangement triple verbatim so reports against the official
+    // benchmark sloppak can be filtered without needing a strict match.
+    function _buildDiagnosticPayload() {
+        const currentHw = resolveHw();
+        const info = (currentHw && currentHw.getSongInfo) ? currentHw.getSongInfo() : {};
+        const total = hits + misses;
+        const sumAcc = total > 0 ? +(hits / total).toFixed(3) : 0;
+        const sAcc = (_diagSingles.hits + _diagSingles.misses) > 0
+            ? +(_diagSingles.hits / (_diagSingles.hits + _diagSingles.misses)).toFixed(3) : 0;
+        const cAcc = (_diagChords.hits + _diagChords.misses) > 0
+            ? +(_diagChords.hits / (_diagChords.hits + _diagChords.misses)).toFixed(3) : 0;
+        return {
+            schema: 'note_detect.diagnostic.v1',
+            timestamp: new Date().toISOString(),
+            plugin_version: '1.4.0',
+            benchmark_hint: {
+                title: info.title || null,
+                artist: info.artist || null,
+                arrangement: info.arrangement || null,
+                arrangement_index: (info.arrangement_index != null) ? info.arrangement_index : null,
+            },
+            song: {
+                tuning: info.tuning || null,
+                capo: (info.capo != null) ? info.capo : 0,
+                duration: (info.duration != null) ? info.duration : null,
+                format: info.format || null,
+            },
+            settings: {
+                method: detectionMethod,
+                timing_tolerance_s: timingTolerance,
+                timing_hit_threshold_s: timingHitThreshold,
+                pitch_tolerance_cents: pitchTolerance,
+                pitch_hit_threshold_cents: pitchHitThreshold,
+                chord_hit_ratio: chordHitRatio,
+                latency_offset_s: latencyOffset,
+                input_gain: inputGain,
+                channel: selectedChannel,
+            },
+            summary: {
+                hits, misses, total,
+                accuracy: sumAcc,
+                best_streak: bestStreak,
+                singles: { hits: _diagSingles.hits, misses: _diagSingles.misses, accuracy: sAcc },
+                chords:  { hits: _diagChords.hits,  misses: _diagChords.misses,  accuracy: cAcc },
+            },
+            miss_breakdown: { ..._diagBreakdown },
+            per_string: _diagPerString.map((slot, s) => ({
+                s,
+                hits: slot.hits,
+                misses: slot.misses,
+                total: slot.hits + slot.misses,
+                accuracy: (slot.hits + slot.misses) > 0
+                    ? +(slot.hits / (slot.hits + slot.misses)).toFixed(3) : null,
+            })),
+            timing_error_ms: {
+                count:   _diagTimingErrors.length,
+                p10:     _diagPercentile(_diagTimingErrors, 10),
+                median:  _diagPercentile(_diagTimingErrors, 50),
+                p90:     _diagPercentile(_diagTimingErrors, 90),
+            },
+            pitch_error_cents: {
+                count:   _diagPitchErrors.length,
+                p10:     _diagPercentile(_diagPitchErrors, 10),
+                median:  _diagPercentile(_diagPitchErrors, 50),
+                p90:     _diagPercentile(_diagPitchErrors, 90),
+            },
+            sections: sectionStats.map(s => ({
+                name: s.name,
+                hits: s.hits,
+                misses: s.misses,
+                accuracy: (s.hits + s.misses) > 0
+                    ? +(s.hits / (s.hits + s.misses)).toFixed(3) : 0,
+            })),
+            events: _diagEvents,
+        };
+    }
+
+    function _downloadDiagnostic() {
+        try {
+            const payload = _buildDiagnosticPayload();
+            const json = JSON.stringify(payload, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const slug = (payload.benchmark_hint.title || 'song')
+                .replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 40);
+            const ts = payload.timestamp.replace(/[:.]/g, '-').slice(0, 19);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `note_detect_diag_${slug}_${ts}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 500);
+            return true;
+        } catch (e) {
+            console.warn('[note_detect] diagnostic download failed:', e);
+            return false;
+        }
+    }
+
     function showSummary() {
         const total = hits + misses;
         if (total < 5) return;
@@ -3502,12 +3743,58 @@ function createNoteDetector(options = {}) {
             sectionHtml += '</div>';
         }
 
+        // Miss-category breakdown (#254 follow-up) — bars sum to total misses
+        // so the dominant failure mode is visible at a glance.
+        let breakdownHtml = '';
+        if (misses > 0) {
+            const labels = {
+                pure:         ['Pure (no pitch)',    'bg-gray-500'],
+                chordPartial: ['Chord — partial',    'bg-purple-500'],
+                early:        ['Timing — early',     'bg-orange-500'],
+                late:         ['Timing — late',      'bg-orange-500'],
+                sharp:        ['Pitch — sharp',      'bg-cyan-500'],
+                flat:         ['Pitch — flat',       'bg-cyan-500'],
+            };
+            breakdownHtml = '<div class="mt-3 text-xs"><div class="text-gray-400 mb-1">Miss Breakdown:</div>';
+            for (const k of Object.keys(labels)) {
+                const v = _diagBreakdown[k] || 0;
+                if (v === 0) continue;
+                const pct = Math.round((v / misses) * 100);
+                breakdownHtml += `
+                    <div class="flex items-center gap-2 mb-1">
+                        <span class="w-24 text-gray-300">${labels[k][0]}</span>
+                        <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
+                            <div class="${labels[k][1]} h-full rounded" style="width:${pct}%"></div>
+                        </div>
+                        <span class="w-12 text-right text-gray-400">${v} <span class="text-gray-600">(${pct}%)</span></span>
+                    </div>
+                `;
+            }
+            const timingMed = _diagPercentile(_diagTimingErrors, 50);
+            const pitchMed  = _diagPercentile(_diagPitchErrors, 50);
+            if (timingMed != null || pitchMed != null) {
+                breakdownHtml += '<div class="mt-2 text-[10px] text-gray-500">';
+                if (timingMed != null) {
+                    const tp10 = _diagPercentile(_diagTimingErrors, 10);
+                    const tp90 = _diagPercentile(_diagTimingErrors, 90);
+                    breakdownHtml += `Timing err (ms): median ${timingMed}, p10..p90 [${tp10}..${tp90}]<br>`;
+                }
+                if (pitchMed != null) {
+                    const pp10 = _diagPercentile(_diagPitchErrors, 10);
+                    const pp90 = _diagPercentile(_diagPitchErrors, 90);
+                    breakdownHtml += `Pitch err (¢): median ${pitchMed}, p10..p90 [${pp10}..${pp90}]`;
+                }
+                breakdownHtml += '</div>';
+            }
+            breakdownHtml += '</div>';
+        }
+
         const overlay = document.createElement('div');
         overlay.className = 'nd-summary-overlay fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
         overlay.style.pointerEvents = 'auto';
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
         overlay.innerHTML = `
-            <div class="bg-dark-700 border border-gray-600 rounded-2xl p-6 w-80 shadow-2xl">
+            <div class="bg-dark-700 border border-gray-600 rounded-2xl p-6 w-96 max-h-[88vh] overflow-y-auto shadow-2xl">
                 <div class="text-center mb-4">
                     <div class="text-3xl font-bold ${accuracy >= 90 ? 'text-green-400' : accuracy >= 70 ? 'text-yellow-400' : 'text-red-400'}">${accuracy}%</div>
                     <div class="text-gray-400 text-sm">Accuracy</div>
@@ -3526,13 +3813,20 @@ function createNoteDetector(options = {}) {
                         <div class="text-gray-500 text-xs">Best Streak</div>
                     </div>
                 </div>
+                ${breakdownHtml}
                 ${sectionHtml}
-                <button class="nd-summary-close mt-4 w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
-                    Close
-                </button>
+                <div class="mt-4 flex gap-2">
+                    <button class="nd-summary-download flex-1 py-2 bg-accent hover:bg-accent-light rounded-lg text-sm font-semibold text-white transition">
+                        Download Diagnostic JSON
+                    </button>
+                    <button class="nd-summary-close px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
+                        Close
+                    </button>
+                </div>
             </div>
         `;
         overlay.querySelector('.nd-summary-close').onclick = () => overlay.remove();
+        overlay.querySelector('.nd-summary-download').onclick = () => _downloadDiagnostic();
         instanceRoot.appendChild(overlay);
 
         publishToJournal(accuracy);
@@ -3601,6 +3895,13 @@ function createNoteDetector(options = {}) {
         setChannel,
         injectButton,
         showSummary,
+        // Diagnostic export (#254 follow-up). `downloadDiagnostic()`
+        // triggers a browser file save of the current session's
+        // breakdown + capped event log; `getDiagnostic()` returns the
+        // same payload for in-page display / programmatic use. Schema
+        // is `note_detect.diagnostic.v1`.
+        downloadDiagnostic: _downloadDiagnostic,
+        getDiagnostic: _buildDiagnosticPayload,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
