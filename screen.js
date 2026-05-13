@@ -1084,11 +1084,27 @@ function createNoteDetector(options = {}) {
     let inputGain = 1.0;
     let selectedDeviceId = '';
     let selectedChannel = 'mono';
+    // Detector pipeline latency compensation. 0.080 is the historical
+    // default; the right value is heavily audio-chain-dependent (USB
+    // interfaces, ScriptProcessor buffering, OS audio path all vary).
+    // Users typically dial this via the gear-popover slider; the A/V
+    // auto-calibrate panel suggests a value derived from their own
+    // recently-detected note timings. We tried bumping the default to
+    // match one heavy-user's empirical value, but it over-corrected
+    // for users with shorter chains (caused their on-time playing to
+    // register as "early" misses). Keeping the conservative default
+    // and pointing users at the calibrate workflow is the right
+    // trade-off.
     let latencyOffset = 0.080;
-    // Fraction of a chord's strings that must register energy for the chord
-    // to count as a hit (0.0–1.0). 0.6 = 60%, matching the brief's default.
-    // Lower this for beginners or dense chords; raise it for stricter scoring.
-    let chordHitRatio = 0.6;
+    // Fraction of a chord's strings that must register energy for the
+    // chord to count as a hit (0.0–1.0). Was 0.6 historically, but
+    // harness measurements against real-guitar recordings showed
+    // chord scoring scoring near 0/16 at that gate even for clean
+    // playing. Dropping to 0.40 lets typical open/power-chord
+    // voicings score multi-string hits without rewarding single-
+    // string strums. Users who want stricter scoring can raise via
+    // the slider.
+    let chordHitRatio = 0.40;
 
     try {
         const raw = localStorage.getItem(_ND_STORAGE_KEY);

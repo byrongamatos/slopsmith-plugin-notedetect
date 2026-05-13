@@ -27,7 +27,7 @@
  *     [--pitch-hit-threshold 20]                  \
  *     [--timing-tolerance 0.150]                  \
  *     [--timing-hit-threshold 0.100]              \
- *     [--chord-hit-ratio 0.6]                     \
+ *     [--chord-hit-ratio 0.40]                    \
  *     [--latency 0.080]                           \
  *     [--frame-size 1024]                         \
  *     [--sample-rate 44100]                       \
@@ -165,7 +165,7 @@ note_detect headless harness
   --pitch-hit-threshold  <c>    cents, clean  (default: 20)
   --timing-tolerance     <s>    seconds, outer (default: 0.150)
   --timing-hit-threshold <s>    seconds, clean (default: 0.100)
-  --chord-hit-ratio      <r>    0..1           (default: 0.6)
+  --chord-hit-ratio      <r>    0..1           (default: 0.40)
   --latency              <s>    detector latency comp (default: 0.080)
   --frame-size           <n>    samples per frame (default: 1024)
   --sample-rate          <hz>   decode rate (default: 44100)
@@ -187,7 +187,7 @@ try {
             'pitch-hit-threshold':   { type: 'string', default: '20' },
             'timing-tolerance':      { type: 'string', default: '0.150' },
             'timing-hit-threshold':  { type: 'string', default: '0.100' },
-            'chord-hit-ratio':       { type: 'string', default: '0.6' },
+            'chord-hit-ratio':       { type: 'string', default: '0.40' },
             'latency':               { type: 'string', default: '0.080' },
             'frame-size':            { type: 'string', default: '1024' },
             'sample-rate':           { type: 'string', default: '44100' },
