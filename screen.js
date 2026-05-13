@@ -947,6 +947,42 @@ async function _ndCrepeDetect(buffer) {
 //   setChannel(idx)  — -1=mono, 0=left, 1=right (restarts audio if enabled)
 //   injectButton(bar)— insert detect + gear buttons into a control bar
 //   showSummary()    — force-show the end-of-song summary modal
+
+// Encode an Array<Float32Array> of mono samples (any chunk size) as a
+// 16-bit PCM mono RIFF/WAVE blob. Used by the in-app reference-recording
+// capture so the headless harness can read back exactly the audio the
+// detector saw. Soft-clips to int16 range; no dithering — fine for the
+// detector's downstream analysis but don't ship this as a master.
+function _ndEncodeWavPcm16(chunks, sampleRate) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const buf = new ArrayBuffer(44 + total * 2);
+    const v = new DataView(buf);
+    let off = 0;
+    const w4  = (s) => { for (let i = 0; i < 4; i++) v.setUint8(off++, s.charCodeAt(i)); };
+    const w16 = (n) => { v.setUint16(off, n, true); off += 2; };
+    const w32 = (n) => { v.setUint32(off, n, true); off += 4; };
+    w4('RIFF');  w32(36 + total * 2);  w4('WAVE');
+    w4('fmt ');  w32(16);
+    w16(1);                                          // PCM
+    w16(1);                                          // mono
+    w32(sampleRate);
+    w32(sampleRate * 2);                             // byte rate
+    w16(2);                                          // block align
+    w16(16);                                         // bits per sample
+    w4('data');  w32(total * 2);
+    for (const c of chunks) {
+        for (let i = 0; i < c.length; i++) {
+            let s = c[i];
+            if (s > 1)  s =  1;
+            else if (s < -1) s = -1;
+            v.setInt16(off, (s * 32767) | 0, true);
+            off += 2;
+        }
+    }
+    return buf;
+}
+
 function createNoteDetector(options = {}) {
     const opts = options || {};
     // Highway is resolved lazily. A caller can pass `highway` in
@@ -1011,6 +1047,14 @@ function createNoteDetector(options = {}) {
     // itself (and sizzles it); users who want the peripheral cue back can
     // re-enable it in the gear popover.
     let edgeFlashEnabled = false;
+    // Tuning mode — opt-in switch for everything the detector exposes
+    // for development / tuning / benchmarking (the Reference Recording
+    // panel, the Diagnostic JSON export / Reset, the miss-category
+    // breakdown on the end-of-song summary). Off by default — these
+    // surfaces are noise for normal play. Gated by a single checkbox
+    // in the gear popover. Persisted in localStorage alongside the
+    // other settings.
+    let tuningMode = false;
     let missMarkerDuration = 2.0;
     let hitGlowDuration = 0.5;
     let inputGain = 1.0;
@@ -1045,6 +1089,7 @@ function createNoteDetector(options = {}) {
             if (s.showTimingErrors !== undefined) showTimingErrors = !!s.showTimingErrors;
             if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
             if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
+            if (s.tuningMode !== undefined) tuningMode = !!s.tuningMode;
             if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
             if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
             if (s.inputGain !== undefined) inputGain = s.inputGain;
@@ -1109,6 +1154,22 @@ function createNoteDetector(options = {}) {
     // size that keeps the JSON small enough to share via copy-paste.
     const _DIAG_EVENT_CAP = 2000;
     const _diagEvents = [];
+
+    // ── Reference-recording capture (#254 follow-up) ──────────────────
+    // Captures the SAME Float32 audio frames the detector is running its
+    // analysis on, while a song is playing, so the headless harness has
+    // a known-aligned WAV to feed it — no DAW / Audacity needed. Auto-
+    // starts on song:play once armed, auto-saves on song:ended. The WAV
+    // lands under `static/note_detect_recordings/` via the routes.py POST
+    // endpoint; that dir is bind-mounted in the dev container so the
+    // harness on the host can read it back without a copy step.
+    let _recArmed = false;            // user clicked Arm; waiting for / actively recording
+    let _recSongPlaying = false;      // tracks song:play / song:pause / song:ended
+    let _recChunks = [];              // Array<Float32Array>; concatenated only on save
+    let _recSampleRate = 44100;       // captured from audioCtx when the first frame lands
+    let _recLastSavePath = null;      // host-visible relative path of the most recent save
+    let _recLastSaveError = null;     // surfaced in the UI when a save fails
+    let _recSaveInFlight = false;     // de-dupe rapid saves
     // slopsmith#254 — per-sustained-hit-note "still being held on-pitch"
     // grace timestamps: key -> performance.now() ms before which the
     // sustain still counts as actively held. Smooths the gap between
@@ -1275,6 +1336,7 @@ function createNoteDetector(options = {}) {
                 showTimingErrors,
                 showPitchErrors,
                 edgeFlash: edgeFlashEnabled,
+                tuningMode,
                 missMarkerDuration,
                 hitGlowDuration,
                 inputGain,
@@ -1819,6 +1881,18 @@ function createNoteDetector(options = {}) {
         // it later from matchNotes would either skip (null) or pick up a
         // newer buffer captured mid-processing.
         await matchNotes(buffer);
+
+        // Reference-recording capture: tap the same audio the detector
+        // just analysed. Gated on (a) the user having armed a take and
+        // (b) the song actually playing — we don't want to fill the
+        // buffer with silence from someone leaving Detect running on
+        // the home screen.
+        if (_recArmed && _recSongPlaying) {
+            _recSampleRate = audioCtx ? audioCtx.sampleRate : (bridgeSampleRate || _recSampleRate);
+            // slice() because the analyser may overwrite the buffer the
+            // next time processFrame fires.
+            _recChunks.push(buffer.slice());
+        }
     }
 
     // ── Note matching ─────────────────────────────────────────────────
@@ -2606,6 +2680,14 @@ function createNoteDetector(options = {}) {
                 Chord detection uses per-string band analysis. This sets how many strings must ring to count as a hit (e.g. 60% = 4 of 6). Lower for beginners or dense voicings.
             </div>
 
+            <label class="flex items-center gap-2 text-gray-400 text-xs mb-1 mt-1">
+                <input type="checkbox" class="nd-tuning-mode accent-green-400" ${tuningMode ? 'checked' : ''}>
+                Detection tuning (advanced)
+            </label>
+            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+                Off by default. Turns on the developer surfaces for tuning detection: <strong>Reference Recording</strong> capture, <strong>Diagnostic JSON</strong> export, the miss-category breakdown on the end-of-song summary. Pair with the headless harness (<code>tools/harness.js</code>) for offline parameter sweeps.
+            </div>
+
             <div class="text-[10px] text-gray-600 mt-1 leading-tight">
                 Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
                 See the <b>Pitch Detection Methods</b> section of the plugin README for guidance on choosing between YIN, HPS, and CREPE.
@@ -2672,6 +2754,15 @@ function createNoteDetector(options = {}) {
                 // Clear any flash that's mid-fade so it doesn't linger.
                 const fe = instanceRoot.querySelector('.nd-flash-overlay');
                 if (fe) fe.style.borderColor = 'transparent';
+            }
+            saveSettings();
+        };
+        panel.querySelector('.nd-tuning-mode').onchange = (e) => {
+            tuningMode = !!e.target.checked;
+            // If the user disarms tuning mid-recording, drop any captured
+            // audio and disarm — the UI for it is about to disappear.
+            if (!tuningMode && (_recArmed || _recChunks.length > 0)) {
+                disarmRecording();
             }
             saveSettings();
         };
@@ -3584,6 +3675,11 @@ function createNoteDetector(options = {}) {
         // unmount cycles. disable() leaves them alone (resumes drill state
         // on re-enable); destroy is the right teardown point.
         _drillUnbindEvents();
+        _recUnbindEvents();
+        // Discard any unsaved recording state — destroying the instance
+        // shouldn't write a half-captured WAV.
+        _recArmed = false;
+        _recChunks = [];
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
         try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
@@ -3714,6 +3810,134 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // ── Reference-recording capture ───────────────────────────────────
+    // Arms the next song-play to record the detector's input audio. On
+    // song:ended, auto-saves a WAV to `static/note_detect_recordings/`
+    // via the plugin's POST endpoint — that dir is bind-mounted in the
+    // dev container, so the headless harness on the host can read the
+    // same file back without a copy step. Detect must be enabled for
+    // audio to actually flow; armed-without-Detect is a no-op.
+    function armRecording() {
+        _recArmed = true;
+        _recChunks = [];
+        _recLastSaveError = null;
+        // Bind song-event listeners lazily so an idle plugin instance
+        // doesn't sit on the slopsmith bus. Unbind in disarm / save /
+        // destroy. Idempotent.
+        _recBindEvents();
+    }
+    function disarmRecording() {
+        _recArmed = false;
+        _recChunks = [];
+        _recUnbindEvents();
+    }
+    async function saveRecordingNow() {
+        if (_recSaveInFlight) return null;
+        if (_recChunks.length === 0) {
+            _recLastSaveError = 'no audio captured (Detect off, or song never played)';
+            return null;
+        }
+        const chunks = _recChunks;
+        const sr = _recSampleRate;
+        // Disarm + clear synchronously so a song:ended fired mid-save
+        // doesn't double-encode the same buffer.
+        _recArmed = false;
+        _recChunks = [];
+        _recSaveInFlight = true;
+        try {
+            const wav = _ndEncodeWavPcm16(chunks, sr);
+            const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+            const slug = ((info.title || 'recording') + '')
+                .replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 40) || 'recording';
+            const resp = await fetch(
+                '/api/plugins/note_detect/recording?slug=' + encodeURIComponent(slug),
+                { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav }
+            );
+            if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()).slice(0, 200));
+            const data = await resp.json();
+            _recLastSavePath = data && data.relative_path || null;
+            _recLastSaveError = null;
+            return data;
+        } catch (e) {
+            _recLastSaveError = String(e && e.message || e);
+            console.warn('[note_detect] saveRecording failed:', e);
+            return null;
+        } finally {
+            _recSaveInFlight = false;
+            // Done with this take — release the song-event listeners.
+            _recUnbindEvents();
+        }
+    }
+    function getRecordingState() {
+        const samples = _recChunks.reduce((s, c) => s + c.length, 0);
+        return {
+            armed:        _recArmed,
+            songPlaying:  _recSongPlaying,
+            chunks:       _recChunks.length,
+            samples,
+            sampleRate:   _recSampleRate,
+            durationS:    samples / Math.max(1, _recSampleRate),
+            saveInFlight: _recSaveInFlight,
+            lastSavePath: _recLastSavePath,
+            lastError:    _recLastSaveError,
+            // Recording requires the audio pipeline to be live — surface
+            // it here so the UI can prompt the user to enable Detect.
+            detectEnabled: enabled,
+        };
+    }
+
+    // Wire song-play / song-end events on the slopsmith bus so an armed
+    // recording auto-arms on Play and auto-saves on song-end. Mirrors
+    // the drill-mode binding pattern: bind once at construct, tear down
+    // in destroy(). The handlers are no-ops while `_recArmed` is false.
+    let _recOnPlay = null, _recOnPause = null, _recOnEnded = null;
+    let _recSubscribed = false;
+    function _recBindEvents() {
+        if (_recSubscribed) return;
+        if (!window.slopsmith
+            || typeof window.slopsmith.on !== 'function'
+            || typeof window.slopsmith.off !== 'function') return;
+        _recOnPlay  = () => { _recSongPlaying = true; };
+        _recOnPause = () => { _recSongPlaying = false; };
+        _recOnEnded = () => {
+            _recSongPlaying = false;
+            if (_recArmed && _recChunks.length > 0) {
+                // Fire-and-forget — the UI polls getRecordingState() so
+                // it'll surface the lastSavePath / lastError when it lands.
+                saveRecordingNow().catch(() => {});
+            } else if (_recArmed) {
+                // Armed but never captured anything (Detect was off, or
+                // song:play never fired). Disarm so the next song doesn't
+                // start an unintended recording.
+                _recArmed = false;
+                _recLastSaveError = 'no audio captured before song:ended';
+            }
+        };
+        try {
+            window.slopsmith.on('song:play',  _recOnPlay);
+            window.slopsmith.on('song:pause', _recOnPause);
+            window.slopsmith.on('song:ended', _recOnEnded);
+        } catch (e) {
+            // Partial registration — unwind to avoid leaking handlers.
+            try { window.slopsmith.off('song:play',  _recOnPlay); }  catch (_) {}
+            try { window.slopsmith.off('song:pause', _recOnPause); } catch (_) {}
+            try { window.slopsmith.off('song:ended', _recOnEnded); } catch (_) {}
+            _recOnPlay = _recOnPause = _recOnEnded = null;
+            return;
+        }
+        _recSubscribed = true;
+    }
+    function _recUnbindEvents() {
+        if (!_recSubscribed) return;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_recOnPlay)  { try { window.slopsmith.off('song:play',  _recOnPlay); }  catch (e) {} }
+            if (_recOnPause) { try { window.slopsmith.off('song:pause', _recOnPause); } catch (e) {} }
+            if (_recOnEnded) { try { window.slopsmith.off('song:ended', _recOnEnded); } catch (e) {} }
+        }
+        _recOnPlay = _recOnPause = _recOnEnded = null;
+        _recSubscribed = false;
+    }
+
     function showSummary() {
         const total = hits + misses;
         if (total < 5) return;
@@ -3744,9 +3968,11 @@ function createNoteDetector(options = {}) {
         }
 
         // Miss-category breakdown (#254 follow-up) — bars sum to total misses
-        // so the dominant failure mode is visible at a glance.
+        // so the dominant failure mode is visible at a glance. Tuning mode
+        // only — normal play sees just the original hits/misses/streak +
+        // per-section bars.
         let breakdownHtml = '';
-        if (misses > 0) {
+        if (tuningMode && misses > 0) {
             const labels = {
                 pure:         ['Pure (no pitch)',    'bg-gray-500'],
                 chordPartial: ['Chord — partial',    'bg-purple-500'],
@@ -3816,17 +4042,19 @@ function createNoteDetector(options = {}) {
                 ${breakdownHtml}
                 ${sectionHtml}
                 <div class="mt-4 flex gap-2">
+                    ${tuningMode ? `
                     <button class="nd-summary-download flex-1 py-2 bg-accent hover:bg-accent-light rounded-lg text-sm font-semibold text-white transition">
                         Download Diagnostic JSON
-                    </button>
-                    <button class="nd-summary-close px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
+                    </button>` : ''}
+                    <button class="nd-summary-close ${tuningMode ? 'px-4' : 'flex-1'} py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
                         Close
                     </button>
                 </div>
             </div>
         `;
         overlay.querySelector('.nd-summary-close').onclick = () => overlay.remove();
-        overlay.querySelector('.nd-summary-download').onclick = () => _downloadDiagnostic();
+        const dlBtn = overlay.querySelector('.nd-summary-download');
+        if (dlBtn) dlBtn.onclick = () => _downloadDiagnostic();
         instanceRoot.appendChild(overlay);
 
         publishToJournal(accuracy);
@@ -3906,6 +4134,22 @@ function createNoteDetector(options = {}) {
         downloadDiagnostic: _downloadDiagnostic,
         getDiagnostic: _buildDiagnosticPayload,
         resetDiagnostic: resetScoring,
+        // Tuning-mode gate. Off by default; flipped in the gear popover.
+        // Other UI (settings.html, the summary modal's breakdown) polls
+        // this to decide whether to show the developer-only surfaces.
+        isTuningMode: () => tuningMode,
+        // Reference-recording capture for the headless harness. Arms
+        // the next song-play to capture the detector's input audio,
+        // auto-saves on song:ended. POSTs the WAV to the plugin's
+        // routes.py endpoint, which writes it under
+        // static/note_detect_recordings/ — bind-mounted in the dev
+        // container, so the harness on the host can read it back
+        // without any copy step. See `getRecordingState()` for status
+        // / lastSavePath / lastError fields the UI polls.
+        armRecording,
+        disarmRecording,
+        saveRecordingNow,
+        getRecordingState,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
@@ -3972,6 +4216,11 @@ function createNoteDetector(options = {}) {
     // If highway isn't ready at construction time, ensureDrawHook()
     // (called from enable()) re-tries after resolving `hw` lazily.
     ensureDrawHook();
+
+    // Recording listeners are NOT bound at construct — drill tests assert
+    // a clean per-instance listener count, and we shouldn't be on the
+    // slopsmith event bus when no recording is armed anyway. We bind
+    // on armRecording(), unbind on disarm / save / destroy.
 
     _ndInstances.add(api);
     return api;

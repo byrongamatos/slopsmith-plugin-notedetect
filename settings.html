@@ -14,6 +14,47 @@
         </p>
     </div>
 
+    <!-- Tuning-mode notice: shown only when tuning mode is OFF. The
+         Reference Recording + Diagnostic panels below are hidden until
+         the user opts in via the gear popover. -->
+    <div id="nd-tuning-off-hint" class="hidden bg-dark-700/40 border border-dashed border-gray-800 rounded-xl p-4 text-xs text-gray-500 leading-relaxed">
+        Detection-tuning surfaces (Reference Recording, Diagnostic JSON export, the miss-category breakdown on the end-of-session summary) are <strong>off by default</strong>. Open the player, click the <strong>gear icon</strong> next to Detect, and tick <strong>"Detection tuning (advanced)"</strong> to reveal them here.
+    </div>
+
+    <div id="nd-tuning-panels" class="space-y-6 hidden">
+
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-3">
+            <h4 class="text-sm font-semibold text-gray-300">Reference Recording</h4>
+            <span id="nd-rec-state" class="text-[10px] uppercase tracking-wider text-gray-500">idle</span>
+        </div>
+
+        <p class="text-[11px] text-gray-400 leading-relaxed mb-3">
+            Captures the same audio the detector hears, while a song plays. Auto-starts on Play, auto-saves a WAV on song end. <strong>Detect must be enabled</strong> for any audio to flow. Pairs with the headless harness for offline tuning.
+        </p>
+
+        <div id="nd-rec-info" class="text-xs text-gray-400 mb-3 leading-snug">Click <em>Arm</em>, then play the song from the start.</div>
+
+        <div class="flex gap-2 mb-3">
+            <button id="nd-rec-arm"
+                    class="flex-1 bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-4 py-2 rounded-lg text-sm font-semibold text-white transition">
+                Arm Recording
+            </button>
+            <button id="nd-rec-save"
+                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    disabled title="Save what's been captured so far without waiting for song:ended">
+                Save now
+            </button>
+            <button id="nd-rec-discard"
+                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    disabled title="Throw away what's been captured so far and disarm">
+                Discard
+            </button>
+        </div>
+
+        <div id="nd-rec-saved" class="text-[11px] text-gray-500 mb-1 break-all"></div>
+    </div>
+
     <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
         <div class="flex items-center justify-between mb-3">
             <h4 class="text-sm font-semibold text-gray-300">Session Diagnostic</h4>
@@ -60,6 +101,8 @@
             Captures the current session's per-category miss breakdown, per-string hit rate, signed timing / pitch error percentiles, settings snapshot, and a capped per-judgment event log — schema <code class="text-gray-500">note_detect.diagnostic.v1</code>. <strong>Reset</strong> zeroes the counters mid-session without disabling Detect — seek to a specific section (arrow keys, or click a label in the highway), hit Reset, play just that section, then Download for a per-section report. Share it back with whoever's tuning your detection (or attach it to a benchmark run).
         </p>
     </div>
+
+    </div><!-- /nd-tuning-panels -->
 </div>
 
 <script>
@@ -81,8 +124,86 @@
     function _q(id) { return document.getElementById(id); }
     function _fmt(n) { return (n == null) ? '—' : String(n); }
 
+    function renderRecording(nd) {
+        const armBtn  = _q('nd-rec-arm');
+        const saveBtn = _q('nd-rec-save');
+        const discBtn = _q('nd-rec-discard');
+        const stateEl = _q('nd-rec-state');
+        const infoEl  = _q('nd-rec-info');
+        const savedEl = _q('nd-rec-saved');
+        if (!nd || typeof nd.getRecordingState !== 'function') {
+            if (stateEl) stateEl.textContent = 'plugin not loaded';
+            if (armBtn)  armBtn.disabled  = true;
+            if (saveBtn) saveBtn.disabled = true;
+            if (discBtn) discBtn.disabled = true;
+            return;
+        }
+        const r = nd.getRecordingState();
+        const hasBuffer = r.samples > 0;
+
+        // State chip + info line
+        let label, info;
+        if (r.saveInFlight) {
+            label = 'saving…';
+            info  = 'Encoding and uploading the WAV…';
+        } else if (r.lastError) {
+            label = 'error';
+            info  = 'Last attempt failed: ' + r.lastError;
+        } else if (r.armed && r.songPlaying) {
+            label = 'recording';
+            info  = `Capturing… ${r.durationS.toFixed(1)} s (${r.samples} samples @ ${r.sampleRate} Hz). Auto-saves on song end.`;
+        } else if (r.armed && !r.detectEnabled) {
+            label = 'armed (Detect off)';
+            info  = 'Armed, but Detect isn\'t enabled — no audio will flow until you click Detect on the player.';
+        } else if (r.armed) {
+            label = 'armed';
+            info  = 'Armed. Press Play on the song to start capturing.';
+        } else if (hasBuffer) {
+            // Reachable if disarmed mid-recording — unusual; keep the buffer alive
+            label = 'paused';
+            info  = `${r.durationS.toFixed(1)} s captured; click Save to keep it or Discard to throw it out.`;
+        } else if (r.lastSavePath) {
+            label = 'idle';
+            info  = 'Ready. Click Arm to record the next play.';
+        } else {
+            label = 'idle';
+            info  = 'Click Arm, then play the song from the start.';
+        }
+        if (stateEl) stateEl.textContent = label;
+        if (infoEl) {
+            infoEl.textContent = info;
+            infoEl.className = 'text-xs mb-3 leading-snug ' + (r.lastError ? 'text-red-400' : 'text-gray-400');
+        }
+        if (savedEl) {
+            if (r.lastSavePath && !r.armed && !r.lastError) {
+                savedEl.innerHTML = 'Saved: <code class="text-gray-300">' + r.lastSavePath + '</code>';
+            } else {
+                savedEl.textContent = '';
+            }
+        }
+        if (armBtn) {
+            armBtn.textContent = r.armed ? 'Disarm' : 'Arm Recording';
+            armBtn.disabled    = r.saveInFlight;
+        }
+        if (saveBtn) saveBtn.disabled = !hasBuffer || r.saveInFlight;
+        if (discBtn) discBtn.disabled = !(r.armed || hasBuffer) || r.saveInFlight;
+    }
+
     function render() {
         const nd = window.noteDetect;
+
+        // Tuning-mode gate. Off by default → show a one-line hint, hide
+        // the developer panels entirely. The gate auto-updates when the
+        // user flips the checkbox in the gear popover and we re-render.
+        const tuning = !!(nd && typeof nd.isTuningMode === 'function' && nd.isTuningMode());
+        const hint   = _q('nd-tuning-off-hint');
+        const panels = _q('nd-tuning-panels');
+        if (hint)   hint.classList.toggle('hidden', tuning);
+        if (panels) panels.classList.toggle('hidden', !tuning);
+        if (!tuning) return;   // nothing else to render — panels are hidden
+
+        renderRecording(nd);
+
         const ready = !!(nd && typeof nd.getDiagnostic === 'function');
         const btn = _q('nd-diag-download');
         const rsBtn = _q('nd-diag-reset');
@@ -175,6 +296,41 @@
     }
     const rfBtn = _q('nd-diag-refresh');
     if (rfBtn) rfBtn.onclick = render;
+
+    // Recording buttons
+    const armBtn  = _q('nd-rec-arm');
+    const saveBtn = _q('nd-rec-save');
+    const discBtn = _q('nd-rec-discard');
+    if (armBtn) {
+        armBtn.onclick = () => {
+            const nd = window.noteDetect;
+            if (!nd) return;
+            const r = nd.getRecordingState && nd.getRecordingState();
+            if (r && r.armed) {
+                // Currently armed → button means Disarm
+                nd.disarmRecording && nd.disarmRecording();
+            } else {
+                nd.armRecording && nd.armRecording();
+            }
+            render();
+        };
+    }
+    if (saveBtn) {
+        saveBtn.onclick = async () => {
+            const nd = window.noteDetect;
+            if (!nd || typeof nd.saveRecordingNow !== 'function') return;
+            saveBtn.disabled = true;
+            await nd.saveRecordingNow();
+            render();
+        };
+    }
+    if (discBtn) {
+        discBtn.onclick = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.disarmRecording === 'function') nd.disarmRecording();
+            render();
+        };
+    }
 
     render();
     // Auto-refresh while the section is in the DOM. Cheap (one
