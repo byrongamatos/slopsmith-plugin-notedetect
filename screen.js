@@ -302,7 +302,22 @@ function _ndMakeJudgment(opts) {
     // pitchState === null means pitch was not measured (e.g. energy-only chord
     // check or harmonic flag).  Treat unmeasured pitch as non-blocking so a
     // chord that passes the scorer is not incorrectly counted as a miss.
-    const hit = timingState === 'OK' && (pitchState === 'OK' || pitchState === null);
+    //
+    // For CHORDS specifically: the chord scorer (_ndScoreChord) already
+    // ran per-string pitch + energy checks before this judgment was
+    // constructed. matchNotes only takes the chord-hit path when the
+    // scorer returned isHit (score ≥ chordHitRatio). If we *also* gate
+    // the overall hit on the monophonic pitchState computed from a
+    // SINGLE string's pitchError (the first one with a finite cents
+    // measurement), we throw away clean chord hits whenever the lead
+    // string happens to be a bit sharp/flat — even when every string
+    // rang and the chord scorer said yes. Trust the chord scorer's
+    // verdict here. For single notes the original timing+pitch rule
+    // still applies.
+    const isChord = !!o.chord;
+    const hit = isChord
+        ? (matched && timingState === 'OK')
+        : (timingState === 'OK' && (pitchState === 'OK' || pitchState === null));
     return {
         chartNote: o.chartNote || o.note || null,
         note: o.note || null,
@@ -1305,6 +1320,12 @@ function createNoteDetector(options = {}) {
     let lastChordScore = null;
     let lastChordHit = 0;
     let lastChordTotal = 0;
+    // Per-chord-key cache of the most recent _ndScoreChord result so
+    // checkMisses() can attach hs/tt/sc to a chord miss judgment. Keyed
+    // by the same `<time>_chord` string the rest of the chord plumbing
+    // uses. Cleared on resetScoring (song change / detect toggle) so a
+    // stale per-chord result from one take can't leak into a later one.
+    const _chordLastResult = new Map();
     let lastChordTime = -Infinity;
 
     // Tuning — per-instance so panels can be on different songs.
@@ -2527,6 +2548,24 @@ function createNoteDetector(options = {}) {
                 );
 
                 if (!chordResult.isHit) {
+                    // Stash the latest chordResult before bailing so that
+                    // when checkMisses() retires this chord as a miss, the
+                    // miss judgment can carry the scorer's per-string
+                    // diagnostic data (hitStrings / totalStrings / score).
+                    // Without this we were blind on missed chords — the
+                    // live JSONL + diagnostic event log just showed
+                    // hs/tt/sc=undefined, which made "the scorer saw 2 of
+                    // 5 strings — was that just the user's playing, or is
+                    // the energy threshold too strict?" impossible to
+                    // answer from data alone. The map is keyed by chord
+                    // key and overwrites every frame so the FINAL frame's
+                    // result is what lands in the miss — that's the
+                    // "best the scorer got" snapshot.
+                    _chordLastResult.set(chordKey, {
+                        score: chordResult.score,
+                        hitStrings: chordResult.hitStrings,
+                        totalStrings: chordResult.totalStrings,
+                    });
                     // Do not lock in a miss while the chord is still within
                     // its timing window. Chords can enter candidateNotes as
                     // early as (chordTime - timingTolerance), so an early
@@ -2678,11 +2717,26 @@ function createNoteDetector(options = {}) {
                     liveNotes[0].s, liveNotes[0].f,
                     currentArrangement, currentStringCount, tuningOffsets, capo
                 );
+                // Pull the latest chord-scorer result (if any) so the
+                // miss judgment carries hs/tt/sc. matchNotes stashes
+                // this on every non-hit frame; the most recent stash
+                // is "what the scorer last saw on this chord". If the
+                // chord scorer never fired in window (no audio buffer,
+                // monophonic detection failure path, etc.) the cache
+                // is empty and we fall back to undefined-as-before.
+                const cachedChord = _chordLastResult.get(chordKey);
                 const chordJudgment = makeMissJudgment(liveNotes[0], c.t, t, expectedMidi, {
                     notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
                     chord: true,
+                    hitStrings:   cachedChord ? cachedChord.hitStrings   : undefined,
+                    totalStrings: cachedChord ? cachedChord.totalStrings : undefined,
+                    score:        cachedChord ? cachedChord.score        : undefined,
                 });
                 recordJudgment(chordKey, chordJudgment);
+                // Free the cache entry — we've consumed it, no further
+                // matchNotes frames will fire for this chord (it just
+                // got finalized as a miss).
+                _chordLastResult.delete(chordKey);
                 for (const cn of liveNotes) {
                     const key = noteKey({ s: cn.s, f: cn.f }, c.t);
                     if (!noteResults.has(key)) noteResults.set(key, makeMissJudgment(cn, c.t, t, _ndMidiFromStringFret(
@@ -3429,6 +3483,7 @@ function createNoteDetector(options = {}) {
         bestStreak = 0;
         noteResults.clear();
         _susActiveUntil.clear();
+        _chordLastResult.clear();
         _diagResetCounters();
         sectionStats = [];
         currentSection = null;
