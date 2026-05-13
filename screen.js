@@ -2370,10 +2370,30 @@ function createNoteDetector(options = {}) {
             }
         }
         if (chords && chords.length > 0) {
-            const start = bsearch(chords, t - tolerance);
+            // Chord candidate window extends past the strict upper edge
+            // the same way single notes do: a chord that says "ring for
+            // 1.5 s" is still audibly the right chord 800 ms after the
+            // chart strike, and a player strumming late should still be
+            // matched against it. The chord scorer (_ndScoreChord) does
+            // its own per-string pitch + energy check on whatever audio
+            // buffer is current, so an extended candidate window just
+            // gives matchNotes more frames in which to attempt scoring
+            // — it doesn't loosen the per-string check itself.
+            //
+            // Take the max sus across chord constituents so a chord with
+            // mixed sustains doesn't drop out the moment its shortest
+            // string would have decayed.
+            const start = bsearch(chords, t - tolerance - MAX_SUS_LATE_GRACE);
             for (let i = start; i < chords.length; i++) {
                 const c = chords[i];
                 if (c.t > t + tolerance) break;
+                let chordSus = 0;
+                for (const cn of (c.notes || [])) {
+                    if (cn.mt) continue;
+                    if (Number.isFinite(cn.sus) && cn.sus > chordSus) chordSus = cn.sus;
+                }
+                const lateGrace = chordSus > 0 ? Math.min(chordSus, MAX_SUS_LATE_GRACE) : 0;
+                if (c.t < t - tolerance - lateGrace) continue;
                 for (const cn of (c.notes || [])) {
                     if (cn.mt) continue;
                     // Chord constituent notes don't carry their own time —
@@ -2707,6 +2727,18 @@ function createNoteDetector(options = {}) {
                     checkNote(liveNotes[0], c.t);
                     continue;
                 }
+                // Mirror the matchNotes-side chord candidate grace: a
+                // chord with sus-marked constituents isn't retired until
+                // its sustain envelope has clearly elapsed, so a late
+                // strummer gets the same window to score that a single-
+                // note late-detect-gets-credited late-player gets. Take
+                // the max sus across constituents.
+                let chordSus = 0;
+                for (const cn of liveNotes) {
+                    if (Number.isFinite(cn.sus) && cn.sus > chordSus) chordSus = cn.sus;
+                }
+                const chordLateGrace = chordSus > 0 ? Math.min(chordSus, MAX_SUS_LATE_GRACE) : 0;
+                if (c.t > missDeadline - chordLateGrace) continue;
                 // Multi-note chord: judge as a single unit. matchNotes()
                 // stores a judgment object at `<t>_chord` when the chord
                 // cleared the ratio threshold; if that key is present, the
