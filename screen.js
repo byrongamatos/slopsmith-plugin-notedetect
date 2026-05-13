@@ -1238,6 +1238,44 @@ function createNoteDetector(options = {}) {
     // sticks to filesystem-safe characters. Off (null) until the first
     // song:play fires with tuning mode on.
     let _liveSessionId = null;
+    function _buildSessionHeader() {
+        // Snapshot the user's live settings + song context at song:play
+        // time. Lands as the first JSONL line of the session file so
+        // any offline reader (host-side regression runner, future
+        // default-suggestion tooling, a maintainer looking at a shared
+        // session) knows what knobs produced the judgments below.
+        // Keep field names consistent with the `settings` block in the
+        // diagnostic export — same vocabulary across the two formats.
+        const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+        const avOffsetMs = (hw && hw.getAvOffset) ? hw.getAvOffset() : 0;
+        return {
+            type: 'session_start',
+            schema: 'note_detect.live.session_start.v1',
+            ts: new Date().toISOString(),
+            plugin_version: _ND_VERSION,
+            song: {
+                title: info.title || null,
+                artist: info.artist || null,
+                arrangement: info.arrangement || null,
+                arrangement_index: (info.arrangement_index != null) ? info.arrangement_index : null,
+                tuning: info.tuning || null,
+                capo: info.capo != null ? info.capo : 0,
+                duration: info.duration != null ? info.duration : null,
+            },
+            settings: {
+                method: detectionMethod,
+                timing_tolerance_s: timingTolerance,
+                timing_hit_threshold_s: timingHitThreshold,
+                pitch_tolerance_cents: pitchTolerance,
+                pitch_hit_threshold_cents: pitchHitThreshold,
+                chord_hit_ratio: chordHitRatio,
+                latency_offset_s: latencyOffset,
+                input_gain: inputGain,
+                channel: selectedChannel,
+                av_offset_ms: avOffsetMs,
+            },
+        };
+    }
     function _streamLiveJudgment(eventObj) {
         // Fire-and-forget — the network round-trip MUST NOT block the
         // detection hot path. We don't even await the promise: any
@@ -4292,6 +4330,18 @@ function createNoteDetector(options = {}) {
             // emit a song:play in the same second (splitscreen).
             const rand = Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
             _liveSessionId = `${ts}_${rand}`;
+            // Stream a session-header record as line 1 of the JSONL so
+            // an offline reader knows under which settings the
+            // subsequent judgments were produced. Important for two
+            // reasons: (1) any analysis that infers "what cr was the
+            // user on?" from judgment data alone is fragile, (2) we
+            // want to mine these for sensible-default suggestions
+            // across users without each contributor having to attach
+            // their settings every time. Distinct shape (type:
+            // "session_start") so consumers can split header from
+            // judgments. Includes song / arrangement context too —
+            // useful for bucketing v1/v2/bass benchmark runs.
+            _streamLiveJudgment(_buildSessionHeader());
         };
         _liveOnEnded = () => {
             _liveSessionId = null;
