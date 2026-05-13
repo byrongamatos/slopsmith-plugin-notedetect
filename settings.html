@@ -148,6 +148,21 @@
     function _q(id) { return document.getElementById(id); }
     function _fmt(n) { return (n == null) ? '—' : String(n); }
 
+    // HTML-escape helper for anything we interpolate into innerHTML.
+    // Song metadata (title/artist/arrangement) comes from user-authored
+    // sloppak manifests, and lastError surfaces server text — both can
+    // contain `<script>` or attribute-breakouts. Cheap five-char escape
+    // is enough for any string we then drop between tags or in single-
+    // quoted attributes.
+    function _esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
     // Read-only mirror of the most recent save path. The arm / save /
     // discard controls live in the gear popover, not here, so the
     // settings page is a between-runs review surface, not a live
@@ -161,9 +176,9 @@
         }
         const r = nd.getRecordingState();
         if (r.lastError) {
-            savedEl.innerHTML = '<span class="text-red-400">Last save failed: ' + r.lastError + '</span>';
+            savedEl.innerHTML = '<span class="text-red-400">Last save failed: ' + _esc(r.lastError) + '</span>';
         } else if (r.lastSavePath) {
-            savedEl.innerHTML = 'Latest: <code class="text-gray-300">' + r.lastSavePath + '</code>';
+            savedEl.innerHTML = 'Latest: <code class="text-gray-300">' + _esc(r.lastSavePath) + '</code>';
         } else {
             savedEl.textContent = 'No recording saved this session yet — arm + save from the gear popover.';
         }
@@ -314,15 +329,23 @@
         if (meta) {
             const bh = d.benchmark_hint || {};
             const s = d.settings || {};
+            // Song metadata is user-controlled (sloppak manifests can
+            // contain anything), so every interpolation through this
+            // path is escaped. Numeric fields are coerced via Number
+            // before stringifying so even if a manifest puts an HTML
+            // string in `pitch_tolerance_cents` we don't render it raw.
             const songLine = (bh.title || bh.artist)
-                ? `${bh.artist || '?'} — ${bh.title || '?'}` + (bh.arrangement ? ` (${bh.arrangement})` : '')
+                ? `${_esc(bh.artist || '?')} — ${_esc(bh.title || '?')}` + (bh.arrangement ? ` (${_esc(bh.arrangement)})` : '')
                 : 'no song loaded';
             const tp = (d.timing_error_ms && d.timing_error_ms.median != null)
-                ? `timing med ${d.timing_error_ms.median} ms` : null;
+                ? `timing med ${Number(d.timing_error_ms.median)} ms` : null;
             const pp = (d.pitch_error_cents && d.pitch_error_cents.median != null)
-                ? `pitch med ${d.pitch_error_cents.median}¢` : null;
+                ? `pitch med ${Number(d.pitch_error_cents.median)}¢` : null;
             const tail = [tp, pp].filter(Boolean).join(' · ');
-            meta.innerHTML = `${songLine}<br>method <code class="text-gray-500">${s.method}</code> · pitch tol ${s.pitch_tolerance_cents}¢ · chord lenience ${Math.round((s.chord_hit_ratio || 0) * 100)}%${tail ? '<br>' + tail : ''}`;
+            const method = _esc(s.method || '?');
+            const pitchTol = Number(s.pitch_tolerance_cents) || 0;
+            const chordPct = Math.round((Number(s.chord_hit_ratio) || 0) * 100);
+            meta.innerHTML = `${songLine}<br>method <code class="text-gray-500">${method}</code> · pitch tol ${pitchTol}¢ · chord lenience ${chordPct}%${tail ? '<br>' + tail : ''}`;
         }
     }
 
@@ -384,10 +407,17 @@
     // read-only "latest save path" mirror, no click handlers.)
 
     render();
-    // Auto-refresh while the section is in the DOM. Cheap (one
-    // function call + DOM writes); stops naturally when the user
-    // navigates away — the interval keeps firing but the elements
-    // are gone, so all reads return null and render() bails early.
-    setInterval(render, 1500);
+    // Auto-refresh while the section is in the DOM. Self-cancels once
+    // the diagnostic block leaves the page so we don't keep ticking
+    // forever after the user navigates away from Settings. Probe the
+    // smallest stable anchor in our section (the tuning-mode checkbox
+    // — always present) instead of any conditional element.
+    const _tickId = setInterval(() => {
+        if (!document.getElementById('nd-tuning-mode')) {
+            clearInterval(_tickId);
+            return;
+        }
+        render();
+    }, 1500);
 })();
 </script>

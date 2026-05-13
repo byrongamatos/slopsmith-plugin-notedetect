@@ -1,2 +1,7 @@
 .env
 node_modules/
+
+# Runtime artifacts — never commit.
+__pycache__/
+*.pyc
+.slopsmith-installed.json

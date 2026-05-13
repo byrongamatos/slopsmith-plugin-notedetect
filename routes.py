@@ -19,6 +19,7 @@ the container. ``static/`` IS bind-mounted, which is what we need.
 """
 
 import re
+import secrets
 import time
 from pathlib import Path
 from fastapi import HTTPException, Request
@@ -65,8 +66,16 @@ def setup(app, context):
             raise HTTPException(400, "body is not a WAV file (no RIFF/WAVE header)")
 
         slug = _sanitize_slug(request.query_params.get("slug", "recording"))
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"note_detect_{slug}_{ts}.wav"
+        # Include milliseconds + a short random suffix so two saves in
+        # the same second with the same slug don't overwrite each other
+        # (two-panel splitscreen scenario, or rapid arm/save cycles).
+        # `secrets.token_hex(3)` is plenty of entropy for human-scale
+        # collision avoidance and keeps the filename short.
+        now = time.time()
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+        ms = int((now - int(now)) * 1000)
+        suffix = secrets.token_hex(3)
+        filename = f"note_detect_{slug}_{ts}_{ms:03d}_{suffix}.wav"
         path = out_dir / filename
         # Use a `.tmp` then rename so a crashed write doesn't leave a
         # truncated WAV that the harness might pick up next time.

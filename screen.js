@@ -188,6 +188,13 @@ const _ndInstances = _ndShared.instances;
 
 const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 
+// Plugin semver — keep in sync with package.json / plugin.json. Stamped
+// into every diagnostic export so a JSON blob can be tied back to the
+// exact build that produced it. The script tag has no `import`/`fetch`
+// hook to read package.json at load time, so this is the single
+// hand-maintained constant the diagnostic path keys off of.
+const _ND_VERSION = '1.6.0';
+
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
 const _ND_FRAME_SIZE = 2048;       // ScriptProcessor buffer size
@@ -2164,7 +2171,13 @@ function createNoteDetector(options = {}) {
     function _diagPercentile(arr, p) {
         if (!arr || !arr.length) return null;
         const sorted = arr.slice().sort((a, b) => a - b);
-        const idx = Math.max(0, Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length)));
+        // Nearest-rank percentile keyed off (length − 1) so the endpoints
+        // map cleanly: p=0 → first element, p=50 → middle, p=100 → last.
+        // The previous form scaled by `length` and biased high at small
+        // N (e.g. p=50 of 2 samples returned the 2nd sample instead of
+        // either bracket-rank median).
+        const rank = (p / 100) * (sorted.length - 1);
+        const idx = Math.max(0, Math.min(sorted.length - 1, Math.round(rank)));
         return sorted[idx];
     }
 
@@ -3804,7 +3817,7 @@ function createNoteDetector(options = {}) {
         return {
             schema: 'note_detect.diagnostic.v1',
             timestamp: new Date().toISOString(),
-            plugin_version: '1.4.0',
+            plugin_version: _ND_VERSION,
             benchmark_hint: {
                 title: info.title || null,
                 artist: info.artist || null,

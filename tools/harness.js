@@ -319,7 +319,13 @@ async function main() {
     if (args.verbose) console.error(`[harness] decoding ${args.audio} at ${sampleRate} Hz mono...`);
     const dec = await decodeFloat32Mono(args.audio, sampleRate);
     const samples = dec.samples;
-    const totalFrames = Math.floor(samples.length / frameSize);
+    // Process every frame including a final partial one — `floor` would
+    // drop up to (frameSize − 1) samples off the tail, which on a 44.1
+    // kHz / 1024-sample-frame run is ~23 ms that could carry the
+    // attack or sustain of the song's final note. The tail frame is
+    // zero-padded to frameSize so the detector's autocorrelation
+    // doesn't read off the end of the audio buffer.
+    const totalFrames = Math.ceil(samples.length / frameSize);
     const totalDuration = samples.length / sampleRate;
     if (args.verbose) {
         console.error(`[harness] decoded ${samples.length} samples (${totalDuration.toFixed(2)} s) via ${dec.decoder}${dec.sourceSampleRate !== sampleRate ? ` (resampled ${dec.sourceSampleRate}→${sampleRate})` : ''} → ${totalFrames} frames × ${frameSize}`);
@@ -368,9 +374,13 @@ async function main() {
         const start = i * frameSize;
         // Copy the slice — processFrame may keep references through
         // async detection methods (CREPE), and reusing the typed view
-        // across frames would corrupt the in-flight buffer.
+        // across frames would corrupt the in-flight buffer. The final
+        // frame is zero-padded to frameSize (since totalFrames uses
+        // ceil); Float32Array zeros on construction, so the loop bound
+        // is the only thing that needs to clamp at samples.length.
         const frame = new Float32Array(frameSize);
-        for (let j = 0; j < frameSize; j++) frame[j] = samples[start + j];
+        const stop = Math.min(start + frameSize, samples.length);
+        for (let j = 0; start + j < stop; j++) frame[j] = samples[start + j];
         // eslint-disable-next-line no-await-in-loop
         await detector._harness.feedFrame(frame, sampleRate);
         if ((i % framesPerTick) === 0) detector._harness.tick();
