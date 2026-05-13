@@ -1148,7 +1148,15 @@ function createNoteDetector(options = {}) {
     // measurement exists). Capped to keep memory bounded across long
     // sessions; percentiles in the summary run on the raw array.
     const _DIAG_ERROR_CAP = 2000;
-    const _diagTimingErrors = [];   // milliseconds, sign = positive late / negative early
+    const _diagTimingErrors = [];   // milliseconds, sign = positive late / negative early — all matched judgments
+    // Hit-only timing samples. The all-matched array above includes
+    // judgments where the matcher snapped to a *neighbouring* chart note
+    // (closest-by-time wins, even if the user's actual playing skew is
+    // big), so its median is pinned by the matching window instead of
+    // tracking real audio↔chart drift. Restricting to actual hits gives
+    // a signal that responds linearly to A/V offset, which is what the
+    // auto-calibrate button keys off of.
+    const _diagTimingErrorsHits = [];
     const _diagPitchErrors  = [];   // cents,        sign = positive sharp / negative flat
     // Per-judgment event capture for the downloadable JSON. Capped at a
     // size that keeps the JSON small enough to share via copy-paste.
@@ -2104,6 +2112,9 @@ function createNoteDetector(options = {}) {
         }
         if (Number.isFinite(judgment.timingError) && _diagTimingErrors.length < _DIAG_ERROR_CAP) {
             _diagTimingErrors.push(judgment.timingError);
+            if (judgment.hit && _diagTimingErrorsHits.length < _DIAG_ERROR_CAP) {
+                _diagTimingErrorsHits.push(judgment.timingError);
+            }
         }
         if (Number.isFinite(judgment.pitchError) && _diagPitchErrors.length < _DIAG_ERROR_CAP) {
             _diagPitchErrors.push(judgment.pitchError);
@@ -2163,6 +2174,7 @@ function createNoteDetector(options = {}) {
         _diagChords.hits  = 0; _diagChords.misses  = 0;
         for (const slot of _diagPerString) { slot.hits = 0; slot.misses = 0; }
         _diagTimingErrors.length = 0;
+        _diagTimingErrorsHits.length = 0;
         _diagPitchErrors.length  = 0;
         _diagEvents.length       = 0;
     }
@@ -2492,16 +2504,22 @@ function createNoteDetector(options = {}) {
         const notes = hw.getNotes();
         const chords = hw.getChords();
 
-        const checkNote = (s, f, noteTime) => {
+        // Pass the full chart-note object (not just {s, f}) so the miss
+        // judgment carries `sus` and technique flags through to the
+        // diagnostic event log. Stripping to {s, f} here made every pure
+        // miss look like a staccato note (sus=0) regardless of whether
+        // the chart said it was sustained, which corrupts any
+        // sus-conditioned analysis downstream.
+        const checkNote = (chartNote, noteTime) => {
             if (noteTime > missDeadline) return;
-            const key = noteKey({ s, f }, noteTime);
+            const key = noteKey(chartNote, noteTime);
             if (!noteResults.has(key)) {
                 const expectedMidi = _ndMidiFromStringFret(
-                    s, f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
                 recordJudgment(
                     key,
-                    makeMissJudgment({ s, f }, noteTime, t, expectedMidi)
+                    makeMissJudgment(chartNote, noteTime, t, expectedMidi)
                 );
             }
         };
@@ -2512,7 +2530,7 @@ function createNoteDetector(options = {}) {
                 const n = notes[i];
                 if (n.t > missDeadline) break;
                 if (n.mt) continue;
-                checkNote(n.s, n.f, n.t);
+                checkNote(n, n.t);
             }
         }
         if (chords && chords.length > 0) {
@@ -2524,7 +2542,7 @@ function createNoteDetector(options = {}) {
                 if (liveNotes.length === 0) continue;
                 if (liveNotes.length === 1) {
                     // Degenerate "chord" of one — treat as a single note.
-                    checkNote(liveNotes[0].s, liveNotes[0].f, c.t);
+                    checkNote(liveNotes[0], c.t);
                     continue;
                 }
                 // Multi-note chord: judge as a single unit. matchNotes()
@@ -2765,7 +2783,7 @@ function createNoteDetector(options = {}) {
                 await saveRecordingNow();
                 renderRec();
             };
-            if (discBtn) discBtn.onclick = () => { disarmRecording(); renderRec(); };
+            if (discBtn) discBtn.onclick = () => { discardRecording(); renderRec(); };
             renderRec();
             const tick = setInterval(renderRec, 1000);
         }
@@ -3832,6 +3850,14 @@ function createNoteDetector(options = {}) {
                 median:  _diagPercentile(_diagTimingErrors, 50),
                 p90:     _diagPercentile(_diagTimingErrors, 90),
             },
+            // Hit-only timing distribution — the responsive signal for
+            // A/V auto-calibration. See _diagTimingErrorsHits comment.
+            timing_error_ms_hits: {
+                count:   _diagTimingErrorsHits.length,
+                p10:     _diagPercentile(_diagTimingErrorsHits, 10),
+                median:  _diagPercentile(_diagTimingErrorsHits, 50),
+                p90:     _diagPercentile(_diagTimingErrorsHits, 90),
+            },
             pitch_error_cents: {
                 count:   _diagPitchErrors.length,
                 p10:     _diagPercentile(_diagPitchErrors, 10),
@@ -3889,8 +3915,18 @@ function createNoteDetector(options = {}) {
         _recBindEvents();
     }
     function disarmRecording() {
+        // Soft stop: turn capture off but keep the buffer so the user
+        // can still Save (or Discard) what they captured. Clearing the
+        // buffer here would silently throw away the user's take, which
+        // is what they were complaining about. Use discardRecording()
+        // when you actually want to wipe.
+        _recArmed = false;
+        _recUnbindEvents();
+    }
+    function discardRecording() {
         _recArmed = false;
         _recChunks = [];
+        _recLastSaveError = null;
         _recUnbindEvents();
     }
     async function saveRecordingNow() {
@@ -4210,7 +4246,7 @@ function createNoteDetector(options = {}) {
             // in-flight buffer + disarm — the UI for it is about to
             // disappear and we don't want a half-captured WAV trailing.
             if (!tuningMode && (_recArmed || _recChunks.length > 0)) {
-                disarmRecording();
+                discardRecording();
             }
             saveSettings();
         },
@@ -4224,6 +4260,7 @@ function createNoteDetector(options = {}) {
         // / lastSavePath / lastError fields the UI polls.
         armRecording,
         disarmRecording,
+        discardRecording,
         saveRecordingNow,
         getRecordingState,
         // Internal — clear hits / misses / streak / noteResults /

@@ -14,6 +14,38 @@
         </p>
     </div>
 
+    <!-- A/V Sync auto-calibration. General-user surface (not gated by
+         tuning mode): suggests an A/V Sync Offset value derived from
+         the median signed timing error of the user's recently detected
+         notes. The math is simple — every ms of median skew is a ms
+         of A/V offset to add — but the value of surfacing it here is
+         that the user gets a concrete suggestion instead of fiddling
+         the slider blind. Needs Detect-on + a small handful of matched
+         notes to populate; before that the panel sits in "play a few
+         notes" mode. -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-semibold text-gray-300">A/V Sync — Auto-Calibrate</h4>
+            <span id="nd-av-state" class="text-[10px] uppercase tracking-wider text-gray-500">no data yet</span>
+        </div>
+        <p class="text-[11px] text-gray-400 leading-relaxed mb-3">
+            Reads your recently-detected note timing and proposes an <strong>A/V Sync Offset</strong> that would zero out the median skew. Run a song with Detect on, then click Apply.
+        </p>
+        <div class="text-[11px] text-gray-400 mb-3 leading-relaxed space-y-0.5">
+            <div>Current A/V offset: <span id="nd-av-current" class="text-gray-200 font-mono">—</span> ms</div>
+            <div>Median timing error: <span id="nd-av-median" class="text-gray-200 font-mono">—</span> ms <span id="nd-av-count" class="text-gray-600">(0 events)</span></div>
+            <div>Suggested A/V offset: <span id="nd-av-suggested" class="text-gray-200 font-mono">—</span> ms</div>
+        </div>
+        <button id="nd-av-apply"
+                class="w-full bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-4 py-2 rounded-lg text-sm font-semibold text-white transition"
+                disabled>
+            Apply suggested A/V offset
+        </button>
+        <p class="text-[10px] text-gray-600 mt-2 leading-relaxed">
+            Needs at least 5 hits. Usually takes 2–3 rounds to converge — Apply, play again, Apply, until the suggested value is within ±20 ms of current. If you've been getting almost no hits, your offset is too far off — reset the A/V slider on the main Settings page to 0, play a section, then come back here.
+        </p>
+    </div>
+
     <!-- Tuning-mode toggle. Lives here (where the panels it gates also
          live) so the user doesn't have to bounce between the gear
          popover and this page just to reveal developer surfaces.
@@ -137,8 +169,75 @@
         }
     }
 
+    // A/V Sync auto-calibrate — always-visible panel. Renders even when
+    // tuning mode is off because it's a general-user calibration tool,
+    // not a dev-only surface.
+    // We key off hit-only timing samples because the all-matched median
+    // is pinned by the matching-window's snap-to-nearest behaviour and
+    // doesn't respond linearly to av-offset; hits-only does. Threshold
+    // is lower than "all events" because hits are scarcer (a player at a
+    // very wrong av-offset may have very few). Iteration is expected:
+    // each Apply usually moves you closer to optimal but rarely lands
+    // it in one shot — converges in 2-3 rounds from a sane starting
+    // point. From a very wrong starting offset, reset to 0 first.
+    const _MIN_HITS_FOR_SUGGESTION = 5;
+    const _MIN_DELTA_TO_SUGGEST_MS = 20;  // smaller skew isn't worth applying
+    function renderAvCalibrate(nd) {
+        const stateEl = _q('nd-av-state');
+        const curEl   = _q('nd-av-current');
+        const medEl   = _q('nd-av-median');
+        const cntEl   = _q('nd-av-count');
+        const sugEl   = _q('nd-av-suggested');
+        const btn     = _q('nd-av-apply');
+        if (!btn) return;
+        const curAv = (window.highway && typeof window.highway.getAvOffset === 'function')
+            ? Math.round(window.highway.getAvOffset())
+            : null;
+        if (curEl) curEl.textContent = (curAv == null) ? '—' : (curAv >= 0 ? '+' + curAv : String(curAv));
+        if (!nd || typeof nd.getDiagnostic !== 'function') {
+            if (stateEl) stateEl.textContent = 'plugin not loaded';
+            if (medEl) medEl.textContent = '—';
+            if (cntEl) cntEl.textContent = '(0 hits)';
+            if (sugEl) sugEl.textContent = '—';
+            btn.disabled = true;
+            return;
+        }
+        const d = nd.getDiagnostic();
+        // Prefer hit-only samples; fall back to all-matched for plugin
+        // builds that don't expose the new field (graceful degrade).
+        const teHits = d.timing_error_ms_hits || d.timing_error_ms || {};
+        const count = teHits.count || 0;
+        const median = (teHits.median != null) ? teHits.median : null;
+        if (cntEl) cntEl.textContent = `(${count} hit${count === 1 ? '' : 's'})`;
+        if (medEl) medEl.textContent = (median == null) ? '—' : (median >= 0 ? '+' + median : String(median));
+        if (count < _MIN_HITS_FOR_SUGGESTION || median == null || curAv == null) {
+            if (sugEl) sugEl.textContent = '—';
+            if (stateEl) stateEl.textContent = count === 0
+                ? 'play a few notes first'
+                : `need ${_MIN_HITS_FOR_SUGGESTION - count} more hit${(_MIN_HITS_FOR_SUGGESTION - count) === 1 ? '' : 's'}`;
+            btn.disabled = true;
+            return;
+        }
+        // Sign math: timingError = (judgedAt − chartTime) × 1000, where
+        // judgedAt = audioT + avOffsetSec − latencyOffset. For a true hit
+        // (not a wrong-note snap), positive median = playing late, so we
+        // subtract the median to drive future te toward zero:
+        // avOffset_new = avOffset_cur − median.
+        const suggested = Math.max(-1000, Math.min(1000, curAv - median));
+        if (sugEl) sugEl.textContent = (suggested >= 0 ? '+' + suggested : String(suggested));
+        if (stateEl) stateEl.textContent = `ready — ${count} hits`;
+        const delta = Math.abs(suggested - curAv);
+        btn.disabled = delta < _MIN_DELTA_TO_SUGGEST_MS;
+        btn.textContent = btn.disabled
+            ? `Already within ${_MIN_DELTA_TO_SUGGEST_MS} ms`
+            : `Apply ${suggested >= 0 ? '+' + suggested : suggested} ms`;
+    }
+
     function render() {
         const nd = window.noteDetect;
+
+        // Always-visible A/V calibrator (renders even when tuning mode off).
+        renderAvCalibrate(nd);
 
         // Tuning-mode gate. Off by default → just the toggle is visible;
         // the Reference Recording + Diagnostic panels stay hidden. The
@@ -246,6 +345,30 @@
     }
     const rfBtn = _q('nd-diag-refresh');
     if (rfBtn) rfBtn.onclick = render;
+
+    // A/V Sync auto-calibrate — apply the suggestion. setAvOffsetMs is
+    // the global setter from app.js; it persists + drives the highway
+    // render shift + updates the main Settings slider in one call.
+    const avBtn = _q('nd-av-apply');
+    if (avBtn) {
+        avBtn.onclick = () => {
+            if (avBtn.disabled) return;
+            const nd = window.noteDetect;
+            if (!nd || typeof nd.getDiagnostic !== 'function'
+                || !window.highway || typeof window.highway.getAvOffset !== 'function'
+                || typeof window.setAvOffsetMs !== 'function') return;
+            const dg = nd.getDiagnostic();
+            const te = dg.timing_error_ms_hits || dg.timing_error_ms || {};
+            if (te.median == null || (te.count || 0) < _MIN_HITS_FOR_SUGGESTION) return;
+            const curAv = Math.round(window.highway.getAvOffset());
+            const next = Math.max(-1000, Math.min(1000, curAv - te.median));
+            window.setAvOffsetMs(next);
+            // Wipe accumulated timing samples so the next suggestion
+            // reflects the new offset, not a stale mix of both regimes.
+            if (typeof nd.resetDiagnostic === 'function') nd.resetDiagnostic();
+            render();
+        };
+    }
 
     // Tuning-mode toggle — drives whether the panels below show.
     const tuneCb = _q('nd-tuning-mode');
