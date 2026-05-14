@@ -199,11 +199,20 @@ process.stdout.write(
     '\n');
 process.stdout.write('-'.repeat(colW.name + colW.hits + colW.pure + colW.chord + (baseline ? colW.delta : 0)) + '\n');
 
+// Squash multi-line / oversized reasons (e.g. a harness stderr spill)
+// to a single line so they don't shred the tabular summary. Full
+// stderr is already echoed under --verbose at the call site above.
+function _oneLine(s) {
+    if (s == null) return 'unknown';
+    const flat = String(s).replace(/\s+/g, ' ').trim();
+    return flat.length > 120 ? flat.slice(0, 117) + '...' : (flat || 'unknown');
+}
+
 let regressed = 0;
 let improved = 0;
 for (const r of results) {
     if (r.status !== 'ok') {
-        process.stdout.write(pad(r.name, colW.name) + '  ' + r.status + ' (' + r.reason + ')\n');
+        process.stdout.write(pad(r.name, colW.name) + '  ' + r.status + ' (' + _oneLine(r.reason) + ')\n');
         continue;
     }
     let deltaCell = '';
