@@ -294,9 +294,20 @@ function _ndMakeJudgment(opts) {
     // 1 s so a 4-second held note doesn't accept detections nearly 4
     // seconds late as "on time" — at some point the player has clearly
     // missed the strike and is just holding the previous note's ring.
+    //
+    // For chord judgments, the caller passes an explicit `lateGraceMs`
+    // computed from the MAX sus across chord constituents (matching
+    // matchNotes' candidate-inclusion + checkMisses' retire-extension
+    // grace). Without that override, this falls back to the chart
+    // note's own sus, which for chords is just the first constituent
+    // (`liveNotes[0]`) — and a chord whose lead has a shorter sus than
+    // its longest constituent would get classified LATE here even
+    // though it was still inside the chord's matching window.
     const chartNote = o.chartNote || o.note || null;
     const susSec = chartNote && Number.isFinite(chartNote.sus) ? chartNote.sus : 0;
-    const lateGraceMs = susSec > 0 ? Math.min(susSec * 1000, 1000) : 0;
+    const lateGraceMs = Number.isFinite(o.lateGraceMs)
+        ? Math.max(0, o.lateGraceMs)
+        : (susSec > 0 ? Math.min(susSec * 1000, 1000) : 0);
     const timingState = matched ? _ndClassifyTiming(timingError, timingThresholdMs, lateGraceMs) : null;
     const pitchState = matched ? _ndClassifyPitch(pitchError, pitchThresholdCents) : null;
     // pitchState === null means pitch was not measured (e.g. energy-only chord
@@ -2288,6 +2299,7 @@ function createNoteDetector(options = {}) {
             totalStrings: extra.totalStrings,
             score: extra.score,
             monophonicDetected: extra.monophonicDetected,
+            lateGraceMs: extra.lateGraceMs,
         });
     }
 
@@ -2306,7 +2318,24 @@ function createNoteDetector(options = {}) {
             hitStrings: extra.hitStrings,
             totalStrings: extra.totalStrings,
             score: extra.score,
+            lateGraceMs: extra.lateGraceMs,
         });
+    }
+
+    // Update per-string diagnostic counters for a chord constituent
+    // judgment WITHOUT updating any other diagnostic counter. Chord
+    // constituent judgments are stashed straight into noteResults
+    // (bypassing recordJudgment) because totals/event-log are
+    // already accounted for at the chord-level entry — but the
+    // per-string panel still needs to see each string's outcome,
+    // otherwise it overrepresents whatever string happens to be
+    // `liveNotes[0]` and is blind to the rest.
+    function _recordPerStringForChord(judgment) {
+        const n = judgment.chartNote || judgment.note;
+        if (n && Number.isInteger(n.s) && n.s >= 0 && n.s < _diagPerString.length) {
+            const slot = _diagPerString[n.s];
+            if (judgment.hit) slot.hits++; else slot.misses++;
+        }
     }
 
     // Bin one judgment into the diagnostic counters. Called from inside
@@ -2316,6 +2345,11 @@ function createNoteDetector(options = {}) {
     // one primary-cause bin (chord events into chordPartial regardless
     // of axis; non-chord misses chosen as pure → timing → pitch in that
     // priority, so a single bar height adds up to total misses).
+    //
+    // NOTE: per-string counters here only see the chord-level chartNote
+    // (lead constituent). Chord constituents go through
+    // _recordPerStringForChord at their stash sites so per-string
+    // stats reflect each string's actual outcome.
     function _recordDiagnostic(judgment) {
         const isChord = !!judgment.chord;
         if (judgment.hit) {
@@ -2341,10 +2375,19 @@ function createNoteDetector(options = {}) {
                 _diagBreakdown.pure++;
             }
         }
-        const n = judgment.chartNote || judgment.note;
-        if (n && Number.isInteger(n.s) && n.s >= 0 && n.s < _diagPerString.length) {
-            const slot = _diagPerString[n.s];
-            if (judgment.hit) slot.hits++; else slot.misses++;
+        // Per-string counters: only update for non-chord judgments here.
+        // For chord-level judgments, judgment.chartNote is the chord's
+        // lead constituent (`liveNotes[0]`), which doesn't represent any
+        // single string's outcome — counting it here would overrepresent
+        // whichever string happened to be the lead and miss the other
+        // constituents. Per-string credit for chord constituents flows
+        // through _recordPerStringForChord at the constituent stash sites.
+        if (!isChord) {
+            const n = judgment.chartNote || judgment.note;
+            if (n && Number.isInteger(n.s) && n.s >= 0 && n.s < _diagPerString.length) {
+                const slot = _diagPerString[n.s];
+                if (judgment.hit) slot.hits++; else slot.misses++;
+            }
         }
         if (Number.isFinite(judgment.timingError) && _diagTimingErrors.length < _DIAG_ERROR_CAP) {
             _diagTimingErrors.push(judgment.timingError);
@@ -2702,6 +2745,19 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
+                // Chord-level late-grace must come from the MAX sus
+                // across constituents — not just `lead.sus` — so that
+                // _ndMakeJudgment's timing classification matches the
+                // candidate-inclusion and retire-extension grace logic
+                // in matchNotes/checkMisses. Capped at MAX_SUS_LATE_GRACE
+                // (mirrors matchNotes; see the constant below).
+                let chordSusForGrace = 0;
+                for (const cn of group) {
+                    if (Number.isFinite(cn.sus) && cn.sus > chordSusForGrace) chordSusForGrace = cn.sus;
+                }
+                const chordLateGraceMs = chordSusForGrace > 0
+                    ? Math.min(chordSusForGrace * 1000, 1000)
+                    : 0;
                 // Derive pitch error from the first string that actually has a
                 // finite centsError measurement. Fall back to the monophonic
                 // detector if available; leave null if no pitch data exists
@@ -2728,6 +2784,7 @@ function createNoteDetector(options = {}) {
                         score: chordResult.score,
                         pitchError: chordPitchError,
                         monophonicDetected: detectedMidi >= 0,
+                        lateGraceMs: chordLateGraceMs,
                     }
                 );
 
@@ -2843,7 +2900,9 @@ function createNoteDetector(options = {}) {
                         const stringExpectedMidi = _ndMidiFromStringFret(
                             cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                         );
-                        noteResults.set(key, makeMissJudgment(cn, cn.t, t, stringExpectedMidi));
+                        const stringMiss = makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
+                        noteResults.set(key, stringMiss);
+                        _recordPerStringForChord(stringMiss);
                         continue;
                     }
                     const stringRes = stringResByKey.get(`${cn.s}_${cn.f}`);
@@ -2862,6 +2921,7 @@ function createNoteDetector(options = {}) {
                         )
                         : makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
                     noteResults.set(key, stringJudgment);
+                    _recordPerStringForChord(stringJudgment);
                 }
             }
         }
@@ -2947,6 +3007,10 @@ function createNoteDetector(options = {}) {
                     if (Number.isFinite(cn.sus) && cn.sus > chordSus) chordSus = cn.sus;
                 }
                 const chordLateGrace = chordSus > 0 ? Math.min(chordSus, MAX_SUS_LATE_GRACE) : 0;
+                // Mirror the seconds-vs-milliseconds split: _ndMakeJudgment
+                // wants late-grace in ms, but the retire-window comparisons
+                // above use seconds.
+                const chordLateGraceMs = chordLateGrace * 1000;
                 if (c.t > missDeadline - chordLateGrace) continue;
                 // Multi-note chord: judge as a single unit. matchNotes()
                 // stores a judgment object at `<t>_chord` when the chord
@@ -3009,6 +3073,7 @@ function createNoteDetector(options = {}) {
                             // (`matched && timingState === 'OK'`) lets it
                             // through.
                             pitchError: null,
+                            lateGraceMs: chordLateGraceMs,
                         },
                     )
                     : makeMissJudgment(liveNotes[0], c.t, t, expectedMidi, {
@@ -3017,6 +3082,7 @@ function createNoteDetector(options = {}) {
                         hitStrings:   cachedChord ? cachedChord.hitStrings   : undefined,
                         totalStrings: cachedChord ? cachedChord.totalStrings : undefined,
                         score:        cachedChord ? cachedChord.score        : undefined,
+                        lateGraceMs: chordLateGraceMs,
                     });
                 recordJudgment(chordKey, chordJudgment);
                 // Free the cache entry — we've consumed it, no further
@@ -3025,9 +3091,18 @@ function createNoteDetector(options = {}) {
                 _chordLastResult.delete(chordKey);
                 for (const cn of liveNotes) {
                     const key = noteKey({ s: cn.s, f: cn.f }, c.t);
-                    if (!noteResults.has(key)) noteResults.set(key, makeMissJudgment(cn, c.t, t, _ndMidiFromStringFret(
+                    if (noteResults.has(key)) continue;
+                    const stringMiss = makeMissJudgment(cn, c.t, t, _ndMidiFromStringFret(
                         cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
-                    )));
+                    ));
+                    noteResults.set(key, stringMiss);
+                    // Bin per-string only when the chord retired as a
+                    // miss. On voicing-rescue (chord-level hit) no
+                    // per-string outcomes were measured — we'd be
+                    // forcing miss-by-default fallbacks into the
+                    // per-string panel and overstating misses on
+                    // strings that may have rung fine.
+                    if (!voicingRescue) _recordPerStringForChord(stringMiss);
                 }
             }
         }
