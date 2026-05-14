@@ -243,3 +243,101 @@ test('scoreChord: harmonic flag bypasses pitch check so off-pitch in-band energy
     assert.equal(pitched.hitStrings, 0, 'expected off-pitch signal to fail pitch check');
     assert.equal(harmonic.hitStrings, 1, 'expected hm:true to skip pitch check and hit');
 });
+
+// ── voicing-reduction credit ──────────────────────────────────────────────
+//
+// Real-song data (American Jesus, Bad Religion rhythm) showed players
+// playing power-chord voicings (root + fifth on the bottom 2 strings)
+// of full-chord charts and scoring "miss" because score = 2/6 = 0.33 fell
+// below the default cr = 0.40. The voicing-reduction path in
+// _ndScoreChord credits those as hits when the bass string's pitch is
+// verified AND at least one other chord string rings. These tests pin
+// the conditions: hit when bass + ≥1 other; miss when bass alone or
+// non-bass-only; off when pitch checking is disabled (energy-only path).
+
+function _summed(amps) {
+    // Sum multiple sine() outputs into one buffer (truncate to shortest).
+    let len = Infinity;
+    for (const b of amps) if (b.length < len) len = b.length;
+    const out = new Float32Array(len);
+    for (const b of amps) for (let i = 0; i < len; i++) out[i] += b[i];
+    return out;
+}
+
+test('voicing-reduction: root + fifth on a full E major chart flags voicingHit (rescue at retire)', () => {
+    // Chart: full E major (all 6 strings). Audio: only the bottom two
+    // strings of the voicing ring — low E (E2 = 82.4 Hz, MIDI 40) and
+    // A-string fret 2 (B2 = 123.47 Hz, MIDI 47, the chord's fifth).
+    // This is the classic power-chord interpretation of an open E.
+    // Strict score = 2/6 = 0.33 → fails the 0.6 ratio, so `isHit`
+    // (which mirrors the strict-ratio path now) stays false on the
+    // scoreChord call. The `voicingHit` flag is what marks the chord
+    // as "rescue this at retire time" — checkMisses (not exercised
+    // here) reads it and records a hit judgment instead of a miss.
+    const buf = _summed([sine(82.41, SR, DURATION, 0.5), sine(123.47, SR, DURATION, 0.5)]);
+    const chord = [
+        { s: 0, f: 0 }, { s: 1, f: 2 }, { s: 2, f: 2 },
+        { s: 3, f: 1 }, { s: 4, f: 0 }, { s: 5, f: 0 },
+    ];
+    const r = core.scoreChord(buf, SR, chord, 'guitar', 6, GUITAR_6.offsets, 0, 50, 0.6);
+    assert.equal(r.voicingHit, true, 'expected voicing-reduction flag');
+    assert.equal(r.isHit, false, 'isHit reflects strict ratio only — voicing is rescued at retire');
+    assert.ok(r.score < 0.6, `score ${r.score} should be below the strict ratio`);
+    assert.ok(r.hitStrings >= 2, `hitStrings ${r.hitStrings} should be ≥ 2`);
+});
+
+test('voicing-reduction: bass-string only (root alone) does NOT credit', () => {
+    // Just the low E ringing, no other chord string. Voicing-reduction
+    // requires ≥ 2 strings to fire — a single string can't fake a chord.
+    const buf = sine(82.4, SR, DURATION, 0.5);
+    const chord = [
+        { s: 0, f: 0 }, { s: 1, f: 2 }, { s: 2, f: 2 },
+        { s: 3, f: 1 }, { s: 4, f: 0 }, { s: 5, f: 0 },
+    ];
+    const r = core.scoreChord(buf, SR, chord, 'guitar', 6, GUITAR_6.offsets, 0, 50, 0.6);
+    assert.equal(r.voicingHit, false, 'single-string strum must not credit voicing');
+    assert.equal(r.isHit, false);
+});
+
+test('voicing-reduction: non-bass strings ringing without bass do NOT credit', () => {
+    // Strings 4 (B3 = 246.94 Hz) and 5 (E4 = 329.63 Hz) ring but the
+    // chord's bass (string 0) does not. Score is 2/6 = 0.33, same
+    // hitStrings count as the root+fifth case, but the bass-pitch
+    // verification fails so voicing-reduction must NOT fire.
+    const buf = _summed([sine(246.94, SR, DURATION, 0.5), sine(329.63, SR, DURATION, 0.5)]);
+    const chord = [
+        { s: 0, f: 0 }, { s: 1, f: 2 }, { s: 2, f: 2 },
+        { s: 3, f: 1 }, { s: 4, f: 0 }, { s: 5, f: 0 },
+    ];
+    const r = core.scoreChord(buf, SR, chord, 'guitar', 6, GUITAR_6.offsets, 0, 50, 0.6);
+    assert.equal(r.voicingHit, false, 'no-bass-but-2-strings must not credit voicing');
+    assert.equal(r.isHit, false);
+});
+
+test('voicing-reduction: energy-only mode (pitchCheckCents=0) gates off voicing-reduction', () => {
+    // 120 Hz sine — same signal as the "score < 60%, isHit false" test
+    // above. With pitchCheckCents=0 the per-string `hit` flag is true
+    // for any band with enough energy, so leakage can produce 2-3
+    // hitStrings without actually matching pitches. Voicing-reduction
+    // must NOT credit this: the bass-pitch-verified gate (centsDiff
+    // finite) requires real pitch checking to have happened.
+    const buf = sine(120, SR, DURATION);
+    const chord = [0, 1, 2, 3, 4, 5].map(s => ({ s, f: 0 }));
+    const r = core.scoreChord(buf, SR, chord, 'guitar', 6, GUITAR_6.offsets, 0, 0, 0.6);
+    assert.equal(r.voicingHit, false, 'energy-only mode must not trigger voicing-reduction');
+    assert.equal(r.isHit, false);
+});
+
+test('voicing-reduction: 2-string power-chord chart (already 2 strings) hits via ratio, voicingHit is informational', () => {
+    // A 2-string chord chart (E5 power chord) with both strings ringing
+    // hits 2/2 = 1.00 via the strict ratio path, regardless of voicing-
+    // reduction. The bass-string condition is still satisfied so
+    // voicingHit also fires — both paths agree on the hit. Confirms the
+    // two paths are a disjunction (either-or) not exclusive.
+    const buf = _summed([sine(82.4, SR, DURATION, 0.5), sine(123.47, SR, DURATION, 0.5)]);
+    const chord = [{ s: 0, f: 0 }, { s: 1, f: 2 }];
+    const r = core.scoreChord(buf, SR, chord, 'guitar', 6, GUITAR_6.offsets, 0, 50, 0.6);
+    assert.equal(r.isHit, true);
+    assert.equal(r.score, 1.0);
+    assert.equal(r.voicingHit, true, 'voicingHit fires alongside the ratio path on full voicings');
+});

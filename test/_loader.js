@@ -278,6 +278,11 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
                 hitStrings: r.hitStrings,
                 totalStrings: r.totalStrings,
                 isHit: r.isHit,
+                // Voicing-reduction credit flag — true when the chord
+                // was rescued by the parallel "bass + ≥1 other" path
+                // rather than the strict score-ratio path. Surfaced for
+                // tests that pin the two paths separately.
+                voicingHit: r.voicingHit,
                 results: r.results.map(x => ({
                     s: x.s, f: x.f, hit: x.hit,
                     bandEnergy: x.bandEnergy, centsDiff: x.centsDiff,

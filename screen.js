@@ -855,7 +855,76 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
 
     const totalStrings = chordNotes.length;
     const score = totalStrings > 0 ? hitStrings / totalStrings : 0;
-    return { score, hitStrings, totalStrings, results, isHit: score >= minHitRatio };
+
+    // ── Voicing-reduction credit ─────────────────────────────────────
+    // The strict score-ratio path counts "how much of the chart's full
+    // voicing rang". For a chart that says "E major, all 6 strings", a
+    // player who plays the same chord as a 2-string power voicing
+    // (E + B = root + fifth on strings 0 and 1) scores 2/6 = 0.33 and
+    // misses at the default cr=0.40. That's musically wrong for huge
+    // categories of real playing — punk / pop-rock / country rhythm
+    // guitar IS root + fifth voicings on full-chord charts. Real-song
+    // data (American Jesus, Bad Religion rhythm, 1033 chord events)
+    // showed ~50% of misses landing in exactly this 1-2-of-N regime,
+    // while having clean timing and ringing the root every time.
+    //
+    // Add a parallel hit path: the chord ALSO counts as a hit if the
+    // chart's lowest string (the bass note / root, by convention for
+    // every common rhythm-guitar voicing) rang AND at least one OTHER
+    // chord string rang. This rewards the voicing-reduction style
+    // without rewarding random-string noise:
+    //   • Single string alone (root only) → still a miss
+    //   • Any 2 strings WITHOUT the root → still a miss
+    //   • Root + any 1+ other → hit
+    //   • Full voicing → hit via ratio (the original path)
+    //
+    // Strict players who want "all strings must ring" can dial cr up
+    // to 1.0; voicing-reduction is gated on the chord's expected bass
+    // note specifically and won't trip on incidental string noise.
+    //
+    // Surface `voicingHit` separately from `isHit` so analytics /
+    // diagnostics can see WHY a chord was credited.
+    let voicingHit = false;
+    if (results.length >= 2) {
+        // The chord's lowest string is its bass note. We don't sort
+        // mid-call (the loop already iterates chordNotes in order and
+        // pushes to `results` in the same order); find the minimum
+        // string number, then check that exact string's result.
+        let minStringIdx = 0;
+        for (let i = 1; i < results.length; i++) {
+            if (results[i].s < results[minStringIdx].s) minStringIdx = i;
+        }
+        const bassResult = results[minStringIdx];
+        // Require the bass string's PITCH to have been verified (not
+        // just an energy-band hit). Without this gate, a synthetic
+        // narrow-band signal in the harmonic/energy-only path (where
+        // `pitchCheckCents <= 0` returns hit=true on energy alone) can
+        // trip voicing-reduction by leakage into adjacent string bands.
+        // Real chord-voicing playing always passes pitch — when
+        // `centsDiff` is finite, we know the bass note's frequency was
+        // matched to the expected fret/string, which is the strong
+        // evidence we actually want here.
+        const bassPitchVerified = bassResult
+            && bassResult.hit
+            && Number.isFinite(bassResult.centsDiff);
+        if (bassPitchVerified && hitStrings >= 2) {
+            voicingHit = true;
+        }
+    }
+
+    // `isHit` reflects ONLY the strict ratio path — that's what
+    // matchNotes uses to decide whether to commit a hit on the
+    // current frame. The `voicingHit` flag is informational: it
+    // means "if matchNotes never finds a strict-ratio frame for
+    // this chord, checkMisses should rescue it as a hit at retire
+    // time instead of recording a miss." This deferred-commit
+    // approach lets strict-ratio frames (which tend to have better
+    // timing because they fire later in the chord's audio decay)
+    // win out, and voicing-reduction only kicks in as a fallback —
+    // avoiding the timing-eager-commit regression where a sub-
+    // threshold early frame locked in a hit with bad timing.
+    const isHit = score >= minHitRatio;
+    return { score, hitStrings, totalStrings, results, isHit, voicingHit };
 }
 
 // ── Pitch Detection: CREPE (shared model) ──────────────────────────────────
@@ -2675,11 +2744,24 @@ function createNoteDetector(options = {}) {
                     // key and overwrites every frame so the FINAL frame's
                     // result is what lands in the miss — that's the
                     // "best the scorer got" snapshot.
-                    _chordLastResult.set(chordKey, {
-                        score: chordResult.score,
-                        hitStrings: chordResult.hitStrings,
-                        totalStrings: chordResult.totalStrings,
-                    });
+                    // Track the BEST voicingHit frame across the
+                    // chord's window — checkMisses will rescue this as
+                    // a hit (instead of recording miss) if no strict
+                    // ratio frame ever materializes. "Best" = highest
+                    // score, so we use the cleanest voicing reduction
+                    // we saw if multiple frames qualified.
+                    const prev = _chordLastResult.get(chordKey);
+                    const isBetter = !prev
+                        || (chordResult.voicingHit && !prev.voicingHit)
+                        || (chordResult.score > (prev.score || 0));
+                    if (isBetter) {
+                        _chordLastResult.set(chordKey, {
+                            score: chordResult.score,
+                            hitStrings: chordResult.hitStrings,
+                            totalStrings: chordResult.totalStrings,
+                            voicingHit: !!chordResult.voicingHit,
+                        });
+                    }
                     // Do not lock in a miss while the chord is still within
                     // its timing window. Chords can enter candidateNotes as
                     // early as (chordTime - timingTolerance), so an early
@@ -2857,17 +2939,47 @@ function createNoteDetector(options = {}) {
                 // monophonic detection failure path, etc.) the cache
                 // is empty and we fall back to undefined-as-before.
                 const cachedChord = _chordLastResult.get(chordKey);
-                const chordJudgment = makeMissJudgment(liveNotes[0], c.t, t, expectedMidi, {
-                    notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
-                    chord: true,
-                    hitStrings:   cachedChord ? cachedChord.hitStrings   : undefined,
-                    totalStrings: cachedChord ? cachedChord.totalStrings : undefined,
-                    score:        cachedChord ? cachedChord.score        : undefined,
-                });
+                // Voicing-reduction rescue: if matchNotes never found a
+                // strict-ratio frame but the chord was voicing-eligible
+                // at some point (`bass + ≥1 other` with verified bass
+                // pitch), record this retire as a HIT instead of a miss.
+                // This is the "punk-rock power-chord interpretation of a
+                // full-chord chart" path — see _ndScoreChord for the
+                // detailed rationale and the trade-off vs eager-commit
+                // in matchNotes (which we explicitly avoid to keep
+                // strict-ratio frames' timing winning when they exist).
+                const voicingRescue = !!(cachedChord && cachedChord.voicingHit);
+                const chordJudgment = voicingRescue
+                    ? makeMatchedJudgment(
+                        liveNotes[0], c.t, t, expectedMidi,
+                        null,    // no monophonic detection at retire time
+                        0,       // no pitch confidence to claim
+                        {
+                            chord: true,
+                            notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
+                            hitStrings:   cachedChord.hitStrings,
+                            totalStrings: cachedChord.totalStrings,
+                            score:        cachedChord.score,
+                            // No pitch error to report — voicing-reduction is
+                            // an aggregate per-string verdict, not a monophonic
+                            // pitch measurement. The pitchState ends up null,
+                            // and _ndMakeJudgment's chord-branch hit calc
+                            // (`matched && timingState === 'OK'`) lets it
+                            // through.
+                            pitchError: null,
+                        },
+                    )
+                    : makeMissJudgment(liveNotes[0], c.t, t, expectedMidi, {
+                        notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
+                        chord: true,
+                        hitStrings:   cachedChord ? cachedChord.hitStrings   : undefined,
+                        totalStrings: cachedChord ? cachedChord.totalStrings : undefined,
+                        score:        cachedChord ? cachedChord.score        : undefined,
+                    });
                 recordJudgment(chordKey, chordJudgment);
                 // Free the cache entry — we've consumed it, no further
                 // matchNotes frames will fire for this chord (it just
-                // got finalized as a miss).
+                // got finalized as a miss or voicing-rescue hit).
                 _chordLastResult.delete(chordKey);
                 for (const cn of liveNotes) {
                     const key = noteKey({ s: cn.s, f: cn.f }, c.t);
