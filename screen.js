@@ -884,32 +884,35 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
     //
     // Surface `voicingHit` separately from `isHit` so analytics /
     // diagnostics can see WHY a chord was credited.
+    // Voicing-reduction = "at least 2 of the chord's strings rang at
+    // their correct expected pitches". This is the bar for "the player
+    // played a reduced voicing of this chord", as distinct from "random
+    // string noise" — which fails to match any chord string's expected
+    // pitch and so doesn't contribute to the count.
+    //
+    // An earlier formulation required the chart's LOWEST string (the
+    // bass note) to be one of the rung strings, reasoning that a real
+    // chord must include its root. Real-song data caught the issue:
+    // players often strum the middle/high strings of a chord shape
+    // without sounding the lowest note (string skipping, fast strumming,
+    // open-chord shapes where the bass is muted by hand position). Those
+    // are valid 2-note interpretations of the chord too. The pitch-
+    // verified gate is the real protection against energy-only false
+    // positives — once 2 chord strings are confirmed at their correct
+    // pitches, it doesn't matter which 2 they are.
     let voicingHit = false;
     if (results.length >= 2) {
-        // The chord's lowest string is its bass note. We don't sort
-        // mid-call (the loop already iterates chordNotes in order and
-        // pushes to `results` in the same order); find the minimum
-        // string number, then check that exact string's result.
-        let minStringIdx = 0;
-        for (let i = 1; i < results.length; i++) {
-            if (results[i].s < results[minStringIdx].s) minStringIdx = i;
+        let pitchVerifiedHits = 0;
+        for (const r of results) {
+            // `hit && finite centsDiff` means the per-string check ran
+            // a real pitch comparison and accepted. Energy-only "hit"s
+            // (centsDiff null, from the pitchCheckCents <= 0 path used
+            // by harmonics) intentionally don't count here — see the
+            // "energy-only mode gates off voicing-reduction" test.
+            if (r.hit && Number.isFinite(r.centsDiff)) pitchVerifiedHits++;
+            if (pitchVerifiedHits >= 2) break;
         }
-        const bassResult = results[minStringIdx];
-        // Require the bass string's PITCH to have been verified (not
-        // just an energy-band hit). Without this gate, a synthetic
-        // narrow-band signal in the harmonic/energy-only path (where
-        // `pitchCheckCents <= 0` returns hit=true on energy alone) can
-        // trip voicing-reduction by leakage into adjacent string bands.
-        // Real chord-voicing playing always passes pitch — when
-        // `centsDiff` is finite, we know the bass note's frequency was
-        // matched to the expected fret/string, which is the strong
-        // evidence we actually want here.
-        const bassPitchVerified = bassResult
-            && bassResult.hit
-            && Number.isFinite(bassResult.centsDiff);
-        if (bassPitchVerified && hitStrings >= 2) {
-            voicingHit = true;
-        }
+        if (pitchVerifiedHits >= 2) voicingHit = true;
     }
 
     // `isHit` reflects ONLY the strict ratio path — that's what

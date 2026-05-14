@@ -299,19 +299,24 @@ test('voicing-reduction: bass-string only (root alone) does NOT credit', () => {
     assert.equal(r.isHit, false);
 });
 
-test('voicing-reduction: non-bass strings ringing without bass do NOT credit', () => {
+test('voicing-reduction: any two pitch-verified chord strings credit voicing (no bass requirement)', () => {
     // Strings 4 (B3 = 246.94 Hz) and 5 (E4 = 329.63 Hz) ring but the
-    // chord's bass (string 0) does not. Score is 2/6 = 0.33, same
-    // hitStrings count as the root+fifth case, but the bass-pitch
-    // verification fails so voicing-reduction must NOT fire.
+    // chord's bass (string 0) does not. Strict score is 2/6 = 0.33,
+    // same hitStrings count as the root+fifth case. An earlier
+    // formulation required the bass specifically to ring, but real-
+    // song data showed players strumming mid/high chord strings
+    // without sounding the bass (string skipping, hand position on
+    // open chords, fast strumming) — those are still valid 2-note
+    // chord voicings. As long as both strings ring at their
+    // CORRECT pitches for the chord, voicing-reduction credits.
     const buf = _summed([sine(246.94, SR, DURATION, 0.5), sine(329.63, SR, DURATION, 0.5)]);
     const chord = [
         { s: 0, f: 0 }, { s: 1, f: 2 }, { s: 2, f: 2 },
         { s: 3, f: 1 }, { s: 4, f: 0 }, { s: 5, f: 0 },
     ];
     const r = core.scoreChord(buf, SR, chord, 'guitar', 6, GUITAR_6.offsets, 0, 50, 0.6);
-    assert.equal(r.voicingHit, false, 'no-bass-but-2-strings must not credit voicing');
-    assert.equal(r.isHit, false);
+    assert.equal(r.voicingHit, true, 'two pitch-verified chord-string hits should credit voicing');
+    assert.ok(r.score < 0.6, `score ${r.score} should still be below the strict ratio`);
 });
 
 test('voicing-reduction: energy-only mode (pitchCheckCents=0) gates off voicing-reduction', () => {
