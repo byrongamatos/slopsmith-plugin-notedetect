@@ -1312,6 +1312,7 @@ function createNoteDetector(options = {}) {
     let _recLastSaveError = null;     // surfaced in the UI when a save fails
     let _recSaveInFlight = false;     // de-dupe rapid saves
     let _recCappedAt = null;          // seconds into the take where the client-side cap kicked in (null = no cap hit)
+    let _recTotalSamples = 0;         // running sum of _recChunks lengths — avoids O(n²) reduce on the detection hot path
     // slopsmith#254 — per-sustained-hit-note "still being held on-pitch"
     // grace timestamps: key -> performance.now() ms before which the
     // sustain still counts as actively held. Smooths the gap between
@@ -2038,25 +2039,32 @@ function createNoteDetector(options = {}) {
         // the home screen.
         if (_recArmed && _recSongPlaying) {
             _recSampleRate = audioCtx ? audioCtx.sampleRate : (bridgeSampleRate || _recSampleRate);
-            // Client-side cap mirrors the routes.py 32 MB / 8 min ceiling so
-            // a runaway arm (user walks away with Detect still capturing) can't
-            // balloon the page's heap before the server-side cap rejects the
-            // upload. 32 MB / (sr * 4 bytes per Float32) ≈ 190 s at 44.1 kHz
-            // — well past a single benchmark take. When we hit it, the buffer
-            // stays at the cap and `_recCappedAt` flips so the save path can
-            // surface a "truncated" note on the resulting WAV.
-            const totalSamples = _recChunks.reduce((s, c) => s + c.length, 0);
-            const sr = _recSampleRate || 44100;
-            const maxSamples = Math.floor((32 * 1024 * 1024) / 4);   // bytes / 4 = Float32 samples
-            if (totalSamples >= maxSamples) {
-                if (!_recCappedAt) _recCappedAt = totalSamples / sr;
+            // Client-side cap mirrors the routes.py 32 MB ceiling so a
+            // runaway arm (user walks away with Detect still capturing)
+            // can't balloon the page's heap before the server-side cap
+            // rejects the upload. 32 MB / 4 bytes per Float32 ≈ 8M
+            // samples ≈ 190 s at 44.1 kHz (~3.2 min) — well past a
+            // single benchmark take. When we hit it, the buffer stays
+            // at the cap and `_recCappedAt` is set so the save path
+            // can surface a "truncated" note on the resulting WAV.
+            //
+            // Track the running sample count in `_recTotalSamples`
+            // rather than `_recChunks.reduce(...)` per frame. The
+            // reduce was O(n) per frame and O(n²) over a take — a
+            // measurable hit on the detection hot path on long
+            // recordings.
+            const maxSamples = Math.floor((32 * 1024 * 1024) / 4);
+            if (_recTotalSamples >= maxSamples) {
+                if (!_recCappedAt) _recCappedAt = _recTotalSamples / (_recSampleRate || 44100);
                 // Silently drop further frames — the cap is the upper bound
                 // and we'd rather keep the first N minutes than truncate the
                 // tail of a long take.
             } else {
                 // slice() because the analyser may overwrite the buffer the
                 // next time processFrame fires.
-                _recChunks.push(buffer.slice());
+                const copy = buffer.slice();
+                _recChunks.push(copy);
+                _recTotalSamples += copy.length;
             }
         }
     }
@@ -2331,14 +2339,32 @@ function createNoteDetector(options = {}) {
     function _diagPercentile(arr, p) {
         if (!arr || !arr.length) return null;
         const sorted = arr.slice().sort((a, b) => a - b);
-        // Nearest-rank percentile keyed off (length − 1) so the endpoints
-        // map cleanly: p=0 → first element, p=50 → middle, p=100 → last.
-        // The previous form scaled by `length` and biased high at small
-        // N (e.g. p=50 of 2 samples returned the 2nd sample instead of
-        // either bracket-rank median).
+        return _diagPercentileFromSorted(sorted, p);
+    }
+    // Same nearest-rank math as _diagPercentile but takes an already-
+    // sorted array. Used by the bulk helper below to avoid sorting the
+    // same array three times when computing p10/median/p90 for one
+    // distribution.
+    function _diagPercentileFromSorted(sorted, p) {
+        if (!sorted || !sorted.length) return null;
         const rank = (p / 100) * (sorted.length - 1);
         const idx = Math.max(0, Math.min(sorted.length - 1, Math.round(rank)));
         return sorted[idx];
+    }
+    // Sort once, compute count + p10/median/p90 once. _buildDiagnosticPayload
+    // calls this three times per export (timing, timing-hits, pitch); the
+    // previous code did three .slice().sort() per call there → 9 sorts per
+    // payload. The Settings-page A/V auto-calibrate panel polls every 1.5 s
+    // while open, so this hit was real.
+    function _diagDistribution(arr) {
+        if (!arr || !arr.length) return { count: 0, p10: null, median: null, p90: null };
+        const sorted = arr.slice().sort((a, b) => a - b);
+        return {
+            count: sorted.length,
+            p10:    _diagPercentileFromSorted(sorted, 10),
+            median: _diagPercentileFromSorted(sorted, 50),
+            p90:    _diagPercentileFromSorted(sorted, 90),
+        };
     }
 
     function _diagResetCounters() {
@@ -2672,6 +2698,12 @@ function createNoteDetector(options = {}) {
                 // lenient chord hits where some strings rang and some
                 // didn't.
                 recordJudgment(chordKey, chordJudgment, { count: true, emit: true });
+                // Hit path doesn't need any cached miss-diagnostic for
+                // this chord — drop the entry so the map only holds
+                // truly-pending chords. Without this, the cache could
+                // grow over a session as chords flicker through the
+                // "scored low, then scored above threshold" pattern.
+                _chordLastResult.delete(chordKey);
                 // Build an (s,f)-keyed lookup so we don't rely on
                 // `chordResult.results[i]` being positionally aligned
                 // with `group[i]`. The browser `_ndScoreChord`
@@ -3598,6 +3630,19 @@ function createNoteDetector(options = {}) {
         lastChordTime = -Infinity;
     }
 
+    // Narrower reset used by the A/V auto-calibrate Apply button.
+    // Calling resetScoring() there blew away the user's hit/miss
+    // counters + streak + section history + event log — surprising
+    // for what's framed as a calibration tweak. This clears ONLY the
+    // timing-error samples that feed the next calibration suggestion,
+    // so the next median reflects the new offset but everything else
+    // the user can see on Settings (accuracy, breakdown, per-section)
+    // stays intact.
+    function _resetCalibrationSamples() {
+        _diagTimingErrors.length = 0;
+        _diagTimingErrorsHits.length = 0;
+    }
+
     // ── Drill mode (slopsmith loop:restart) ───────────────────────────
     function _drillCurrentLoop() {
         const fallback = { loopA: null, loopB: null };
@@ -4039,6 +4084,7 @@ function createNoteDetector(options = {}) {
         // shouldn't write a half-captured WAV.
         _recArmed = false;
         _recChunks = [];
+        _recTotalSamples = 0;
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
         try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
@@ -4130,26 +4176,11 @@ function createNoteDetector(options = {}) {
                 accuracy: (slot.hits + slot.misses) > 0
                     ? +(slot.hits / (slot.hits + slot.misses)).toFixed(3) : null,
             })),
-            timing_error_ms: {
-                count:   _diagTimingErrors.length,
-                p10:     _diagPercentile(_diagTimingErrors, 10),
-                median:  _diagPercentile(_diagTimingErrors, 50),
-                p90:     _diagPercentile(_diagTimingErrors, 90),
-            },
+            timing_error_ms: _diagDistribution(_diagTimingErrors),
             // Hit-only timing distribution — the responsive signal for
             // A/V auto-calibration. See _diagTimingErrorsHits comment.
-            timing_error_ms_hits: {
-                count:   _diagTimingErrorsHits.length,
-                p10:     _diagPercentile(_diagTimingErrorsHits, 10),
-                median:  _diagPercentile(_diagTimingErrorsHits, 50),
-                p90:     _diagPercentile(_diagTimingErrorsHits, 90),
-            },
-            pitch_error_cents: {
-                count:   _diagPitchErrors.length,
-                p10:     _diagPercentile(_diagPitchErrors, 10),
-                median:  _diagPercentile(_diagPitchErrors, 50),
-                p90:     _diagPercentile(_diagPitchErrors, 90),
-            },
+            timing_error_ms_hits: _diagDistribution(_diagTimingErrorsHits),
+            pitch_error_cents:    _diagDistribution(_diagPitchErrors),
             sections: sectionStats.map(s => ({
                 name: s.name,
                 hits: s.hits,
@@ -4194,6 +4225,7 @@ function createNoteDetector(options = {}) {
     function armRecording() {
         _recArmed = true;
         _recChunks = [];
+        _recTotalSamples = 0;
         _recLastSaveError = null;
         _recCappedAt = null;
         // Bind song-event listeners lazily so an idle plugin instance
@@ -4213,6 +4245,7 @@ function createNoteDetector(options = {}) {
     function discardRecording() {
         _recArmed = false;
         _recChunks = [];
+        _recTotalSamples = 0;
         _recLastSaveError = null;
         _recCappedAt = null;
         _recUnbindEvents();
@@ -4251,6 +4284,7 @@ function createNoteDetector(options = {}) {
             // doesn't lose the user's audio. _recCappedAt also resets
             // since the take that was capped has shipped.
             _recChunks = [];
+            _recTotalSamples = 0;
             _recCappedAt = null;
             return data;
         } catch (e) {
@@ -4267,7 +4301,12 @@ function createNoteDetector(options = {}) {
         }
     }
     function getRecordingState() {
-        const samples = _recChunks.reduce((s, c) => s + c.length, 0);
+        // Use the cached running total instead of reducing the array —
+        // the UI's auto-refresh poll calls this every 1500 ms, and on a
+        // long take the reduce was O(n) per call. The cache is
+        // maintained in lockstep with `_recChunks` (incremented on
+        // push, zeroed on arm/discard/successful-save/destroy).
+        const samples = _recTotalSamples;
         return {
             armed:        _recArmed,
             songPlaying:  _recSongPlaying,
@@ -4600,6 +4639,13 @@ function createNoteDetector(options = {}) {
         downloadDiagnostic: _downloadDiagnostic,
         getDiagnostic: _buildDiagnosticPayload,
         resetDiagnostic: resetScoring,
+        // Narrower reset for A/V calibrate — clears only the timing
+        // samples that feed the next calibration suggestion, leaving
+        // hits/misses/streak/sectionStats/eventLog intact. Use this
+        // instead of `resetDiagnostic` when the goal is "stop using
+        // stale samples from before my offset change", not "start a
+        // brand-new session".
+        resetCalibrationSamples: _resetCalibrationSamples,
         // Tuning-mode gate. Off by default; flipped on/off from the
         // Settings page (the developer surfaces it gates live there too,
         // so the toggle and the panels it reveals are in one place).

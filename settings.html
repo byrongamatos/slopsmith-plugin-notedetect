@@ -388,7 +388,17 @@
             window.setAvOffsetMs(next);
             // Wipe accumulated timing samples so the next suggestion
             // reflects the new offset, not a stale mix of both regimes.
-            if (typeof nd.resetDiagnostic === 'function') nd.resetDiagnostic();
+            // Use the narrower resetCalibrationSamples() instead of the
+            // full resetDiagnostic — clearing the user's hit/miss
+            // counters + streak + event log when they only wanted to
+            // tweak A/V offset was surprising. Falls back to the
+            // broader reset on older plugin builds that don't expose
+            // the narrower API.
+            if (typeof nd.resetCalibrationSamples === 'function') {
+                nd.resetCalibrationSamples();
+            } else if (typeof nd.resetDiagnostic === 'function') {
+                nd.resetDiagnostic();
+            }
             render();
         };
     }
