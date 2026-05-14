@@ -571,6 +571,15 @@
         };
     }
 
+    // Canonical builders list — single source of truth for both
+    // renderAutoTune (which materialises every row) and the Apply-all
+    // handler (which iterates the same set). Order matters: A/V Sync
+    // first because it shifts the timing distribution; method last
+    // because it can alter pure-rate AND pitch spread. `warnOnly`
+    // rows (Tuning bias) are kept in the list so they render, and
+    // are filtered out inside the Apply-all loop.
+    const _AUTO_TUNE_BUILDERS = [_suggestAvSync, _suggestConfidence, _suggestTuningBias, _suggestTimingWindow, _suggestPitchWindow, _suggestMethod];
+
     function renderAutoTune(nd) {
         const rowsEl  = _q('nd-at-rows');
         const stateEl = _q('nd-at-state');
@@ -583,7 +592,7 @@
             return;
         }
         const d = nd.getDiagnostic();
-        const builders = [_suggestAvSync, _suggestConfidence, _suggestTuningBias, _suggestTimingWindow, _suggestPitchWindow, _suggestMethod];
+        const builders = _AUTO_TUNE_BUILDERS;
         const suggestions = builders.map(b => b(d, nd)).filter(s => s != null);
         // Stash the suggestions on the rowsEl so the Apply-all handler
         // can call .apply() without rebuilding them — avoids a tick-
@@ -764,14 +773,18 @@
             const nd = window.noteDetect;
             if (!nd || typeof nd.getDiagnostic !== 'function') return;
             const d = nd.getDiagnostic();
-            const builders = [_suggestAvSync, _suggestConfidence, _suggestTimingWindow, _suggestPitchWindow, _suggestMethod];
-            // Apply in a deterministic order. A/V Sync first because
-            // it shifts the entire timing distribution; the window-
-            // sizing rows would otherwise propose tolerances for the
-            // pre-shift distribution. Method change last because it
-            // can alter both pure-rate AND pitch-error spread, and
-            // we don't want the earlier rows fighting it.
-            for (const b of builders) {
+            // Reuse the canonical builders list (avoids drift between
+            // renderAutoTune's row set and Apply-all's set — a builder
+            // added to one but not the other would otherwise appear
+            // in the panel but be silently skipped by Apply-all).
+            // Apply in the canonical order. A/V Sync first because it
+            // shifts the entire timing distribution; window-sizing
+            // rows would otherwise propose tolerances for the pre-
+            // shift distribution. Method change last because it can
+            // alter both pure-rate AND pitch-error spread, and we
+            // don't want the earlier rows fighting it. The `warnOnly`
+            // filter inside the loop transparently skips Tuning bias.
+            for (const b of _AUTO_TUNE_BUILDERS) {
                 const s = b(d, nd);
                 if (s && !s.warnOnly && s.actionable) s.apply();
             }
