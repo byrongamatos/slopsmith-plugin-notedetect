@@ -180,8 +180,18 @@ if (args.baseline) {
     }
 }
 const baselineMap = new Map();
-if (baseline && baseline.results) {
-    for (const r of baseline.results) baselineMap.set(r.name, r);
+if (baseline) {
+    // Guard against malformed / older-schema baseline files. Iterating a
+    // missing or non-array `results` would throw mid-run and abort the
+    // whole regression; surface a clear schema mismatch instead.
+    if (!Array.isArray(baseline.results)) {
+        process.stderr.write(`[regression] --baseline file has no 'results' array (schema mismatch): ${args.baseline}\n`);
+        process.stderr.write(`             expected shape: { schema, generated_at, results: [{name, hits, ...}, ...] }\n`);
+        process.exit(2);
+    }
+    for (const r of baseline.results) {
+        if (r && typeof r.name === 'string') baselineMap.set(r.name, r);
+    }
 }
 
 const colW = { name: 36, hits: 12, pure: 8, chord: 8, delta: 10 };
