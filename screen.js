@@ -2744,24 +2744,39 @@ function createNoteDetector(options = {}) {
                     // key and overwrites every frame so the FINAL frame's
                     // result is what lands in the miss — that's the
                     // "best the scorer got" snapshot.
-                    // Track the BEST voicingHit frame across the
-                    // chord's window — checkMisses will rescue this as
-                    // a hit (instead of recording miss) if no strict
-                    // ratio frame ever materializes. "Best" = highest
-                    // score, so we use the cleanest voicing reduction
-                    // we saw if multiple frames qualified.
+                    // Cache for checkMisses to consume on retire.
+                    //
+                    // Two pieces tracked separately:
+                    //
+                    //   • voicingHit — STICKY. Once ANY frame in this
+                    //     chord's window registered as voicing-eligible
+                    //     (bass + ≥1 other, verified pitch), remember
+                    //     it forever for this chord. A subsequent frame
+                    //     where the bass momentarily failed pitch (the
+                    //     bass note decayed below threshold while the
+                    //     rest still rang, audio bleed shifted things,
+                    //     etc.) MUST NOT retroactively cancel a
+                    //     previously-eligible voicing. Earlier logic
+                    //     here had a "higher score wins" rule that
+                    //     accidentally demoted voicingHit:true frames
+                    //     when a later !voicingHit but slightly higher
+                    //     score frame arrived — which on real-song
+                    //     data wiped out the rescue path entirely.
+                    //
+                    //   • score / hitStrings / totalStrings — best
+                    //     frame's diagnostic snapshot, regardless of
+                    //     voicingHit. Used by the live JSONL and the
+                    //     event log so a reader can see "best the
+                    //     scorer got" on this chord.
                     const prev = _chordLastResult.get(chordKey);
-                    const isBetter = !prev
-                        || (chordResult.voicingHit && !prev.voicingHit)
-                        || (chordResult.score > (prev.score || 0));
-                    if (isBetter) {
-                        _chordLastResult.set(chordKey, {
-                            score: chordResult.score,
-                            hitStrings: chordResult.hitStrings,
-                            totalStrings: chordResult.totalStrings,
-                            voicingHit: !!chordResult.voicingHit,
-                        });
-                    }
+                    const voicingEver = !!((prev && prev.voicingHit) || chordResult.voicingHit);
+                    const useNewSnapshot = !prev || chordResult.score > (prev.score || 0);
+                    _chordLastResult.set(chordKey, {
+                        score:        useNewSnapshot ? chordResult.score        : prev.score,
+                        hitStrings:   useNewSnapshot ? chordResult.hitStrings   : prev.hitStrings,
+                        totalStrings: useNewSnapshot ? chordResult.totalStrings : prev.totalStrings,
+                        voicingHit:   voicingEver,
+                    });
                     // Do not lock in a miss while the chord is still within
                     // its timing window. Chords can enter candidateNotes as
                     // early as (chordTime - timingTolerance), so an early
