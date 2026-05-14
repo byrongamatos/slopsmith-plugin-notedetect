@@ -237,6 +237,19 @@ const RATIO_01 = (v, k) => {
     }
     return n;
 };
+// Range validator. Mirrors the in-app clamping in screen.js so harness
+// runs reflect what the browser would actually score (the createNoteDetector
+// settings loader caps these to the slider ranges; passing a value outside
+// would silently get re-clamped on the in-app side and diverge from the
+// harness output).
+const RANGE = (v, k, min, max) => {
+    const n = NUM(v, k);
+    if (n < min || n > max) {
+        process.stderr.write(`bad --${k}: ${v} (must be in [${min}, ${max}])\n`);
+        process.exit(2);
+    }
+    return n;
+};
 // Detector hook only honours these two in the headless path; CREPE
 // needs WebGL + TensorFlow.js model load and is intentionally not
 // wired up here (see the file header). Accepting `crepe` would
@@ -253,14 +266,27 @@ const frameSize     = POS_INT(args['frame-size'], 'frame-size');
 const arrangement   = args.arrangement;
 const stringCount   = POS_INT(args['string-count'], 'string-count');
 const avOffsetMs    = NUM(args['av-offset-ms'], 'av-offset-ms');
+// In-app slider ranges (screen.js createNoteDetector settings loader):
+//   pitchTolerance      10..100 cents
+//   pitchHitThreshold     5..pitchTolerance cents
+//   timingTolerance     0.03..0.3 s
+//   timingHitThreshold  0.03..timingTolerance s
+//   chordHitRatio       0.25..1.0       (we use 0..1 here to keep
+//                                        regression sweeps unconstrained)
+// `latencyOffset` isn't slider-clamped today but a negative or wildly
+// large value is nonsense for an audio-pipeline delay — gate to [0, 1].
+const pitchTolerance    = RANGE(args['pitch-tolerance'], 'pitch-tolerance', 10, 100);
+const pitchHitThreshold = RANGE(args['pitch-hit-threshold'], 'pitch-hit-threshold', 5, pitchTolerance);
+const timingTolerance    = RANGE(args['timing-tolerance'], 'timing-tolerance', 0.03, 0.3);
+const timingHitThreshold = RANGE(args['timing-hit-threshold'], 'timing-hit-threshold', 0.03, timingTolerance);
 const settings = {
     method,
-    pitchTolerance:     NUM(args['pitch-tolerance'], 'pitch-tolerance'),
-    pitchHitThreshold:  NUM(args['pitch-hit-threshold'], 'pitch-hit-threshold'),
-    timingTolerance:    NUM(args['timing-tolerance'], 'timing-tolerance'),
-    timingHitThreshold: NUM(args['timing-hit-threshold'], 'timing-hit-threshold'),
+    pitchTolerance,
+    pitchHitThreshold,
+    timingTolerance,
+    timingHitThreshold,
     chordHitRatio:      RATIO_01(args['chord-hit-ratio'], 'chord-hit-ratio'),
-    latencyOffset:      NUM(args['latency'], 'latency'),
+    latencyOffset:      RANGE(args['latency'], 'latency', 0, 1),
 };
 
 // ── Load chart ──────────────────────────────────────────────────────
