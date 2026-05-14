@@ -188,6 +188,13 @@ const _ndInstances = _ndShared.instances;
 
 const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 
+// Plugin semver — keep in sync with package.json / plugin.json. Stamped
+// into every diagnostic export so a JSON blob can be tied back to the
+// exact build that produced it. The script tag has no `import`/`fetch`
+// hook to read package.json at load time, so this is the single
+// hand-maintained constant the diagnostic path keys off of.
+const _ND_VERSION = '1.7.0';
+
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
 const _ND_FRAME_SIZE = 2048;       // ScriptProcessor buffer size
@@ -248,11 +255,21 @@ function _ndMidiFromStringFret(string, fret, arrangement, stringCount, offsets, 
     return base[string] + offset + (capo || 0) + fret;
 }
 
-function _ndClassifyTiming(timingErrorMs, timingThresholdMs) {
+function _ndClassifyTiming(timingErrorMs, timingThresholdMs, lateGraceMs) {
     if (!Number.isFinite(timingErrorMs)) return null;
-    return Math.abs(timingErrorMs) <= timingThresholdMs
-        ? 'OK'
-        : (timingErrorMs < 0 ? 'EARLY' : 'LATE');
+    const grace = Number.isFinite(lateGraceMs) && lateGraceMs > 0 ? lateGraceMs : 0;
+    // Asymmetric for sus-marked notes (caller passes grace > 0): the
+    // EARLY side stays strict — playing before the note is always
+    // wrong — but late detection within the sustain envelope is still
+    // a hit, because the note is *audibly* the right one. Without this,
+    // a player who plucks a few hundred ms after the chart time on a
+    // half-note (which YIN may take ~100 ms to confidently lock) gets
+    // a LATE miss even though they're hearing themselves play the
+    // correct note over the strike-line ring.
+    if (timingErrorMs < 0) {
+        return Math.abs(timingErrorMs) <= timingThresholdMs ? 'OK' : 'EARLY';
+    }
+    return timingErrorMs <= timingThresholdMs + grace ? 'OK' : 'LATE';
 }
 
 function _ndClassifyPitch(pitchErrorCents, pitchThresholdCents) {
@@ -273,12 +290,45 @@ function _ndMakeJudgment(opts) {
         : null;
     const timingThresholdMs = Number.isFinite(o.timingThresholdMs) ? o.timingThresholdMs : 100;
     const pitchThresholdCents = Number.isFinite(o.pitchThresholdCents) ? o.pitchThresholdCents : 20;
-    const timingState = matched ? _ndClassifyTiming(timingError, timingThresholdMs) : null;
+    // Derive late-side grace from the chart note's sustain. Capped at
+    // 1 s so a 4-second held note doesn't accept detections nearly 4
+    // seconds late as "on time" — at some point the player has clearly
+    // missed the strike and is just holding the previous note's ring.
+    //
+    // For chord judgments, the caller passes an explicit `lateGraceMs`
+    // computed from the MAX sus across chord constituents (matching
+    // matchNotes' candidate-inclusion + checkMisses' retire-extension
+    // grace). Without that override, this falls back to the chart
+    // note's own sus, which for chords is just the first constituent
+    // (`liveNotes[0]`) — and a chord whose lead has a shorter sus than
+    // its longest constituent would get classified LATE here even
+    // though it was still inside the chord's matching window.
+    const chartNote = o.chartNote || o.note || null;
+    const susSec = chartNote && Number.isFinite(chartNote.sus) ? chartNote.sus : 0;
+    const lateGraceMs = Number.isFinite(o.lateGraceMs)
+        ? Math.max(0, o.lateGraceMs)
+        : (susSec > 0 ? Math.min(susSec * 1000, 1000) : 0);
+    const timingState = matched ? _ndClassifyTiming(timingError, timingThresholdMs, lateGraceMs) : null;
     const pitchState = matched ? _ndClassifyPitch(pitchError, pitchThresholdCents) : null;
     // pitchState === null means pitch was not measured (e.g. energy-only chord
     // check or harmonic flag).  Treat unmeasured pitch as non-blocking so a
     // chord that passes the scorer is not incorrectly counted as a miss.
-    const hit = timingState === 'OK' && (pitchState === 'OK' || pitchState === null);
+    //
+    // For CHORDS specifically: the chord scorer (_ndScoreChord) already
+    // ran per-string pitch + energy checks before this judgment was
+    // constructed. matchNotes only takes the chord-hit path when the
+    // scorer returned isHit (score ≥ chordHitRatio). If we *also* gate
+    // the overall hit on the monophonic pitchState computed from a
+    // SINGLE string's pitchError (the first one with a finite cents
+    // measurement), we throw away clean chord hits whenever the lead
+    // string happens to be a bit sharp/flat — even when every string
+    // rang and the chord scorer said yes. Trust the chord scorer's
+    // verdict here. For single notes the original timing+pitch rule
+    // still applies.
+    const isChord = !!o.chord;
+    const hit = isChord
+        ? (matched && timingState === 'OK')
+        : (timingState === 'OK' && (pitchState === 'OK' || pitchState === null));
     return {
         chartNote: o.chartNote || o.note || null,
         note: o.note || null,
@@ -816,7 +866,77 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
 
     const totalStrings = chordNotes.length;
     const score = totalStrings > 0 ? hitStrings / totalStrings : 0;
-    return { score, hitStrings, totalStrings, results, isHit: score >= minHitRatio };
+
+    // ── Voicing-reduction credit ─────────────────────────────────────
+    // The strict score-ratio path counts "how much of the chart's full
+    // voicing rang". For a chart that says "E major, all 6 strings", a
+    // player who plays the same chord as a 2-string power voicing
+    // (E + B = root + fifth on strings 0 and 1) scores 2/6 = 0.33 and
+    // misses at the default cr=0.40. That's musically wrong for huge
+    // categories of real playing — punk / pop-rock / country rhythm
+    // guitar IS root + fifth voicings on full-chord charts. Real-song
+    // data (American Jesus, Bad Religion rhythm, 1033 chord events)
+    // showed ~50% of misses landing in exactly this 1-2-of-N regime,
+    // while having clean timing and ringing the root every time.
+    //
+    // Add a parallel hit path: the chord ALSO counts as a hit if at
+    // least 2 of the chord's strings rang at their expected pitches
+    // (pitch-verified, not energy-only). This rewards reduced
+    // voicings without rewarding random-string noise:
+    //   • Single string alone → still a miss
+    //   • Any ≥2 pitch-verified chord strings (in any combination) → hit
+    //   • Full voicing → hit via ratio (the original path)
+    //
+    // Strict players who want "all strings must ring" can dial cr up
+    // to 1.0. The pitch-verified gate (vs. raw energy) keeps incidental
+    // noise from tripping the rescue path.
+    //
+    // Surface `voicingHit` separately from `isHit` so analytics /
+    // diagnostics can see WHY a chord was credited.
+    // Voicing-reduction = "at least 2 of the chord's strings rang at
+    // their correct expected pitches". This is the bar for "the player
+    // played a reduced voicing of this chord", as distinct from "random
+    // string noise" — which fails to match any chord string's expected
+    // pitch and so doesn't contribute to the count.
+    //
+    // An earlier formulation required the chart's LOWEST string (the
+    // bass note) to be one of the rung strings, reasoning that a real
+    // chord must include its root. Real-song data caught the issue:
+    // players often strum the middle/high strings of a chord shape
+    // without sounding the lowest note (string skipping, fast strumming,
+    // open-chord shapes where the bass is muted by hand position). Those
+    // are valid 2-note interpretations of the chord too. The pitch-
+    // verified gate is the real protection against energy-only false
+    // positives — once 2 chord strings are confirmed at their correct
+    // pitches, it doesn't matter which 2 they are.
+    let voicingHit = false;
+    if (results.length >= 2) {
+        let pitchVerifiedHits = 0;
+        for (const r of results) {
+            // `hit && finite centsDiff` means the per-string check ran
+            // a real pitch comparison and accepted. Energy-only "hit"s
+            // (centsDiff null, from the pitchCheckCents <= 0 path used
+            // by harmonics) intentionally don't count here — see the
+            // "energy-only mode gates off voicing-reduction" test.
+            if (r.hit && Number.isFinite(r.centsDiff)) pitchVerifiedHits++;
+            if (pitchVerifiedHits >= 2) break;
+        }
+        if (pitchVerifiedHits >= 2) voicingHit = true;
+    }
+
+    // `isHit` reflects ONLY the strict ratio path — that's what
+    // matchNotes uses to decide whether to commit a hit on the
+    // current frame. The `voicingHit` flag is informational: it
+    // means "if matchNotes never finds a strict-ratio frame for
+    // this chord, checkMisses should rescue it as a hit at retire
+    // time instead of recording a miss." This deferred-commit
+    // approach lets strict-ratio frames (which tend to have better
+    // timing because they fire later in the chord's audio decay)
+    // win out, and voicing-reduction only kicks in as a fallback —
+    // avoiding the timing-eager-commit regression where a sub-
+    // threshold early frame locked in a hit with bad timing.
+    const isHit = score >= minHitRatio;
+    return { score, hitStrings, totalStrings, results, isHit, voicingHit };
 }
 
 // ── Pitch Detection: CREPE (shared model) ──────────────────────────────────
@@ -947,6 +1067,42 @@ async function _ndCrepeDetect(buffer) {
 //   setChannel(idx)  — -1=mono, 0=left, 1=right (restarts audio if enabled)
 //   injectButton(bar)— insert detect + gear buttons into a control bar
 //   showSummary()    — force-show the end-of-song summary modal
+
+// Encode an Array<Float32Array> of mono samples (any chunk size) as a
+// 16-bit PCM mono RIFF/WAVE blob. Used by the in-app reference-recording
+// capture so the headless harness can read back exactly the audio the
+// detector saw. Soft-clips to int16 range; no dithering — fine for the
+// detector's downstream analysis but don't ship this as a master.
+function _ndEncodeWavPcm16(chunks, sampleRate) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const buf = new ArrayBuffer(44 + total * 2);
+    const v = new DataView(buf);
+    let off = 0;
+    const w4  = (s) => { for (let i = 0; i < 4; i++) v.setUint8(off++, s.charCodeAt(i)); };
+    const w16 = (n) => { v.setUint16(off, n, true); off += 2; };
+    const w32 = (n) => { v.setUint32(off, n, true); off += 4; };
+    w4('RIFF');  w32(36 + total * 2);  w4('WAVE');
+    w4('fmt ');  w32(16);
+    w16(1);                                          // PCM
+    w16(1);                                          // mono
+    w32(sampleRate);
+    w32(sampleRate * 2);                             // byte rate
+    w16(2);                                          // block align
+    w16(16);                                         // bits per sample
+    w4('data');  w32(total * 2);
+    for (const c of chunks) {
+        for (let i = 0; i < c.length; i++) {
+            let s = c[i];
+            if (s > 1)  s =  1;
+            else if (s < -1) s = -1;
+            v.setInt16(off, (s * 32767) | 0, true);
+            off += 2;
+        }
+    }
+    return buf;
+}
+
 function createNoteDetector(options = {}) {
     const opts = options || {};
     // Highway is resolved lazily. A caller can pass `highway` in
@@ -976,6 +1132,14 @@ function createNoteDetector(options = {}) {
 
     // ── Per-instance state ────────────────────────────────────────────
     let enabled = false;
+    // User preference for whether detection should be running. Default
+    // is true (Detect on out of the box) — overridden by localStorage
+    // when the user has explicitly toggled. Distinct from `enabled`
+    // because the audio pipeline can't be claimed during construction
+    // (highway may not be ready, mic permissions may not be cached),
+    // so this is the *intent* and `enabled` is the *current run state*.
+    // The plugin auto-calls enable() on next tick if this is true.
+    let detectPreference = true;
     // Session generation — incremented on every disable(). A frame
     // that captures the value at the start of processing and re-checks
     // after an `await _ndCrepeDetect(...)` can drop its result rather
@@ -1011,16 +1175,40 @@ function createNoteDetector(options = {}) {
     // itself (and sizzles it); users who want the peripheral cue back can
     // re-enable it in the gear popover.
     let edgeFlashEnabled = false;
+    // Tuning mode — opt-in switch for everything the detector exposes
+    // for development / tuning / benchmarking (the Reference Recording
+    // panel, the Diagnostic JSON export / Reset, the miss-category
+    // breakdown on the end-of-song summary). Off by default — these
+    // surfaces are noise for normal play. Gated by a single checkbox
+    // in the gear popover. Persisted in localStorage alongside the
+    // other settings.
+    let tuningMode = false;
     let missMarkerDuration = 2.0;
     let hitGlowDuration = 0.5;
     let inputGain = 1.0;
     let selectedDeviceId = '';
     let selectedChannel = 'mono';
+    // Detector pipeline latency compensation. 0.080 is the historical
+    // default; the right value is heavily audio-chain-dependent (USB
+    // interfaces, ScriptProcessor buffering, OS audio path all vary).
+    // Users typically dial this via the gear-popover slider; the A/V
+    // auto-calibrate panel suggests a value derived from their own
+    // recently-detected note timings. We tried bumping the default to
+    // match one heavy-user's empirical value, but it over-corrected
+    // for users with shorter chains (caused their on-time playing to
+    // register as "early" misses). Keeping the conservative default
+    // and pointing users at the calibrate workflow is the right
+    // trade-off.
     let latencyOffset = 0.080;
-    // Fraction of a chord's strings that must register energy for the chord
-    // to count as a hit (0.0–1.0). 0.6 = 60%, matching the brief's default.
-    // Lower this for beginners or dense chords; raise it for stricter scoring.
-    let chordHitRatio = 0.6;
+    // Fraction of a chord's strings that must register energy for the
+    // chord to count as a hit (0.0–1.0). Was 0.6 historically, but
+    // harness measurements against real-guitar recordings showed
+    // chord scoring near 0/16 at that gate even for clean
+    // playing. Dropping to 0.40 lets typical open/power-chord
+    // voicings score multi-string hits without rewarding single-
+    // string strums. Users who want stricter scoring can raise via
+    // the slider.
+    let chordHitRatio = 0.40;
 
     try {
         const raw = localStorage.getItem(_ND_STORAGE_KEY);
@@ -1045,6 +1233,10 @@ function createNoteDetector(options = {}) {
             if (s.showTimingErrors !== undefined) showTimingErrors = !!s.showTimingErrors;
             if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
             if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
+            if (s.tuningMode !== undefined) tuningMode = !!s.tuningMode;
+            // Persisted on/off preference. Absence keeps the default
+            // (true), so fresh installs get Detect on out of the box.
+            if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
             if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
             if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
             if (s.inputGain !== undefined) inputGain = s.inputGain;
@@ -1077,6 +1269,131 @@ function createNoteDetector(options = {}) {
     let sectionStats = [];   // [{name, hits, misses}]
     let currentSection = null;
     const noteResults = new Map(); // key -> judgment object
+
+    // ── Miss-category diagnostic (#254 follow-up) ─────────────────────
+    // Counts WHY a judgment missed so a session report can isolate the
+    // dominant failure mode — pure misses → mic/audio chain; chord-partial
+    // → leniency too tight; timing → window too narrow; pitch → tolerance
+    // too narrow. Each miss falls into exactly one primary bin (chord
+    // events into chordPartial regardless of axis); per-string + signed-
+    // error arrays let us see which strings the player is losing on and
+    // whether they trend sharp/flat or early/late. Reset alongside
+    // hits/misses in resetScoring(); refs stay stable across reset.
+    const _diagBreakdown = {
+        pure: 0,           // miss, no pitch detected within the timing window
+        chordPartial: 0,   // chord event below the chord-leniency threshold
+        early: 0,
+        late: 0,
+        sharp: 0,
+        flat: 0,
+    };
+    const _diagSingles = { hits: 0, misses: 0 };
+    const _diagChords  = { hits: 0, misses: 0 };
+    // Per-string. 8 covers 4/5/6/7/8-string arrangements without resizing.
+    const _diagPerString = Array.from({ length: 8 }, () => ({ hits: 0, misses: 0 }));
+    // Signed errors for matched judgments (excludes pure misses where no
+    // measurement exists). Capped to keep memory bounded across long
+    // sessions; percentiles in the summary run on the raw array.
+    const _DIAG_ERROR_CAP = 2000;
+    const _diagTimingErrors = [];   // milliseconds, sign = positive late / negative early — all matched judgments
+    // Hit-only timing samples. The all-matched array above includes
+    // judgments where the matcher snapped to a *neighbouring* chart note
+    // (closest-by-time wins, even if the user's actual playing skew is
+    // big), so its median is pinned by the matching window instead of
+    // tracking real audio↔chart drift. Restricting to actual hits gives
+    // a signal that responds linearly to A/V offset, which is what the
+    // auto-calibrate button keys off of.
+    const _diagTimingErrorsHits = [];
+    const _diagPitchErrors  = [];   // cents,        sign = positive sharp / negative flat
+    // Per-judgment event capture for the downloadable JSON. Capped at a
+    // size that keeps the JSON small enough to share via copy-paste.
+    const _DIAG_EVENT_CAP = 2000;
+    const _diagEvents = [];
+
+    // Live-streaming state. When tuning mode is on, every judgment is
+    // also POSTed to /api/plugins/note_detect/live-judgment so an
+    // off-device reader (the host iterating against this code) can
+    // watch a session unfold in real time. The session id changes on
+    // every `song:play` so each take produces its own JSONL file; the
+    // value is used directly as a filename slug server-side, so it
+    // sticks to filesystem-safe characters. Off (null) until the first
+    // song:play fires with tuning mode on.
+    let _liveSessionId = null;
+    function _buildSessionHeader() {
+        // Snapshot the user's live settings + song context at song:play
+        // time. Lands as the first JSONL line of the session file so
+        // any offline reader (host-side regression runner, future
+        // default-suggestion tooling, a maintainer looking at a shared
+        // session) knows what knobs produced the judgments below.
+        // Keep field names consistent with the `settings` block in the
+        // diagnostic export — same vocabulary across the two formats.
+        const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+        const avOffsetMs = (hw && hw.getAvOffset) ? hw.getAvOffset() : 0;
+        return {
+            type: 'session_start',
+            schema: 'note_detect.live.session_start.v1',
+            ts: new Date().toISOString(),
+            plugin_version: _ND_VERSION,
+            song: {
+                title: info.title || null,
+                artist: info.artist || null,
+                arrangement: info.arrangement || null,
+                arrangement_index: (info.arrangement_index != null) ? info.arrangement_index : null,
+                tuning: info.tuning || null,
+                capo: info.capo != null ? info.capo : 0,
+                duration: info.duration != null ? info.duration : null,
+            },
+            settings: {
+                method: detectionMethod,
+                timing_tolerance_s: timingTolerance,
+                timing_hit_threshold_s: timingHitThreshold,
+                pitch_tolerance_cents: pitchTolerance,
+                pitch_hit_threshold_cents: pitchHitThreshold,
+                chord_hit_ratio: chordHitRatio,
+                latency_offset_s: latencyOffset,
+                input_gain: inputGain,
+                channel: selectedChannel,
+                av_offset_ms: avOffsetMs,
+            },
+        };
+    }
+    function _streamLiveJudgment(eventObj) {
+        // Fire-and-forget — the network round-trip MUST NOT block the
+        // detection hot path. We don't even await the promise: any
+        // failure (server down, file capped, etc.) is silently
+        // swallowed so the in-memory diagnostic remains the source of
+        // truth and detection keeps running.
+        try {
+            fetch(
+                '/api/plugins/note_detect/live-judgment?session='
+                    + encodeURIComponent(_liveSessionId),
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(eventObj),
+                    keepalive: true,   // survives page nav / song-end teardown
+                },
+            ).catch(() => {});
+        } catch (e) { /* swallow — see comment above */ }
+    }
+
+    // ── Reference-recording capture (#254 follow-up) ──────────────────
+    // Captures the SAME Float32 audio frames the detector is running its
+    // analysis on, while a song is playing, so the headless harness has
+    // a known-aligned WAV to feed it — no DAW / Audacity needed. Auto-
+    // starts on song:play once armed, auto-saves on song:ended. The WAV
+    // lands under `static/note_detect_recordings/` via the routes.py POST
+    // endpoint; that dir is bind-mounted in the dev container so the
+    // harness on the host can read it back without a copy step.
+    let _recArmed = false;            // user clicked Arm; waiting for / actively recording
+    let _recSongPlaying = false;      // tracks song:play / song:pause / song:ended
+    let _recChunks = [];              // Array<Float32Array>; concatenated only on save
+    let _recSampleRate = 44100;       // captured from audioCtx when the first frame lands
+    let _recLastSavePath = null;      // host-visible relative path of the most recent save
+    let _recLastSaveError = null;     // surfaced in the UI when a save fails
+    let _recSaveInFlight = false;     // de-dupe rapid saves
+    let _recCappedAt = null;          // seconds into the take where the client-side cap kicked in (null = no cap hit)
+    let _recTotalSamples = 0;         // running sum of _recChunks lengths — avoids O(n²) reduce on the detection hot path
     // slopsmith#254 — per-sustained-hit-note "still being held on-pitch"
     // grace timestamps: key -> performance.now() ms before which the
     // sustain still counts as actively held. Smooths the gap between
@@ -1135,6 +1452,12 @@ function createNoteDetector(options = {}) {
     let lastChordScore = null;
     let lastChordHit = 0;
     let lastChordTotal = 0;
+    // Per-chord-key cache of the most recent _ndScoreChord result so
+    // checkMisses() can attach hs/tt/sc to a chord miss judgment. Keyed
+    // by the same `<time>_chord` string the rest of the chord plumbing
+    // uses. Cleared on resetScoring (song change / detect toggle) so a
+    // stale per-chord result from one take can't leak into a later one.
+    const _chordLastResult = new Map();
     let lastChordTime = -Infinity;
 
     // Tuning — per-instance so panels can be on different songs.
@@ -1243,6 +1566,8 @@ function createNoteDetector(options = {}) {
                 showTimingErrors,
                 showPitchErrors,
                 edgeFlash: edgeFlashEnabled,
+                tuningMode,
+                detectEnabled: detectPreference,
                 missMarkerDuration,
                 hitGlowDuration,
                 inputGain,
@@ -1787,6 +2112,42 @@ function createNoteDetector(options = {}) {
         // it later from matchNotes would either skip (null) or pick up a
         // newer buffer captured mid-processing.
         await matchNotes(buffer);
+
+        // Reference-recording capture: tap the same audio the detector
+        // just analysed. Gated on (a) the user having armed a take and
+        // (b) the song actually playing — we don't want to fill the
+        // buffer with silence from someone leaving Detect running on
+        // the home screen.
+        if (_recArmed && _recSongPlaying) {
+            _recSampleRate = audioCtx ? audioCtx.sampleRate : (bridgeSampleRate || _recSampleRate);
+            // Client-side cap mirrors the routes.py 32 MB ceiling so a
+            // runaway arm (user walks away with Detect still capturing)
+            // can't balloon the page's heap before the server-side cap
+            // rejects the upload. 32 MB / 4 bytes per Float32 ≈ 8M
+            // samples ≈ 190 s at 44.1 kHz (~3.2 min) — well past a
+            // single benchmark take. When we hit it, the buffer stays
+            // at the cap and `_recCappedAt` is set so the save path
+            // can surface a "truncated" note on the resulting WAV.
+            //
+            // Track the running sample count in `_recTotalSamples`
+            // rather than `_recChunks.reduce(...)` per frame. The
+            // reduce was O(n) per frame and O(n²) over a take — a
+            // measurable hit on the detection hot path on long
+            // recordings.
+            const maxSamples = Math.floor((32 * 1024 * 1024) / 4);
+            if (_recTotalSamples >= maxSamples) {
+                if (!_recCappedAt) _recCappedAt = _recTotalSamples / (_recSampleRate || 44100);
+                // Silently drop further frames — the cap is the upper bound
+                // and we'd rather keep the first N minutes than truncate the
+                // tail of a long take.
+            } else {
+                // slice() because the analyser may overwrite the buffer the
+                // next time processFrame fires.
+                const copy = buffer.slice();
+                _recChunks.push(copy);
+                _recTotalSamples += copy.length;
+            }
+        }
     }
 
     // ── Note matching ─────────────────────────────────────────────────
@@ -1938,6 +2299,7 @@ function createNoteDetector(options = {}) {
             totalStrings: extra.totalStrings,
             score: extra.score,
             monophonicDetected: extra.monophonicDetected,
+            lateGraceMs: extra.lateGraceMs,
         });
     }
 
@@ -1956,12 +2318,183 @@ function createNoteDetector(options = {}) {
             hitStrings: extra.hitStrings,
             totalStrings: extra.totalStrings,
             score: extra.score,
+            lateGraceMs: extra.lateGraceMs,
         });
+    }
+
+    // Update per-string diagnostic counters for a chord constituent
+    // judgment WITHOUT updating any other diagnostic counter. Chord
+    // constituent judgments are stashed straight into noteResults
+    // (bypassing recordJudgment) because totals/event-log are
+    // already accounted for at the chord-level entry — but the
+    // per-string panel still needs to see each string's outcome,
+    // otherwise it overrepresents whatever string happens to be
+    // `liveNotes[0]` and is blind to the rest.
+    function _recordPerStringForChord(judgment) {
+        const n = judgment.chartNote || judgment.note;
+        if (n && Number.isInteger(n.s) && n.s >= 0 && n.s < _diagPerString.length) {
+            const slot = _diagPerString[n.s];
+            if (judgment.hit) slot.hits++; else slot.misses++;
+        }
+    }
+
+    // Bin one judgment into the diagnostic counters. Called from inside
+    // recordJudgment under the same `count` gate so this never double-
+    // counts (chord events fire one chord-level judgment plus per-string
+    // ones; only the chord-level passes count=true). One miss → exactly
+    // one primary-cause bin (chord events into chordPartial regardless
+    // of axis; non-chord misses chosen as pure → timing → pitch in that
+    // priority, so a single bar height adds up to total misses).
+    //
+    // NOTE: per-string counters here only see the chord-level chartNote
+    // (lead constituent). Chord constituents go through
+    // _recordPerStringForChord at their stash sites so per-string
+    // stats reflect each string's actual outcome.
+    function _recordDiagnostic(judgment) {
+        const isChord = !!judgment.chord;
+        if (judgment.hit) {
+            (isChord ? _diagChords : _diagSingles).hits++;
+        } else {
+            (isChord ? _diagChords : _diagSingles).misses++;
+            if (isChord) {
+                _diagBreakdown.chordPartial++;
+            } else if (judgment.detectedMidi == null) {
+                _diagBreakdown.pure++;
+            } else if (judgment.timingState === 'EARLY') {
+                _diagBreakdown.early++;
+            } else if (judgment.timingState === 'LATE') {
+                _diagBreakdown.late++;
+            } else if (judgment.pitchState === 'SHARP') {
+                _diagBreakdown.sharp++;
+            } else if (judgment.pitchState === 'FLAT') {
+                _diagBreakdown.flat++;
+            } else {
+                // Defensive fallback — keep totals balanced if a future
+                // judgment shape doesn't trip any axis (shouldn't happen
+                // today). Land it in pure so the bin sums still match.
+                _diagBreakdown.pure++;
+            }
+        }
+        // Per-string counters: only update for non-chord judgments here.
+        // For chord-level judgments, judgment.chartNote is the chord's
+        // lead constituent (`liveNotes[0]`), which doesn't represent any
+        // single string's outcome — counting it here would overrepresent
+        // whichever string happened to be the lead and miss the other
+        // constituents. Per-string credit for chord constituents flows
+        // through _recordPerStringForChord at the constituent stash sites.
+        if (!isChord) {
+            const n = judgment.chartNote || judgment.note;
+            if (n && Number.isInteger(n.s) && n.s >= 0 && n.s < _diagPerString.length) {
+                const slot = _diagPerString[n.s];
+                if (judgment.hit) slot.hits++; else slot.misses++;
+            }
+        }
+        if (Number.isFinite(judgment.timingError) && _diagTimingErrors.length < _DIAG_ERROR_CAP) {
+            _diagTimingErrors.push(judgment.timingError);
+            if (judgment.hit && _diagTimingErrorsHits.length < _DIAG_ERROR_CAP) {
+                _diagTimingErrorsHits.push(judgment.timingError);
+            }
+        }
+        if (Number.isFinite(judgment.pitchError) && _diagPitchErrors.length < _DIAG_ERROR_CAP) {
+            _diagPitchErrors.push(judgment.pitchError);
+        }
+        // Build the event object once; push to in-memory log (capped)
+        // AND stream to the backend live-judgment endpoint when tuning
+        // mode is on. The streaming path is fire-and-forget — failures
+        // are swallowed since they shouldn't disrupt detection or
+        // bookkeeping.
+        const nn = judgment.chartNote || judgment.note || {};
+        const eventObj = {
+            t:   Number.isFinite(judgment.noteTime) ? +judgment.noteTime.toFixed(3) : null,
+            at:  Number.isFinite(judgment.time)     ? +judgment.time.toFixed(3)     : null,
+            s:   Number.isInteger(nn.s) ? nn.s : null,
+            f:   Number.isInteger(nn.f) ? nn.f : null,
+            sus: Number.isFinite(nn.sus) ? +(+nn.sus).toFixed(3) : 0,
+            hit:   !!judgment.hit,
+            chord: !!judgment.chord,
+            ts:  judgment.timingState || null,
+            ps:  judgment.pitchState  || null,
+            te:  Number.isFinite(judgment.timingError) ? judgment.timingError : null,
+            pe:  Number.isFinite(judgment.pitchError)  ? judgment.pitchError  : null,
+            ex:  Number.isFinite(judgment.expectedMidi) ? judgment.expectedMidi : null,
+            dx:  Number.isFinite(judgment.detectedMidi) ? judgment.detectedMidi : null,
+            cnf: Number.isFinite(judgment.confidence) ? +judgment.confidence.toFixed(3) : 0,
+            hs:  Number.isFinite(judgment.hitStrings)   ? judgment.hitStrings   : undefined,
+            tt:  Number.isFinite(judgment.totalStrings) ? judgment.totalStrings : undefined,
+            sc:  Number.isFinite(judgment.score) ? +judgment.score.toFixed(3) : undefined,
+            tf:  _diagTechFlags(nn),
+        };
+        if (_diagEvents.length < _DIAG_EVENT_CAP) {
+            _diagEvents.push(eventObj);
+        }
+        if (tuningMode && _liveSessionId) {
+            _streamLiveJudgment(eventObj);
+        }
+    }
+
+    function _diagTechFlags(n) {
+        if (!n) return null;
+        const flags = [];
+        if (n.bn)               flags.push('B');    // bend
+        if (n.sl != null && n.sl >= 0) flags.push('S');    // slide
+        if (n.hm || n.hp)       flags.push('H');    // harmonic / pinch
+        if (n.ho)               flags.push('h');    // hammer-on
+        if (n.po)               flags.push('p');    // pull-off
+        if (n.tp)               flags.push('t');    // tap
+        if (n.pm)               flags.push('PM');   // palm mute
+        if (n.mt)               flags.push('M');    // muted
+        if (n.tr)               flags.push('TR');   // tremolo
+        if (n.ac)               flags.push('A');    // accent
+        if ((+n.sus || 0) > 0)  flags.push('SUS');
+        return flags.length ? flags.join(',') : null;
+    }
+
+    function _diagPercentile(arr, p) {
+        if (!arr || !arr.length) return null;
+        const sorted = arr.slice().sort((a, b) => a - b);
+        return _diagPercentileFromSorted(sorted, p);
+    }
+    // Same nearest-rank math as _diagPercentile but takes an already-
+    // sorted array. Used by the bulk helper below to avoid sorting the
+    // same array three times when computing p10/median/p90 for one
+    // distribution.
+    function _diagPercentileFromSorted(sorted, p) {
+        if (!sorted || !sorted.length) return null;
+        const rank = (p / 100) * (sorted.length - 1);
+        const idx = Math.max(0, Math.min(sorted.length - 1, Math.round(rank)));
+        return sorted[idx];
+    }
+    // Sort once, compute count + p10/median/p90 once. _buildDiagnosticPayload
+    // calls this three times per export (timing, timing-hits, pitch); the
+    // previous code did three .slice().sort() per call there → 9 sorts per
+    // payload. The Settings-page A/V auto-calibrate panel polls every 1.5 s
+    // while open, so this hit was real.
+    function _diagDistribution(arr) {
+        if (!arr || !arr.length) return { count: 0, p10: null, median: null, p90: null };
+        const sorted = arr.slice().sort((a, b) => a - b);
+        return {
+            count: sorted.length,
+            p10:    _diagPercentileFromSorted(sorted, 10),
+            median: _diagPercentileFromSorted(sorted, 50),
+            p90:    _diagPercentileFromSorted(sorted, 90),
+        };
+    }
+
+    function _diagResetCounters() {
+        for (const k of Object.keys(_diagBreakdown)) _diagBreakdown[k] = 0;
+        _diagSingles.hits = 0; _diagSingles.misses = 0;
+        _diagChords.hits  = 0; _diagChords.misses  = 0;
+        for (const slot of _diagPerString) { slot.hits = 0; slot.misses = 0; }
+        _diagTimingErrors.length = 0;
+        _diagTimingErrorsHits.length = 0;
+        _diagPitchErrors.length  = 0;
+        _diagEvents.length       = 0;
     }
 
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
         noteResults.set(key, judgment);
         if (count) {
+            _recordDiagnostic(judgment);
             // No per-judgment sync — the host getLoop() poll would land
             // on the scoring hot path. Instead we sync at enable()
             // (closes the post-enable gap) and rely on updateHUD's
@@ -2009,12 +2542,32 @@ function createNoteDetector(options = {}) {
 
         const candidateNotes = [];
 
+        // For sus-marked chart notes, allow late detection — the note is
+        // still audibly ringing past its nominal `t + tolerance`, and
+        // YIN may need ~80–100 ms of accumulated buffer to confidently
+        // lock on (longer for low E). Without this, players who pluck
+        // slightly late on a half- or whole-note get no judgment recorded
+        // at all (pure miss) instead of a hit-while-ringing. Cap the
+        // grace at MAX_SUS_LATE_GRACE so a 4-second sustain doesn't
+        // accept detections seconds after the strike.
+        const MAX_SUS_LATE_GRACE = 1.0;  // seconds
         if (notes && notes.length > 0) {
-            const start = bsearch(notes, t - tolerance);
+            // Bsearch from `t - tolerance - MAX_SUS_LATE_GRACE` so the
+            // scan picks up sus-marked notes whose nominal window has
+            // already closed but whose sustain envelope hasn't. The
+            // per-note filter below ensures non-sus notes still age out
+            // at the strict ±tolerance boundary.
+            const start = bsearch(notes, t - tolerance - MAX_SUS_LATE_GRACE);
             for (let i = start; i < notes.length; i++) {
                 const n = notes[i];
                 if (n.t > t + tolerance) break;
                 if (n.mt) continue;
+                // Non-sus notes use the strict past edge; sus notes get
+                // a grace bounded by both the chart's declared sustain
+                // and the global cap.
+                const susSec = Number.isFinite(n.sus) && n.sus > 0 ? n.sus : 0;
+                const lateGrace = susSec > 0 ? Math.min(susSec, MAX_SUS_LATE_GRACE) : 0;
+                if (n.t < t - tolerance - lateGrace) continue;
                 // Spread the chart note so technique flags (ho/po/b/sl/hm)
                 // travel with the candidate. _ndScoreChord reads these to
                 // adjust per-string thresholds, so dropping them here would
@@ -2024,10 +2577,30 @@ function createNoteDetector(options = {}) {
             }
         }
         if (chords && chords.length > 0) {
-            const start = bsearch(chords, t - tolerance);
+            // Chord candidate window extends past the strict upper edge
+            // the same way single notes do: a chord that says "ring for
+            // 1.5 s" is still audibly the right chord 800 ms after the
+            // chart strike, and a player strumming late should still be
+            // matched against it. The chord scorer (_ndScoreChord) does
+            // its own per-string pitch + energy check on whatever audio
+            // buffer is current, so an extended candidate window just
+            // gives matchNotes more frames in which to attempt scoring
+            // — it doesn't loosen the per-string check itself.
+            //
+            // Take the max sus across chord constituents so a chord with
+            // mixed sustains doesn't drop out the moment its shortest
+            // string would have decayed.
+            const start = bsearch(chords, t - tolerance - MAX_SUS_LATE_GRACE);
             for (let i = start; i < chords.length; i++) {
                 const c = chords[i];
                 if (c.t > t + tolerance) break;
+                let chordSus = 0;
+                for (const cn of (c.notes || [])) {
+                    if (cn.mt) continue;
+                    if (Number.isFinite(cn.sus) && cn.sus > chordSus) chordSus = cn.sus;
+                }
+                const lateGrace = chordSus > 0 ? Math.min(chordSus, MAX_SUS_LATE_GRACE) : 0;
+                if (c.t < t - tolerance - lateGrace) continue;
                 for (const cn of (c.notes || [])) {
                     if (cn.mt) continue;
                     // Chord constituent notes don't carry their own time —
@@ -2172,6 +2745,19 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
+                // Chord-level late-grace must come from the MAX sus
+                // across constituents — not just `lead.sus` — so that
+                // _ndMakeJudgment's timing classification matches the
+                // candidate-inclusion and retire-extension grace logic
+                // in matchNotes/checkMisses. Capped at MAX_SUS_LATE_GRACE
+                // (mirrors matchNotes; see the constant below).
+                let chordSusForGrace = 0;
+                for (const cn of group) {
+                    if (Number.isFinite(cn.sus) && cn.sus > chordSusForGrace) chordSusForGrace = cn.sus;
+                }
+                const chordLateGraceMs = chordSusForGrace > 0
+                    ? Math.min(chordSusForGrace * 1000, 1000)
+                    : 0;
                 // Derive pitch error from the first string that actually has a
                 // finite centsError measurement. Fall back to the monophonic
                 // detector if available; leave null if no pitch data exists
@@ -2198,10 +2784,71 @@ function createNoteDetector(options = {}) {
                         score: chordResult.score,
                         pitchError: chordPitchError,
                         monophonicDetected: detectedMidi >= 0,
+                        lateGraceMs: chordLateGraceMs,
                     }
                 );
 
                 if (!chordResult.isHit) {
+                    // Stash the chordResult before bailing so that when
+                    // checkMisses() retires this chord as a miss, the
+                    // miss judgment can carry the scorer's per-string
+                    // diagnostic data (hitStrings / totalStrings / score).
+                    // Without this we were blind on missed chords — the
+                    // live JSONL + diagnostic event log just showed
+                    // hs/tt/sc=undefined, which made "the scorer saw 2 of
+                    // 5 strings — was that just the user's playing, or is
+                    // the energy threshold too strict?" impossible to
+                    // answer from data alone. The map is keyed by chord
+                    // key and the snapshot lands the BEST-SCORE frame
+                    // seen during the chord's match window (see the
+                    // `useNewSnapshot` predicate below) — gives the
+                    // reader "best the scorer got at any point in the
+                    // window" rather than an arbitrary final frame which
+                    // may be tail-end decay.
+                    // Cache for checkMisses to consume on retire.
+                    //
+                    // Two pieces tracked separately:
+                    //
+                    //   • voicingHit — STICKY. Once ANY frame in this
+                    //     chord's window registered as voicing-eligible
+                    //     (≥2 chord strings rang at their expected
+                    //     pitches), remember it forever for this chord.
+                    //     A subsequent frame where some of those strings
+                    //     momentarily failed pitch (decay below threshold
+                    //     while the rest still rang, audio bleed shifted
+                    //     things, etc.) MUST NOT retroactively cancel a
+                    //     previously-eligible voicing. Earlier logic
+                    //     here had a "higher score wins" rule that
+                    //     accidentally demoted voicingHit:true frames
+                    //     when a later !voicingHit but slightly higher
+                    //     score frame arrived — which on real-song
+                    //     data wiped out the rescue path entirely.
+                    //
+                    //   • score / hitStrings / totalStrings — best
+                    //     frame's diagnostic snapshot, regardless of
+                    //     voicingHit. Used by the live JSONL and the
+                    //     event log so a reader can see "best the
+                    //     scorer got" on this chord.
+                    const prev = _chordLastResult.get(chordKey);
+                    const voicingEver = !!((prev && prev.voicingHit) || chordResult.voicingHit);
+                    const useNewSnapshot = !prev || chordResult.score > (prev.score || 0);
+                    // Capture the frame time of the FIRST voicing-eligible
+                    // frame for this chord. checkMisses uses this as the
+                    // judgment's `judgedAt` so the resulting timingError
+                    // reflects when voicing was actually satisfied — not
+                    // the retire-tick time (which is by definition past
+                    // the chord's match window and would classify the
+                    // rescued judgment as LATE, defeating the rescue).
+                    const voicingT = (prev && prev.voicingT)
+                        ? prev.voicingT
+                        : (chordResult.voicingHit ? t : null);
+                    _chordLastResult.set(chordKey, {
+                        score:        useNewSnapshot ? chordResult.score        : prev.score,
+                        hitStrings:   useNewSnapshot ? chordResult.hitStrings   : prev.hitStrings,
+                        totalStrings: useNewSnapshot ? chordResult.totalStrings : prev.totalStrings,
+                        voicingHit:   voicingEver,
+                        voicingT,
+                    });
                     // Do not lock in a miss while the chord is still within
                     // its timing window. Chords can enter candidateNotes as
                     // early as (chordTime - timingTolerance), so an early
@@ -2220,6 +2867,12 @@ function createNoteDetector(options = {}) {
                 // lenient chord hits where some strings rang and some
                 // didn't.
                 recordJudgment(chordKey, chordJudgment, { count: true, emit: true });
+                // Hit path doesn't need any cached miss-diagnostic for
+                // this chord — drop the entry so the map only holds
+                // truly-pending chords. Without this, the cache could
+                // grow over a session as chords flicker through the
+                // "scored low, then scored above threshold" pattern.
+                _chordLastResult.delete(chordKey);
                 // Build an (s,f)-keyed lookup so we don't rely on
                 // `chordResult.results[i]` being positionally aligned
                 // with `group[i]`. The browser `_ndScoreChord`
@@ -2250,7 +2903,9 @@ function createNoteDetector(options = {}) {
                         const stringExpectedMidi = _ndMidiFromStringFret(
                             cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                         );
-                        noteResults.set(key, makeMissJudgment(cn, cn.t, t, stringExpectedMidi));
+                        const stringMiss = makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
+                        noteResults.set(key, stringMiss);
+                        _recordPerStringForChord(stringMiss);
                         continue;
                     }
                     const stringRes = stringResByKey.get(`${cn.s}_${cn.f}`);
@@ -2269,6 +2924,7 @@ function createNoteDetector(options = {}) {
                         )
                         : makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
                     noteResults.set(key, stringJudgment);
+                    _recordPerStringForChord(stringJudgment);
                 }
             }
         }
@@ -2280,34 +2936,59 @@ function createNoteDetector(options = {}) {
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         const tolerance = timingTolerance;
         const missDeadline = t - tolerance * 2;
+        // Mirror matchNotes' sus-late-grace policy. Without this, a sus
+        // note whose match window matchNotes is willing to extend gets
+        // retired here as a miss before that extended window has even
+        // closed — matchNotes never gets a chance to record the late
+        // hit. Cap matches matchNotes (kept loosely in sync via the
+        // same constant pattern so both paths shift together).
+        const MAX_SUS_LATE_GRACE = 1.0;
         const notes = hw.getNotes();
         const chords = hw.getChords();
 
-        const checkNote = (s, f, noteTime) => {
-            if (noteTime > missDeadline) return;
-            const key = noteKey({ s, f }, noteTime);
+        // Pass the full chart-note object (not just {s, f}) so the miss
+        // judgment carries `sus` and technique flags through to the
+        // diagnostic event log. Stripping to {s, f} here made every pure
+        // miss look like a staccato note (sus=0) regardless of whether
+        // the chart said it was sustained, which corrupts any
+        // sus-conditioned analysis downstream.
+        const checkNote = (chartNote, noteTime) => {
+            const susSec = Number.isFinite(chartNote.sus) && chartNote.sus > 0 ? chartNote.sus : 0;
+            const lateGrace = susSec > 0 ? Math.min(susSec, MAX_SUS_LATE_GRACE) : 0;
+            // Effective retire threshold: a sus note isn't retired
+            // until its sustain envelope has clearly elapsed, giving
+            // matchNotes the same grace period to lock on.
+            if (noteTime > missDeadline - lateGrace) return;
+            const key = noteKey(chartNote, noteTime);
             if (!noteResults.has(key)) {
                 const expectedMidi = _ndMidiFromStringFret(
-                    s, f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
                 recordJudgment(
                     key,
-                    makeMissJudgment({ s, f }, noteTime, t, expectedMidi)
+                    makeMissJudgment(chartNote, noteTime, t, expectedMidi)
                 );
             }
         };
 
+        // Look back far enough that sus-marked notes whose grace just
+        // expired are still visited by this scan. Without this, the
+        // bsearch start moves forward each tick and overruns notes that
+        // were intentionally held past their normal retire window — they
+        // never get retired at all. The `+ 1` is the existing lookback
+        // slack; `MAX_SUS_LATE_GRACE` is the per-note extension we added.
+        const scanStartT = missDeadline - 1 - MAX_SUS_LATE_GRACE;
         if (notes && notes.length > 0) {
-            const start = bsearch(notes, missDeadline - 1);
+            const start = bsearch(notes, scanStartT);
             for (let i = start; i < notes.length; i++) {
                 const n = notes[i];
                 if (n.t > missDeadline) break;
                 if (n.mt) continue;
-                checkNote(n.s, n.f, n.t);
+                checkNote(n, n.t);
             }
         }
         if (chords && chords.length > 0) {
-            const start = bsearch(chords, missDeadline - 1);
+            const start = bsearch(chords, scanStartT);
             for (let i = start; i < chords.length; i++) {
                 const c = chords[i];
                 if (c.t > missDeadline) break;
@@ -2315,9 +2996,25 @@ function createNoteDetector(options = {}) {
                 if (liveNotes.length === 0) continue;
                 if (liveNotes.length === 1) {
                     // Degenerate "chord" of one — treat as a single note.
-                    checkNote(liveNotes[0].s, liveNotes[0].f, c.t);
+                    checkNote(liveNotes[0], c.t);
                     continue;
                 }
+                // Mirror the matchNotes-side chord candidate grace: a
+                // chord with sus-marked constituents isn't retired until
+                // its sustain envelope has clearly elapsed, so a late
+                // strummer gets the same window to score that a single-
+                // note late-detect-gets-credited late-player gets. Take
+                // the max sus across constituents.
+                let chordSus = 0;
+                for (const cn of liveNotes) {
+                    if (Number.isFinite(cn.sus) && cn.sus > chordSus) chordSus = cn.sus;
+                }
+                const chordLateGrace = chordSus > 0 ? Math.min(chordSus, MAX_SUS_LATE_GRACE) : 0;
+                // Mirror the seconds-vs-milliseconds split: _ndMakeJudgment
+                // wants late-grace in ms, but the retire-window comparisons
+                // above use seconds.
+                const chordLateGraceMs = chordLateGrace * 1000;
+                if (c.t > missDeadline - chordLateGrace) continue;
                 // Multi-note chord: judge as a single unit. matchNotes()
                 // stores a judgment object at `<t>_chord` when the chord
                 // cleared the ratio threshold; if that key is present, the
@@ -2328,16 +3025,87 @@ function createNoteDetector(options = {}) {
                     liveNotes[0].s, liveNotes[0].f,
                     currentArrangement, currentStringCount, tuningOffsets, capo
                 );
-                const chordJudgment = makeMissJudgment(liveNotes[0], c.t, t, expectedMidi, {
-                    notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
-                    chord: true,
-                });
+                // Pull the latest chord-scorer result (if any) so the
+                // miss judgment carries hs/tt/sc. matchNotes stashes
+                // this on every non-hit frame; the most recent stash
+                // is "what the scorer last saw on this chord". If the
+                // chord scorer never fired in window (no audio buffer,
+                // monophonic detection failure path, etc.) the cache
+                // is empty and we fall back to undefined-as-before.
+                const cachedChord = _chordLastResult.get(chordKey);
+                // Voicing-reduction rescue: if matchNotes never found a
+                // strict-ratio frame but the chord was voicing-eligible
+                // at some point (≥2 chord strings rang at their expected
+                // pitches), record this retire as a HIT instead of a miss.
+                // This is the "punk-rock power-chord interpretation of a
+                // full-chord chart" path — see _ndScoreChord for the
+                // detailed rationale and the trade-off vs eager-commit
+                // in matchNotes (which we explicitly avoid to keep
+                // strict-ratio frames' timing winning when they exist).
+                const voicingRescue = !!(cachedChord && cachedChord.voicingHit);
+                // Pass the cached voicing-eligible frame time as the
+                // judgment's `judgedAt`, not the current retire-tick
+                // time. The retire tick fires AFTER the chord window
+                // has closed by 2 × timingTolerance + lateGrace, so
+                // using `t` here would produce a timingError of
+                // hundreds of milliseconds, the timingState would be
+                // LATE, and the chord-branch hit calc
+                // (`matched && timingState === 'OK'`) would flip the
+                // rescue back to a miss — defeating the entire path.
+                // The cached voicingT is the actual moment voicing
+                // was first satisfied, which is by definition inside
+                // the chord's match window.
+                const judgedAtForRescue = (voicingRescue && Number.isFinite(cachedChord.voicingT))
+                    ? cachedChord.voicingT
+                    : t;
+                const chordJudgment = voicingRescue
+                    ? makeMatchedJudgment(
+                        liveNotes[0], c.t, judgedAtForRescue, expectedMidi,
+                        null,    // no monophonic detection at retire time
+                        0,       // no pitch confidence to claim
+                        {
+                            chord: true,
+                            notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
+                            hitStrings:   cachedChord.hitStrings,
+                            totalStrings: cachedChord.totalStrings,
+                            score:        cachedChord.score,
+                            // No pitch error to report — voicing-reduction is
+                            // an aggregate per-string verdict, not a monophonic
+                            // pitch measurement. The pitchState ends up null,
+                            // and _ndMakeJudgment's chord-branch hit calc
+                            // (`matched && timingState === 'OK'`) lets it
+                            // through.
+                            pitchError: null,
+                            lateGraceMs: chordLateGraceMs,
+                        },
+                    )
+                    : makeMissJudgment(liveNotes[0], c.t, t, expectedMidi, {
+                        notes: liveNotes.map(cn => ({ s: cn.s, f: cn.f })),
+                        chord: true,
+                        hitStrings:   cachedChord ? cachedChord.hitStrings   : undefined,
+                        totalStrings: cachedChord ? cachedChord.totalStrings : undefined,
+                        score:        cachedChord ? cachedChord.score        : undefined,
+                        lateGraceMs: chordLateGraceMs,
+                    });
                 recordJudgment(chordKey, chordJudgment);
+                // Free the cache entry — we've consumed it, no further
+                // matchNotes frames will fire for this chord (it just
+                // got finalized as a miss or voicing-rescue hit).
+                _chordLastResult.delete(chordKey);
                 for (const cn of liveNotes) {
                     const key = noteKey({ s: cn.s, f: cn.f }, c.t);
-                    if (!noteResults.has(key)) noteResults.set(key, makeMissJudgment(cn, c.t, t, _ndMidiFromStringFret(
+                    if (noteResults.has(key)) continue;
+                    const stringMiss = makeMissJudgment(cn, c.t, t, _ndMidiFromStringFret(
                         cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
-                    )));
+                    ));
+                    noteResults.set(key, stringMiss);
+                    // Bin per-string only when the chord retired as a
+                    // miss. On voicing-rescue (chord-level hit) no
+                    // per-string outcomes were measured — we'd be
+                    // forcing miss-by-default fallbacks into the
+                    // per-string panel and overstating misses on
+                    // strings that may have rung fine.
+                    if (!voicingRescue) _recordPerStringForChord(stringMiss);
                 }
             }
         }
@@ -2382,6 +3150,28 @@ function createNoteDetector(options = {}) {
                 <span class="text-gray-200 font-semibold">Note Detection Settings</span>
                 <button class="nd-settings-close text-gray-500 hover:text-white">&times;</button>
             </div>
+
+            ${tuningMode ? `
+            <div class="nd-rec-block bg-dark-600/40 border border-gray-700 rounded-lg p-3 mb-3">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="text-gray-200 text-xs font-semibold uppercase tracking-wider">Reference Recording</span>
+                    <span class="nd-rec-state text-[10px] uppercase tracking-wider text-gray-500">idle</span>
+                </div>
+                <div class="nd-rec-info text-[11px] text-gray-400 leading-snug mb-2">Click Arm, then press Play on the song.</div>
+                <div class="flex gap-1.5">
+                    <button class="nd-rec-arm flex-1 bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-2 py-1.5 rounded text-xs font-semibold text-white transition">
+                        Arm
+                    </button>
+                    <button class="nd-rec-save px-3 py-1.5 bg-dark-500 hover:bg-dark-400 rounded text-xs text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed" title="Save what's captured so far">
+                        Save
+                    </button>
+                    <button class="nd-rec-discard px-3 py-1.5 bg-dark-500 hover:bg-dark-400 rounded text-xs text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed" title="Throw out the in-flight buffer">
+                        Discard
+                    </button>
+                </div>
+                <div class="nd-rec-saved text-[10px] text-gray-500 mt-2 break-all"></div>
+            </div>
+            ` : ''}
 
             <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
             <select class="nd-device-select w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2">
@@ -2481,6 +3271,71 @@ function createNoteDetector(options = {}) {
 
         // Wire up controls
         panel.querySelector('.nd-settings-close').onclick = () => panel.remove();
+
+        // Reference-recording controls — present only when tuningMode is
+        // on (the .nd-rec-block element is conditional in the template
+        // above). Status updates on a self-cancelling 1s interval so the
+        // duration tick + "Saved to ..." path appear in real time while
+        // the popover is open.
+        const recBlock = panel.querySelector('.nd-rec-block');
+        if (recBlock) {
+            const armBtn  = recBlock.querySelector('.nd-rec-arm');
+            const saveBtn = recBlock.querySelector('.nd-rec-save');
+            const discBtn = recBlock.querySelector('.nd-rec-discard');
+            const stateEl = recBlock.querySelector('.nd-rec-state');
+            const infoEl  = recBlock.querySelector('.nd-rec-info');
+            const savedEl = recBlock.querySelector('.nd-rec-saved');
+            // Declared up-front (vs. `const` after setInterval below) so
+            // the bail-out branch in renderRec can call clearInterval
+            // even if it fires on the very first synchronous call before
+            // the interval has been installed — e.g., when instanceRoot
+            // isn't attached to document.body in some host/test context.
+            // Without this, the early bail-out would hit the temporal
+            // dead zone and ReferenceError-out instead of cleaning up.
+            let tick = null;
+
+            function renderRec() {
+                if (!document.body.contains(panel)) { if (tick != null) clearInterval(tick); return; }
+                const r = getRecordingState();
+                const hasBuffer = r.samples > 0;
+                let label, info;
+                if (r.saveInFlight) { label = 'saving…'; info = 'Encoding + uploading the WAV…'; }
+                else if (r.lastError) { label = 'error'; info = 'Last attempt failed: ' + r.lastError; }
+                else if (r.armed && r.songPlaying) { label = 'recording'; info = `Capturing… ${r.durationS.toFixed(1)} s (${r.samples} samples @ ${r.sampleRate} Hz). Auto-saves on song end.`; }
+                else if (r.armed && !r.detectEnabled) { label = 'armed (Detect off)'; info = 'Armed, but Detect isn\'t on — no audio is flowing.'; }
+                else if (r.armed) { label = 'armed'; info = 'Armed. Press Play to start capturing.'; }
+                else if (hasBuffer) { label = 'paused'; info = `${r.durationS.toFixed(1)} s captured; Save to keep it or Discard to throw it out.`; }
+                else if (r.lastSavePath) { label = 'idle'; info = 'Ready. Click Arm for the next take.'; }
+                else { label = 'idle'; info = 'Click Arm, then press Play.'; }
+                if (stateEl) stateEl.textContent = label;
+                if (infoEl)  {
+                    infoEl.textContent = info;
+                    infoEl.className = 'nd-rec-info text-[11px] leading-snug mb-2 ' + (r.lastError ? 'text-red-400' : 'text-gray-400');
+                }
+                if (savedEl) {
+                    if (r.lastSavePath && !r.armed && !r.lastError) {
+                        savedEl.innerHTML = 'Saved: <code class="text-gray-300">' + r.lastSavePath + '</code>';
+                    } else {
+                        savedEl.textContent = '';
+                    }
+                }
+                if (armBtn)  { armBtn.textContent = r.armed ? 'Disarm' : 'Arm'; armBtn.disabled = r.saveInFlight; }
+                if (saveBtn) saveBtn.disabled = !hasBuffer || r.saveInFlight;
+                if (discBtn) discBtn.disabled = !(r.armed || hasBuffer) || r.saveInFlight;
+            }
+            if (armBtn) armBtn.onclick = () => {
+                const r = getRecordingState();
+                if (r.armed) disarmRecording(); else armRecording();
+                renderRec();
+            };
+            if (saveBtn) saveBtn.onclick = async () => {
+                await saveRecordingNow();
+                renderRec();
+            };
+            if (discBtn) discBtn.onclick = () => { discardRecording(); renderRec(); };
+            renderRec();
+            tick = setInterval(renderRec, 1000);
+        }
         panel.querySelector('.nd-device-select').onchange = (e) => onDeviceChange(e.target.value);
         panel.querySelector('.nd-channel-select').onchange = (e) => onChannelChange(e.target.value);
         panel.querySelector('.nd-method-select').onchange = (e) => setMethod(e.target.value);
@@ -3000,6 +3855,8 @@ function createNoteDetector(options = {}) {
         bestStreak = 0;
         noteResults.clear();
         _susActiveUntil.clear();
+        _chordLastResult.clear();
+        _diagResetCounters();
         sectionStats = [];
         currentSection = null;
         detectedMidi = -1;
@@ -3011,6 +3868,19 @@ function createNoteDetector(options = {}) {
         lastChordHit = 0;
         lastChordTotal = 0;
         lastChordTime = -Infinity;
+    }
+
+    // Narrower reset used by the A/V auto-calibrate Apply button.
+    // Calling resetScoring() there blew away the user's hit/miss
+    // counters + streak + section history + event log — surprising
+    // for what's framed as a calibration tweak. This clears ONLY the
+    // timing-error samples that feed the next calibration suggestion,
+    // so the next median reflects the new offset but everything else
+    // the user can see on Settings (accuracy, breakdown, per-section)
+    // stays intact.
+    function _resetCalibrationSamples() {
+        _diagTimingErrors.length = 0;
+        _diagTimingErrorsHits.length = 0;
     }
 
     // ── Drill mode (slopsmith loop:restart) ───────────────────────────
@@ -3448,6 +4318,13 @@ function createNoteDetector(options = {}) {
         // unmount cycles. disable() leaves them alone (resumes drill state
         // on re-enable); destroy is the right teardown point.
         _drillUnbindEvents();
+        _recUnbindEvents();
+        _liveUnbindEvents();
+        // Discard any unsaved recording state — destroying the instance
+        // shouldn't write a half-captured WAV.
+        _recArmed = false;
+        _recChunks = [];
+        _recTotalSamples = 0;
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
         try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
@@ -3469,8 +4346,343 @@ function createNoteDetector(options = {}) {
     }
 
     async function toggle() {
-        if (enabled) disable();
-        else await enable();
+        if (enabled) {
+            disable();
+            detectPreference = false;
+            saveSettings();
+        } else {
+            await enable();
+            detectPreference = true;
+            saveSettings();
+        }
+    }
+
+    // Builds a self-contained snapshot of the current session — counters,
+    // miss-category breakdown, per-string hit rate, signed error
+    // percentiles, the song/arrangement/tuning, the detector settings,
+    // and a capped per-judgment event log. Schema is versioned so future
+    // tooling can dispatch. `benchmark_hint` carries the song's title/
+    // artist/arrangement triple verbatim so reports against the official
+    // benchmark sloppak can be filtered without needing a strict match.
+    function _buildDiagnosticPayload() {
+        const currentHw = resolveHw();
+        const info = (currentHw && currentHw.getSongInfo) ? currentHw.getSongInfo() : {};
+        const total = hits + misses;
+        const sumAcc = total > 0 ? +(hits / total).toFixed(3) : 0;
+        const sAcc = (_diagSingles.hits + _diagSingles.misses) > 0
+            ? +(_diagSingles.hits / (_diagSingles.hits + _diagSingles.misses)).toFixed(3) : 0;
+        const cAcc = (_diagChords.hits + _diagChords.misses) > 0
+            ? +(_diagChords.hits / (_diagChords.hits + _diagChords.misses)).toFixed(3) : 0;
+        return {
+            schema: 'note_detect.diagnostic.v1',
+            timestamp: new Date().toISOString(),
+            plugin_version: _ND_VERSION,
+            benchmark_hint: {
+                title: info.title || null,
+                artist: info.artist || null,
+                arrangement: info.arrangement || null,
+                arrangement_index: (info.arrangement_index != null) ? info.arrangement_index : null,
+            },
+            song: {
+                tuning: info.tuning || null,
+                capo: (info.capo != null) ? info.capo : 0,
+                duration: (info.duration != null) ? info.duration : null,
+                format: info.format || null,
+            },
+            settings: {
+                method: detectionMethod,
+                timing_tolerance_s: timingTolerance,
+                timing_hit_threshold_s: timingHitThreshold,
+                pitch_tolerance_cents: pitchTolerance,
+                pitch_hit_threshold_cents: pitchHitThreshold,
+                chord_hit_ratio: chordHitRatio,
+                latency_offset_s: latencyOffset,
+                input_gain: inputGain,
+                channel: selectedChannel,
+            },
+            summary: {
+                hits, misses, total,
+                accuracy: sumAcc,
+                best_streak: bestStreak,
+                singles: { hits: _diagSingles.hits, misses: _diagSingles.misses, accuracy: sAcc },
+                chords:  { hits: _diagChords.hits,  misses: _diagChords.misses,  accuracy: cAcc },
+            },
+            miss_breakdown: { ..._diagBreakdown },
+            per_string: _diagPerString.map((slot, s) => ({
+                s,
+                hits: slot.hits,
+                misses: slot.misses,
+                total: slot.hits + slot.misses,
+                accuracy: (slot.hits + slot.misses) > 0
+                    ? +(slot.hits / (slot.hits + slot.misses)).toFixed(3) : null,
+            })),
+            timing_error_ms: _diagDistribution(_diagTimingErrors),
+            // Hit-only timing distribution — the responsive signal for
+            // A/V auto-calibration. See _diagTimingErrorsHits comment.
+            timing_error_ms_hits: _diagDistribution(_diagTimingErrorsHits),
+            pitch_error_cents:    _diagDistribution(_diagPitchErrors),
+            sections: sectionStats.map(s => ({
+                name: s.name,
+                hits: s.hits,
+                misses: s.misses,
+                accuracy: (s.hits + s.misses) > 0
+                    ? +(s.hits / (s.hits + s.misses)).toFixed(3) : 0,
+            })),
+            events: _diagEvents,
+        };
+    }
+
+    function _downloadDiagnostic() {
+        try {
+            const payload = _buildDiagnosticPayload();
+            const json = JSON.stringify(payload, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const slug = (payload.benchmark_hint.title || 'song')
+                .replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 40);
+            const ts = payload.timestamp.replace(/[:.]/g, '-').slice(0, 19);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `note_detect_diag_${slug}_${ts}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 500);
+            return true;
+        } catch (e) {
+            console.warn('[note_detect] diagnostic download failed:', e);
+            return false;
+        }
+    }
+
+    // ── Reference-recording capture ───────────────────────────────────
+    // Arms the next song-play to record the detector's input audio. On
+    // song:ended, auto-saves a WAV to `static/note_detect_recordings/`
+    // via the plugin's POST endpoint — that dir is bind-mounted in the
+    // dev container, so the headless harness on the host can read the
+    // same file back without a copy step. Detect must be enabled for
+    // audio to actually flow; armed-without-Detect is a no-op.
+    function armRecording() {
+        _recArmed = true;
+        _recChunks = [];
+        _recTotalSamples = 0;
+        _recLastSaveError = null;
+        _recCappedAt = null;
+        // Bind song-event listeners lazily so an idle plugin instance
+        // doesn't sit on the slopsmith bus. Unbind in disarm / save /
+        // destroy. Idempotent.
+        _recBindEvents();
+    }
+    function disarmRecording() {
+        // Soft stop: turn capture off but keep the buffer so the user
+        // can still Save (or Discard) what they captured. Clearing the
+        // buffer here would silently throw away the user's take, which
+        // is what they were complaining about. Use discardRecording()
+        // when you actually want to wipe.
+        _recArmed = false;
+        _recUnbindEvents();
+    }
+    function discardRecording() {
+        _recArmed = false;
+        _recChunks = [];
+        _recTotalSamples = 0;
+        _recLastSaveError = null;
+        _recCappedAt = null;
+        _recUnbindEvents();
+    }
+    async function saveRecordingNow() {
+        if (_recSaveInFlight) return null;
+        if (_recChunks.length === 0) {
+            _recLastSaveError = 'no audio captured (Detect off, or song never played)';
+            return null;
+        }
+        // Snapshot the buffer (alias, not copy) and disarm so any
+        // song:ended fired mid-upload doesn't re-enter this path. We
+        // intentionally DO NOT clear _recChunks here — if the POST
+        // fails the user keeps their take and can retry via the Save
+        // button. Earlier behaviour cleared synchronously, which meant
+        // a network error or 413 from the server-side cap silently
+        // destroyed a recorded session with no way to recover.
+        const chunks = _recChunks;
+        const sr = _recSampleRate;
+        _recArmed = false;
+        _recSaveInFlight = true;
+        try {
+            const wav = _ndEncodeWavPcm16(chunks, sr);
+            const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+            const slug = ((info.title || 'recording') + '')
+                .replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 40) || 'recording';
+            const resp = await fetch(
+                '/api/plugins/note_detect/recording?slug=' + encodeURIComponent(slug),
+                { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav }
+            );
+            if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()).slice(0, 200));
+            const data = await resp.json();
+            _recLastSavePath = data && data.relative_path || null;
+            _recLastSaveError = null;
+            // SUCCESS — only NOW clear the buffer, so a failed upload
+            // doesn't lose the user's audio. _recCappedAt also resets
+            // since the take that was capped has shipped.
+            _recChunks = [];
+            _recTotalSamples = 0;
+            _recCappedAt = null;
+            return data;
+        } catch (e) {
+            _recLastSaveError = String(e && e.message || e);
+            console.warn('[note_detect] saveRecording failed:', e);
+            // Buffer intentionally left in _recChunks so the user can
+            // retry via the Save button after fixing the underlying
+            // issue (server restart, larger cap, etc.).
+            return null;
+        } finally {
+            _recSaveInFlight = false;
+            // Done with this take — release the song-event listeners.
+            _recUnbindEvents();
+        }
+    }
+    function getRecordingState() {
+        // Use the cached running total instead of reducing the array —
+        // the UI's auto-refresh poll calls this every 1500 ms, and on a
+        // long take the reduce was O(n) per call. The cache is
+        // maintained in lockstep with `_recChunks` (incremented on
+        // push, zeroed on arm/discard/successful-save/destroy).
+        const samples = _recTotalSamples;
+        return {
+            armed:        _recArmed,
+            songPlaying:  _recSongPlaying,
+            chunks:       _recChunks.length,
+            samples,
+            sampleRate:   _recSampleRate,
+            durationS:    samples / Math.max(1, _recSampleRate),
+            saveInFlight: _recSaveInFlight,
+            lastSavePath: _recLastSavePath,
+            lastError:    _recLastSaveError,
+            // null = no cap hit; otherwise the second-mark where the client-
+            // side 32 MB cap kicked in. UI can surface "your take was
+            // truncated at X s".
+            cappedAtS:    _recCappedAt,
+            // Recording requires the audio pipeline to be live — surface
+            // it here so the UI can prompt the user to enable Detect.
+            detectEnabled: enabled,
+        };
+    }
+
+    // Wire song-play / song-end events on the slopsmith bus so an armed
+    // recording auto-arms on Play and auto-saves on song-end. Mirrors
+    // the drill-mode binding pattern: bind once at construct, tear down
+    // in destroy(). The handlers are no-ops while `_recArmed` is false.
+    let _recOnPlay = null, _recOnPause = null, _recOnEnded = null;
+    let _recSubscribed = false;
+    function _recBindEvents() {
+        if (_recSubscribed) return;
+        if (!window.slopsmith
+            || typeof window.slopsmith.on !== 'function'
+            || typeof window.slopsmith.off !== 'function') return;
+        _recOnPlay  = () => { _recSongPlaying = true; };
+        _recOnPause = () => { _recSongPlaying = false; };
+        _recOnEnded = () => {
+            _recSongPlaying = false;
+            if (_recArmed && _recChunks.length > 0) {
+                // Fire-and-forget — the UI polls getRecordingState() so
+                // it'll surface the lastSavePath / lastError when it lands.
+                saveRecordingNow().catch(() => {});
+            } else if (_recArmed) {
+                // Armed but never captured anything (Detect was off, or
+                // song:play never fired). Disarm + release the bus
+                // listeners so the next song doesn't start an unintended
+                // recording and we don't keep flipping _recSongPlaying.
+                _recArmed = false;
+                _recLastSaveError = 'no audio captured before song:ended';
+                _recUnbindEvents();
+            }
+        };
+        try {
+            window.slopsmith.on('song:play',  _recOnPlay);
+            window.slopsmith.on('song:pause', _recOnPause);
+            window.slopsmith.on('song:ended', _recOnEnded);
+        } catch (e) {
+            // Partial registration — unwind to avoid leaking handlers.
+            try { window.slopsmith.off('song:play',  _recOnPlay); }  catch (_) {}
+            try { window.slopsmith.off('song:pause', _recOnPause); } catch (_) {}
+            try { window.slopsmith.off('song:ended', _recOnEnded); } catch (_) {}
+            _recOnPlay = _recOnPause = _recOnEnded = null;
+            return;
+        }
+        _recSubscribed = true;
+    }
+    function _recUnbindEvents() {
+        if (!_recSubscribed) return;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_recOnPlay)  { try { window.slopsmith.off('song:play',  _recOnPlay); }  catch (e) {} }
+            if (_recOnPause) { try { window.slopsmith.off('song:pause', _recOnPause); } catch (e) {} }
+            if (_recOnEnded) { try { window.slopsmith.off('song:ended', _recOnEnded); } catch (e) {} }
+        }
+        _recOnPlay = _recOnPause = _recOnEnded = null;
+        _recSubscribed = false;
+    }
+
+    // Live-streaming event bindings — only active while tuning mode is
+    // on. Mints a fresh session id on song:play so every take produces
+    // its own `live_<id>.jsonl` file server-side; clears it on song:end
+    // so judgments fired after a song ends don't trickle into a stale
+    // file. Independent of recording arm state — the user gets live
+    // streaming even without arming a WAV capture.
+    let _liveOnPlay = null, _liveOnEnded = null;
+    let _liveSubscribed = false;
+    function _liveBindEvents() {
+        if (_liveSubscribed) return;
+        if (!window.slopsmith
+            || typeof window.slopsmith.on !== 'function'
+            || typeof window.slopsmith.off !== 'function') return;
+        _liveOnPlay = () => {
+            // Match the recording route's filename convention so live
+            // JSONL and recorded WAV pair up cleanly under
+            // static/note_detect_recordings/.
+            const now = new Date();
+            const pad = (n) => String(n).padStart(2, '0');
+            const ts = now.getFullYear()
+                + pad(now.getMonth() + 1) + pad(now.getDate()) + '_'
+                + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+            // Short random suffix avoids collisions when two panels
+            // emit a song:play in the same second (splitscreen).
+            const rand = Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
+            _liveSessionId = `${ts}_${rand}`;
+            // Stream a session-header record as line 1 of the JSONL so
+            // an offline reader knows under which settings the
+            // subsequent judgments were produced. Important for two
+            // reasons: (1) any analysis that infers "what cr was the
+            // user on?" from judgment data alone is fragile, (2) we
+            // want to mine these for sensible-default suggestions
+            // across users without each contributor having to attach
+            // their settings every time. Distinct shape (type:
+            // "session_start") so consumers can split header from
+            // judgments. Includes song / arrangement context too —
+            // useful for bucketing v1/v2/bass benchmark runs.
+            _streamLiveJudgment(_buildSessionHeader());
+        };
+        _liveOnEnded = () => {
+            _liveSessionId = null;
+        };
+        try {
+            window.slopsmith.on('song:play',  _liveOnPlay);
+            window.slopsmith.on('song:ended', _liveOnEnded);
+        } catch (e) {
+            try { window.slopsmith.off('song:play',  _liveOnPlay); }  catch (_) {}
+            try { window.slopsmith.off('song:ended', _liveOnEnded); } catch (_) {}
+            _liveOnPlay = _liveOnEnded = null;
+            return;
+        }
+        _liveSubscribed = true;
+    }
+    function _liveUnbindEvents() {
+        if (!_liveSubscribed) return;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_liveOnPlay)  { try { window.slopsmith.off('song:play',  _liveOnPlay); }  catch (e) {} }
+            if (_liveOnEnded) { try { window.slopsmith.off('song:ended', _liveOnEnded); } catch (e) {} }
+        }
+        _liveOnPlay = _liveOnEnded = null;
+        _liveSubscribed = false;
+        _liveSessionId = null;
     }
 
     function showSummary() {
@@ -3502,12 +4714,60 @@ function createNoteDetector(options = {}) {
             sectionHtml += '</div>';
         }
 
+        // Miss-category breakdown (#254 follow-up) — bars sum to total misses
+        // so the dominant failure mode is visible at a glance. Tuning mode
+        // only — normal play sees just the original hits/misses/streak +
+        // per-section bars.
+        let breakdownHtml = '';
+        if (tuningMode && misses > 0) {
+            const labels = {
+                pure:         ['Pure (no pitch)',    'bg-gray-500'],
+                chordPartial: ['Chord — partial',    'bg-purple-500'],
+                early:        ['Timing — early',     'bg-orange-500'],
+                late:         ['Timing — late',      'bg-orange-500'],
+                sharp:        ['Pitch — sharp',      'bg-cyan-500'],
+                flat:         ['Pitch — flat',       'bg-cyan-500'],
+            };
+            breakdownHtml = '<div class="mt-3 text-xs"><div class="text-gray-400 mb-1">Miss Breakdown:</div>';
+            for (const k of Object.keys(labels)) {
+                const v = _diagBreakdown[k] || 0;
+                if (v === 0) continue;
+                const pct = Math.round((v / misses) * 100);
+                breakdownHtml += `
+                    <div class="flex items-center gap-2 mb-1">
+                        <span class="w-24 text-gray-300">${labels[k][0]}</span>
+                        <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
+                            <div class="${labels[k][1]} h-full rounded" style="width:${pct}%"></div>
+                        </div>
+                        <span class="w-12 text-right text-gray-400">${v} <span class="text-gray-600">(${pct}%)</span></span>
+                    </div>
+                `;
+            }
+            const timingMed = _diagPercentile(_diagTimingErrors, 50);
+            const pitchMed  = _diagPercentile(_diagPitchErrors, 50);
+            if (timingMed != null || pitchMed != null) {
+                breakdownHtml += '<div class="mt-2 text-[10px] text-gray-500">';
+                if (timingMed != null) {
+                    const tp10 = _diagPercentile(_diagTimingErrors, 10);
+                    const tp90 = _diagPercentile(_diagTimingErrors, 90);
+                    breakdownHtml += `Timing err (ms): median ${timingMed}, p10..p90 [${tp10}..${tp90}]<br>`;
+                }
+                if (pitchMed != null) {
+                    const pp10 = _diagPercentile(_diagPitchErrors, 10);
+                    const pp90 = _diagPercentile(_diagPitchErrors, 90);
+                    breakdownHtml += `Pitch err (¢): median ${pitchMed}, p10..p90 [${pp10}..${pp90}]`;
+                }
+                breakdownHtml += '</div>';
+            }
+            breakdownHtml += '</div>';
+        }
+
         const overlay = document.createElement('div');
         overlay.className = 'nd-summary-overlay fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
         overlay.style.pointerEvents = 'auto';
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
         overlay.innerHTML = `
-            <div class="bg-dark-700 border border-gray-600 rounded-2xl p-6 w-80 shadow-2xl">
+            <div class="bg-dark-700 border border-gray-600 rounded-2xl p-6 w-96 max-h-[88vh] overflow-y-auto shadow-2xl">
                 <div class="text-center mb-4">
                     <div class="text-3xl font-bold ${accuracy >= 90 ? 'text-green-400' : accuracy >= 70 ? 'text-yellow-400' : 'text-red-400'}">${accuracy}%</div>
                     <div class="text-gray-400 text-sm">Accuracy</div>
@@ -3526,13 +4786,22 @@ function createNoteDetector(options = {}) {
                         <div class="text-gray-500 text-xs">Best Streak</div>
                     </div>
                 </div>
+                ${breakdownHtml}
                 ${sectionHtml}
-                <button class="nd-summary-close mt-4 w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
-                    Close
-                </button>
+                <div class="mt-4 flex gap-2">
+                    ${tuningMode ? `
+                    <button class="nd-summary-download flex-1 py-2 bg-accent hover:bg-accent-light rounded-lg text-sm font-semibold text-white transition">
+                        Download Diagnostic JSON
+                    </button>` : ''}
+                    <button class="nd-summary-close ${tuningMode ? 'px-4' : 'flex-1'} py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
+                        Close
+                    </button>
+                </div>
             </div>
         `;
         overlay.querySelector('.nd-summary-close').onclick = () => overlay.remove();
+        const dlBtn = overlay.querySelector('.nd-summary-download');
+        if (dlBtn) dlBtn.onclick = () => _downloadDiagnostic();
         instanceRoot.appendChild(overlay);
 
         publishToJournal(accuracy);
@@ -3601,6 +4870,61 @@ function createNoteDetector(options = {}) {
         setChannel,
         injectButton,
         showSummary,
+        // Diagnostic export (#254 follow-up). `downloadDiagnostic()`
+        // triggers a browser file save of the current session's
+        // breakdown + capped event log; `getDiagnostic()` returns the
+        // same payload for in-page display / programmatic use. Schema
+        // is `note_detect.diagnostic.v1`. `resetDiagnostic()` zeroes
+        // all the counters mid-session (without touching audio /
+        // enabled / button state) so you can navigate to a specific
+        // section, reset, and capture *only* that section's events.
+        downloadDiagnostic: _downloadDiagnostic,
+        getDiagnostic: _buildDiagnosticPayload,
+        resetDiagnostic: resetScoring,
+        // Narrower reset for A/V calibrate — clears only the timing
+        // samples that feed the next calibration suggestion, leaving
+        // hits/misses/streak/sectionStats/eventLog intact. Use this
+        // instead of `resetDiagnostic` when the goal is "stop using
+        // stale samples from before my offset change", not "start a
+        // brand-new session".
+        resetCalibrationSamples: _resetCalibrationSamples,
+        // Tuning-mode gate. Off by default; flipped on/off from the
+        // Settings page (the developer surfaces it gates live there too,
+        // so the toggle and the panels it reveals are in one place).
+        // Other UI — the summary modal's breakdown / Download button —
+        // polls this to decide whether to render the dev-only surfaces.
+        isTuningMode: () => tuningMode,
+        setTuningMode: (v) => {
+            const next = !!v;
+            if (next === tuningMode) return;
+            tuningMode = next;
+            // If the user disables tuning mid-recording, drop the
+            // in-flight buffer + disarm — the UI for it is about to
+            // disappear and we don't want a half-captured WAV trailing.
+            if (!tuningMode && (_recArmed || _recChunks.length > 0)) {
+                discardRecording();
+            }
+            // Live JSONL streaming binds/unbinds with tuning mode so
+            // non-tuning users don't pollute the slopsmith event bus.
+            // The drill-mode tests assert exactly one song:ended
+            // listener after their own bind — adding an always-on
+            // live-stream listener would break that contract.
+            if (tuningMode) _liveBindEvents(); else _liveUnbindEvents();
+            saveSettings();
+        },
+        // Reference-recording capture for the headless harness. Arms
+        // the next song-play to capture the detector's input audio,
+        // auto-saves on song:ended. POSTs the WAV to the plugin's
+        // routes.py endpoint, which writes it under
+        // static/note_detect_recordings/ — bind-mounted in the dev
+        // container, so the harness on the host can read it back
+        // without any copy step. See `getRecordingState()` for status
+        // / lastSavePath / lastError fields the UI polls.
+        armRecording,
+        disarmRecording,
+        discardRecording,
+        saveRecordingNow,
+        getRecordingState,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
@@ -3623,6 +4947,50 @@ function createNoteDetector(options = {}) {
         _unbindDrillEvents: _drillUnbindEvents,
         _drillSyncFromLoopState: _drillSyncFromLoopState,
         _recordJudgment: recordJudgment,
+
+        // Internal — headless-harness hooks. Lets a Node CLI tool
+        // (plugins/note_detect/tools/harness.js) drive the exact same
+        // processFrame / matchNotes / checkMisses pipeline the browser
+        // uses, without going through getUserMedia / AudioContext.
+        // Required because the matching + judgment logic is closure-
+        // internal and 300+ lines of nuance we don't want to
+        // reimplement out-of-process. Each entry is a no-arg / small-
+        // arg method; the harness composes them. Production code
+        // never touches `_harness`.
+        _harness: {
+            feedFrame: async (buffer, sampleRate) => {
+                if (Number.isFinite(sampleRate)) bridgeSampleRate = sampleRate;
+                await processFrame(buffer);
+            },
+            tick: () => { checkMisses(); },
+            setEnabled: (v) => { enabled = !!v; },
+            setContext: (ctx) => {
+                ctx = ctx || {};
+                if (typeof ctx.arrangement === 'string') currentArrangement = ctx.arrangement;
+                if (Number.isFinite(ctx.stringCount))   currentStringCount = ctx.stringCount;
+                if (Array.isArray(ctx.tuningOffsets))   tuningOffsets = ctx.tuningOffsets.slice();
+                if (Number.isFinite(ctx.capo))          capo = ctx.capo;
+            },
+            setSettings: (s) => {
+                s = s || {};
+                // _harness is a Node-only entrypoint and CREPE's
+                // TensorFlow.js model isn't wired in this path (see the
+                // file header on tools/harness.js). Accepting 'crepe'
+                // here would let a programmatic caller drive a value
+                // that the harness CLI explicitly rejects — and the
+                // detector would silently fall back to YIN at runtime.
+                // Keep the internal API aligned with the CLI's whitelist.
+                if (typeof s.method === 'string' && ['yin', 'hps'].includes(s.method))
+                    detectionMethod = s.method;
+                if (Number.isFinite(s.pitchTolerance))      pitchTolerance      = s.pitchTolerance;
+                if (Number.isFinite(s.pitchHitThreshold))   pitchHitThreshold   = s.pitchHitThreshold;
+                if (Number.isFinite(s.timingTolerance))     timingTolerance     = s.timingTolerance;
+                if (Number.isFinite(s.timingHitThreshold))  timingHitThreshold  = s.timingHitThreshold;
+                if (Number.isFinite(s.chordHitRatio))       chordHitRatio       = s.chordHitRatio;
+                if (Number.isFinite(s.latencyOffset))       latencyOffset       = s.latencyOffset;
+                if (Number.isFinite(s.inputGain))           inputGain           = s.inputGain;
+            },
+        },
     };
 
     // Register the draw hook once per instance. The hook early-returns
@@ -3630,6 +4998,46 @@ function createNoteDetector(options = {}) {
     // If highway isn't ready at construction time, ensureDrawHook()
     // (called from enable()) re-tries after resolving `hw` lazily.
     ensureDrawHook();
+
+    // Recording listeners are NOT bound at construct — drill tests assert
+    // a clean per-instance listener count, and we shouldn't be on the
+    // slopsmith event bus when no recording is armed anyway. We bind
+    // on armRecording(), unbind on disarm / save / destroy.
+
+    // Live-stream listeners follow the same rule but key off tuning
+    // mode: if the user already has tuning mode on from localStorage,
+    // bind so song:play mints a session id without requiring a
+    // setTuningMode toggle. setTuningMode handles the dynamic case.
+    if (tuningMode) _liveBindEvents();
+
+    // Auto-enable detection on construct when the persisted preference
+    // says so. Default singletons only — splitscreen panels mount /
+    // unmount on demand and shouldn't claim the audio device the
+    // moment they're constructed. Deferred to next tick so plugin
+    // construction returns first; enableImpl() bails cleanly if the
+    // highway isn't resolvable yet (it'll keep showing the off-state
+    // button until the user clicks).
+    //
+    // Gated on `window.AudioContext` (or the webkit-prefixed alias) so
+    // the vm test sandbox — which stubs the highway but has no audio
+    // — doesn't trigger a phantom enable() that binds drill listeners
+    // before the test gets to make its assertions.
+    const _hasAudio = typeof window !== 'undefined'
+        && (typeof window.AudioContext === 'function'
+            || typeof window.webkitAudioContext === 'function');
+    if (isDefault && detectPreference && _hasAudio) {
+        setTimeout(() => {
+            // Re-check BOTH enabled and detectPreference. A fast user
+            // click could have already enabled us (`enabled`), and
+            // another surface (settings sync, headless toggle) could
+            // have flipped detectPreference to false during the
+            // timeout — in that case we'd be honouring a stale-by-now
+            // preference and enabling against the user's wishes.
+            if (!enabled && detectPreference) enable().catch((e) => {
+                console.warn('[note_detect] auto-enable failed:', e && e.message ? e.message : e);
+            });
+        }, 0);
+    }
 
     _ndInstances.add(api);
     return api;

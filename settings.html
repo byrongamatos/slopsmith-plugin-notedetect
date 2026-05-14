@@ -1,0 +1,436 @@
+<!-- Note Detection settings — main Settings-page section. Most live
+     detection knobs (device, channel, tolerances, the screen-edge
+     flash toggle, etc.) still live in the gear popover beside the
+     Detect button in the player, because the user is mid-song when
+     they tune them. What lives here is the *post-run* benchmark
+     workflow: read out the current session's miss-category breakdown
+     and pull the diagnostic JSON without having to end the session
+     to trigger the summary modal. -->
+
+<div class="space-y-6">
+    <div>
+        <p class="text-xs text-gray-500 leading-relaxed">
+            Detection options for live play (device, channel, tolerances, label toggles, screen-edge flash, chord leniency) live in the gear popover next to the <strong>Detect</strong> button on the player screen.
+        </p>
+    </div>
+
+    <!-- A/V Sync auto-calibration. General-user surface (not gated by
+         tuning mode): suggests an A/V Sync Offset value derived from
+         the median signed timing error of the user's recently detected
+         notes. The math is simple — every ms of median skew is a ms
+         of A/V offset to add — but the value of surfacing it here is
+         that the user gets a concrete suggestion instead of fiddling
+         the slider blind. Needs Detect-on + a small handful of matched
+         notes to populate; before that the panel sits in "play a few
+         notes" mode. -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-semibold text-gray-300">A/V Sync — Auto-Calibrate</h4>
+            <span id="nd-av-state" class="text-[10px] uppercase tracking-wider text-gray-500">no data yet</span>
+        </div>
+        <p class="text-[11px] text-gray-400 leading-relaxed mb-3">
+            Reads your recently-detected note timing and proposes an <strong>A/V Sync Offset</strong> that would zero out the median skew. Run a song with Detect on, then click Apply.
+        </p>
+        <div class="text-[11px] text-gray-400 mb-3 leading-relaxed space-y-0.5">
+            <div>Current A/V offset: <span id="nd-av-current" class="text-gray-200 font-mono">—</span> ms</div>
+            <div>Median timing error: <span id="nd-av-median" class="text-gray-200 font-mono">—</span> ms <span id="nd-av-count" class="text-gray-600">(0 events)</span></div>
+            <div>Suggested A/V offset: <span id="nd-av-suggested" class="text-gray-200 font-mono">—</span> ms</div>
+        </div>
+        <button id="nd-av-apply"
+                class="w-full bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-4 py-2 rounded-lg text-sm font-semibold text-white transition"
+                disabled>
+            Apply suggested A/V offset
+        </button>
+        <p class="text-[10px] text-gray-600 mt-2 leading-relaxed">
+            Needs at least 5 hits. Usually takes 2–3 rounds to converge — Apply, play again, Apply, until the suggested value is within ±20 ms of current. If you've been getting almost no hits, your offset is too far off — reset the A/V slider on the main Settings page to 0, play a section, then come back here.
+        </p>
+    </div>
+
+    <!-- Tuning-mode toggle. Lives here (where the panels it gates also
+         live) so the user doesn't have to bounce between the gear
+         popover and this page just to reveal developer surfaces.
+         Persisted in localStorage via the plugin's saveSettings(). -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
+        <label class="flex items-start gap-3 cursor-pointer select-none">
+            <input type="checkbox" id="nd-tuning-mode"
+                   class="mt-0.5 rounded border-gray-600 bg-dark-700 text-accent focus:ring-accent/40">
+            <span class="text-sm text-gray-300">
+                Detection tuning (advanced)
+                <span class="block text-[11px] text-gray-500 leading-relaxed mt-1">
+                    Off by default. Turns on the developer surfaces: <strong>Reference Recording</strong> capture, <strong>Diagnostic JSON</strong> export + Reset, and the miss-category breakdown on the end-of-session summary. Pair with the headless harness (<code>plugins/note_detect/tools/harness.js</code>) for offline parameter sweeps.
+                </span>
+            </span>
+        </label>
+    </div>
+
+    <div id="nd-tuning-panels" class="space-y-6 hidden">
+
+    <!-- Reference Recording: the actual Arm / Save / Discard controls
+         live in the gear popover next to Detect (a during-play action),
+         not here. This block is a read-only breadcrumb so you can see
+         where your last take landed without re-opening the popover. -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-semibold text-gray-300">Reference Recording</h4>
+        </div>
+        <p class="text-[11px] text-gray-400 leading-relaxed mb-2">
+            Arming + saving live in the <strong>gear popover</strong> next to Detect on the player. This block just shows where your most recent take landed.
+        </p>
+        <div id="nd-rec-saved" class="text-[11px] text-gray-500 break-all">No recording saved this session yet.</div>
+    </div>
+
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-3">
+            <h4 class="text-sm font-semibold text-gray-300">Session Diagnostic</h4>
+            <span id="nd-diag-state" class="text-[10px] uppercase tracking-wider text-gray-500">no data yet</span>
+        </div>
+
+        <div id="nd-diag-summary" class="grid grid-cols-3 gap-3 text-center text-sm mb-3">
+            <div>
+                <div id="nd-diag-acc" class="font-bold text-gray-400">—</div>
+                <div class="text-[10px] text-gray-500">Accuracy</div>
+            </div>
+            <div>
+                <div id="nd-diag-hits" class="text-green-400 font-bold">0</div>
+                <div class="text-[10px] text-gray-500">Hits</div>
+            </div>
+            <div>
+                <div id="nd-diag-misses" class="text-red-400 font-bold">0</div>
+                <div class="text-[10px] text-gray-500">Misses</div>
+            </div>
+        </div>
+
+        <div id="nd-diag-breakdown" class="text-xs space-y-1 mb-3"></div>
+
+        <div id="nd-diag-meta" class="text-[10px] text-gray-600 leading-relaxed mb-3"></div>
+
+        <div class="flex gap-2">
+            <button id="nd-diag-download"
+                    class="flex-1 bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-4 py-2 rounded-lg text-sm font-semibold text-white transition"
+                    disabled>
+                Download Diagnostic JSON
+            </button>
+            <button id="nd-diag-reset"
+                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    disabled>
+                Reset
+            </button>
+            <button id="nd-diag-refresh"
+                    class="px-3 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition" title="Refresh now (auto-refreshes every 1.5s anyway)">
+                ↻
+            </button>
+        </div>
+
+        <p class="text-[10px] text-gray-600 mt-3 leading-relaxed">
+            Captures the current session's per-category miss breakdown, per-string hit rate, signed timing / pitch error percentiles, settings snapshot, and a capped per-judgment event log — schema <code class="text-gray-500">note_detect.diagnostic.v1</code>. <strong>Reset</strong> zeroes the counters mid-session without disabling Detect — seek to a specific section (arrow keys, or click a label in the highway), hit Reset, play just that section, then Download for a per-section report. Share it back with whoever's tuning your detection (or attach it to a benchmark run).
+        </p>
+    </div>
+
+    </div><!-- /nd-tuning-panels -->
+</div>
+
+<script>
+(function () {
+    // Self-contained: this script runs in the host page's window scope
+    // (not an iframe), so it can call window.noteDetect.* directly. The
+    // singleton may not be ready on first render — retry until it shows
+    // up, then start the periodic refresh.
+
+    const labels = {
+        pure:         ['Pure (no pitch)',  'bg-gray-500'],
+        chordPartial: ['Chord — partial',  'bg-purple-500'],
+        early:        ['Timing — early',   'bg-orange-500'],
+        late:         ['Timing — late',    'bg-orange-500'],
+        sharp:        ['Pitch — sharp',    'bg-cyan-500'],
+        flat:         ['Pitch — flat',     'bg-cyan-500'],
+    };
+
+    function _q(id) { return document.getElementById(id); }
+    function _fmt(n) { return (n == null) ? '—' : String(n); }
+
+    // HTML-escape helper for anything we interpolate into innerHTML.
+    // Song metadata (title/artist/arrangement) comes from user-authored
+    // sloppak manifests, and lastError surfaces server text — both can
+    // contain `<script>` or attribute-breakouts. Cheap five-char escape
+    // is enough for any string we then drop between tags or in single-
+    // quoted attributes.
+    function _esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // Read-only mirror of the most recent save path. The arm / save /
+    // discard controls live in the gear popover, not here, so the
+    // settings page is a between-runs review surface, not a live
+    // recording panel.
+    function renderRecording(nd) {
+        const savedEl = _q('nd-rec-saved');
+        if (!savedEl) return;
+        if (!nd || typeof nd.getRecordingState !== 'function') {
+            savedEl.textContent = 'plugin not loaded.';
+            return;
+        }
+        const r = nd.getRecordingState();
+        if (r.lastError) {
+            savedEl.innerHTML = '<span class="text-red-400">Last save failed: ' + _esc(r.lastError) + '</span>';
+        } else if (r.lastSavePath) {
+            savedEl.innerHTML = 'Latest: <code class="text-gray-300">' + _esc(r.lastSavePath) + '</code>';
+        } else {
+            savedEl.textContent = 'No recording saved this session yet — arm + save from the gear popover.';
+        }
+    }
+
+    // A/V Sync auto-calibrate — always-visible panel. Renders even when
+    // tuning mode is off because it's a general-user calibration tool,
+    // not a dev-only surface.
+    // We key off hit-only timing samples because the all-matched median
+    // is pinned by the matching-window's snap-to-nearest behaviour and
+    // doesn't respond linearly to av-offset; hits-only does. Threshold
+    // is lower than "all events" because hits are scarcer (a player at a
+    // very wrong av-offset may have very few). Iteration is expected:
+    // each Apply usually moves you closer to optimal but rarely lands
+    // it in one shot — converges in 2-3 rounds from a sane starting
+    // point. From a very wrong starting offset, reset to 0 first.
+    const _MIN_HITS_FOR_SUGGESTION = 5;
+    const _MIN_DELTA_TO_SUGGEST_MS = 20;  // smaller skew isn't worth applying
+    const _APPLY_BTN_DEFAULT_LABEL = 'Apply suggested A/V offset';
+    function renderAvCalibrate(nd) {
+        const stateEl = _q('nd-av-state');
+        const curEl   = _q('nd-av-current');
+        const medEl   = _q('nd-av-median');
+        const cntEl   = _q('nd-av-count');
+        const sugEl   = _q('nd-av-suggested');
+        const btn     = _q('nd-av-apply');
+        if (!btn) return;
+        const curAv = (window.highway && typeof window.highway.getAvOffset === 'function')
+            ? Math.round(window.highway.getAvOffset())
+            : null;
+        if (curEl) curEl.textContent = (curAv == null) ? '—' : (curAv >= 0 ? '+' + curAv : String(curAv));
+        if (!nd || typeof nd.getDiagnostic !== 'function') {
+            if (stateEl) stateEl.textContent = 'plugin not loaded';
+            if (medEl) medEl.textContent = '—';
+            if (cntEl) cntEl.textContent = '(0 hits)';
+            if (sugEl) sugEl.textContent = '—';
+            btn.disabled = true;
+            btn.textContent = _APPLY_BTN_DEFAULT_LABEL;
+            return;
+        }
+        const d = nd.getDiagnostic();
+        // Prefer hit-only samples; fall back to all-matched for plugin
+        // builds that don't expose the new field (graceful degrade).
+        const teHits = d.timing_error_ms_hits || d.timing_error_ms || {};
+        const count = teHits.count || 0;
+        const median = (teHits.median != null) ? teHits.median : null;
+        if (cntEl) cntEl.textContent = `(${count} hit${count === 1 ? '' : 's'})`;
+        if (medEl) medEl.textContent = (median == null) ? '—' : (median >= 0 ? '+' + median : String(median));
+        if (count < _MIN_HITS_FOR_SUGGESTION || median == null || curAv == null) {
+            if (sugEl) sugEl.textContent = '—';
+            if (stateEl) stateEl.textContent = count === 0
+                ? 'play a few notes first'
+                : `need ${_MIN_HITS_FOR_SUGGESTION - count} more hit${(_MIN_HITS_FOR_SUGGESTION - count) === 1 ? '' : 's'}`;
+            btn.disabled = true;
+            btn.textContent = _APPLY_BTN_DEFAULT_LABEL;
+            return;
+        }
+        // Sign math: timingError = (judgedAt − chartTime) × 1000, where
+        // judgedAt = audioT + avOffsetSec − latencyOffset. For a true hit
+        // (not a wrong-note snap), positive median = playing late, so we
+        // subtract the median to drive future te toward zero:
+        // avOffset_new = avOffset_cur − median.
+        const suggested = Math.max(-1000, Math.min(1000, curAv - median));
+        if (sugEl) sugEl.textContent = (suggested >= 0 ? '+' + suggested : String(suggested));
+        if (stateEl) stateEl.textContent = `ready — ${count} hits`;
+        const delta = Math.abs(suggested - curAv);
+        btn.disabled = delta < _MIN_DELTA_TO_SUGGEST_MS;
+        btn.textContent = btn.disabled
+            ? `Already within ${_MIN_DELTA_TO_SUGGEST_MS} ms`
+            : `Apply ${suggested >= 0 ? '+' + suggested : suggested} ms`;
+    }
+
+    function render() {
+        const nd = window.noteDetect;
+
+        // Always-visible A/V calibrator (renders even when tuning mode off).
+        renderAvCalibrate(nd);
+
+        // Tuning-mode gate. Off by default → just the toggle is visible;
+        // the Reference Recording + Diagnostic panels stay hidden. The
+        // checkbox state is sourced from the plugin singleton (not the
+        // DOM) so it stays in sync if some other surface flips the flag.
+        const tuning = !!(nd && typeof nd.isTuningMode === 'function' && nd.isTuningMode());
+        const cb     = _q('nd-tuning-mode');
+        const panels = _q('nd-tuning-panels');
+        if (cb && cb.checked !== tuning) cb.checked = tuning;
+        if (cb) cb.disabled = !nd;
+        if (panels) panels.classList.toggle('hidden', !tuning);
+        if (!tuning) return;   // nothing else to render — panels are hidden
+
+        renderRecording(nd);
+
+        const ready = !!(nd && typeof nd.getDiagnostic === 'function');
+        const btn = _q('nd-diag-download');
+        const rsBtn = _q('nd-diag-reset');
+        const state = _q('nd-diag-state');
+        if (!ready) {
+            if (state) state.textContent = 'plugin not loaded';
+            if (btn) btn.disabled = true;
+            if (rsBtn) rsBtn.disabled = true;
+            return;
+        }
+        const d = nd.getDiagnostic();
+        const total = d.summary.total || 0;
+        const enabled = !!(nd.isEnabled && nd.isEnabled());
+
+        if (state) state.textContent = total === 0
+            ? (enabled ? 'detecting — no judgments yet' : 'no data yet')
+            : `${total} judgments${enabled ? ' (live)' : ''}`;
+        if (btn) btn.disabled = total === 0;
+        if (rsBtn) rsBtn.disabled = total === 0;
+
+        _q('nd-diag-acc').textContent = total > 0 ? Math.round(d.summary.accuracy * 100) + '%' : '—';
+        _q('nd-diag-acc').className = total === 0
+            ? 'font-bold text-gray-400'
+            : (d.summary.accuracy >= 0.9 ? 'font-bold text-green-400'
+               : d.summary.accuracy >= 0.7 ? 'font-bold text-yellow-400'
+               : 'font-bold text-red-400');
+        _q('nd-diag-hits').textContent = d.summary.hits;
+        _q('nd-diag-misses').textContent = d.summary.misses;
+
+        // Breakdown bars (only categories with > 0 events).
+        const bk = _q('nd-diag-breakdown');
+        if (bk) {
+            const ms = d.summary.misses;
+            if (ms === 0) {
+                bk.innerHTML = total === 0
+                    ? '<div class="text-[10px] text-gray-600">Run a song with Detect on to populate this.</div>'
+                    : '<div class="text-[10px] text-gray-600">No misses yet — clean run so far.</div>';
+            } else {
+                let html = '<div class="text-gray-400 mb-1">Miss breakdown:</div>';
+                for (const k of Object.keys(labels)) {
+                    const v = d.miss_breakdown[k] || 0;
+                    if (v === 0) continue;
+                    const pct = Math.round((v / ms) * 100);
+                    html += `
+                        <div class="flex items-center gap-2">
+                            <span class="w-28 text-gray-300">${labels[k][0]}</span>
+                            <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
+                                <div class="${labels[k][1]} h-full rounded" style="width:${pct}%"></div>
+                            </div>
+                            <span class="w-14 text-right text-gray-400">${v} <span class="text-gray-600">(${pct}%)</span></span>
+                        </div>`;
+                }
+                bk.innerHTML = html;
+            }
+        }
+
+        // Metadata footer — song + tunables — handy when sharing the JSON.
+        const meta = _q('nd-diag-meta');
+        if (meta) {
+            const bh = d.benchmark_hint || {};
+            const s = d.settings || {};
+            // Song metadata is user-controlled (sloppak manifests can
+            // contain anything), so every interpolation through this
+            // path is escaped. Numeric fields are coerced via Number
+            // before stringifying so even if a manifest puts an HTML
+            // string in `pitch_tolerance_cents` we don't render it raw.
+            const songLine = (bh.title || bh.artist)
+                ? `${_esc(bh.artist || '?')} — ${_esc(bh.title || '?')}` + (bh.arrangement ? ` (${_esc(bh.arrangement)})` : '')
+                : 'no song loaded';
+            const tp = (d.timing_error_ms && d.timing_error_ms.median != null)
+                ? `timing med ${Number(d.timing_error_ms.median)} ms` : null;
+            const pp = (d.pitch_error_cents && d.pitch_error_cents.median != null)
+                ? `pitch med ${Number(d.pitch_error_cents.median)}¢` : null;
+            const tail = [tp, pp].filter(Boolean).join(' · ');
+            const method = _esc(s.method || '?');
+            const pitchTol = Number(s.pitch_tolerance_cents) || 0;
+            const chordPct = Math.round((Number(s.chord_hit_ratio) || 0) * 100);
+            meta.innerHTML = `${songLine}<br>method <code class="text-gray-500">${method}</code> · pitch tol ${pitchTol}¢ · chord lenience ${chordPct}%${tail ? '<br>' + tail : ''}`;
+        }
+    }
+
+    const dlBtn = _q('nd-diag-download');
+    if (dlBtn) {
+        dlBtn.onclick = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.downloadDiagnostic === 'function') nd.downloadDiagnostic();
+        };
+    }
+    const rsBtn = _q('nd-diag-reset');
+    if (rsBtn) {
+        rsBtn.onclick = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.resetDiagnostic === 'function') {
+                nd.resetDiagnostic();
+                render();   // immediate visual feedback that the counters cleared
+            }
+        };
+    }
+    const rfBtn = _q('nd-diag-refresh');
+    if (rfBtn) rfBtn.onclick = render;
+
+    // A/V Sync auto-calibrate — apply the suggestion. setAvOffsetMs is
+    // the global setter from app.js; it persists + drives the highway
+    // render shift + updates the main Settings slider in one call.
+    const avBtn = _q('nd-av-apply');
+    if (avBtn) {
+        avBtn.onclick = () => {
+            if (avBtn.disabled) return;
+            const nd = window.noteDetect;
+            if (!nd || typeof nd.getDiagnostic !== 'function'
+                || !window.highway || typeof window.highway.getAvOffset !== 'function'
+                || typeof window.setAvOffsetMs !== 'function') return;
+            const dg = nd.getDiagnostic();
+            const te = dg.timing_error_ms_hits || dg.timing_error_ms || {};
+            if (te.median == null || (te.count || 0) < _MIN_HITS_FOR_SUGGESTION) return;
+            const curAv = Math.round(window.highway.getAvOffset());
+            const next = Math.max(-1000, Math.min(1000, curAv - te.median));
+            window.setAvOffsetMs(next);
+            // Wipe accumulated timing samples so the next suggestion
+            // reflects the new offset, not a stale mix of both regimes.
+            // Use the narrower resetCalibrationSamples() instead of the
+            // full resetDiagnostic — clearing the user's hit/miss
+            // counters + streak + event log when they only wanted to
+            // tweak A/V offset was surprising. Falls back to the
+            // broader reset on older plugin builds that don't expose
+            // the narrower API.
+            if (typeof nd.resetCalibrationSamples === 'function') {
+                nd.resetCalibrationSamples();
+            } else if (typeof nd.resetDiagnostic === 'function') {
+                nd.resetDiagnostic();
+            }
+            render();
+        };
+    }
+
+    // Tuning-mode toggle — drives whether the panels below show.
+    const tuneCb = _q('nd-tuning-mode');
+    if (tuneCb) {
+        tuneCb.onchange = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.setTuningMode === 'function') nd.setTuningMode(tuneCb.checked);
+            render();
+        };
+    }
+
+    // (Recording buttons moved to the gear popover — this page is the
+    // read-only "latest save path" mirror, no click handlers.)
+
+    render();
+    // Auto-refresh while the section is in the DOM. Self-cancels once
+    // the diagnostic block leaves the page so we don't keep ticking
+    // forever after the user navigates away from Settings. Probe the
+    // smallest stable anchor in our section (the tuning-mode checkbox
+    // — always present) instead of any conditional element.
+    const _tickId = setInterval(() => {
+        if (!document.getElementById('nd-tuning-mode')) {
+            clearInterval(_tickId);
+            return;
+        }
+        render();
+    }, 1500);
+})();
+</script>
