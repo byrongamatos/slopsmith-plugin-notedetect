@@ -193,7 +193,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.8.0';
+const _ND_VERSION = '1.8.1';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -4015,6 +4015,85 @@ function createNoteDetector(options = {}) {
         drillSubscribed = true;
     }
 
+    // ── Chart state sync ─────────────────────────────────────────────
+    //
+    // `currentArrangement` / `currentStringCount` / `tuningOffsets` /
+    // `capo` are read on every match/miss frame to map (string, fret)
+    // → MIDI. They live in the factory closure and used to be set ONLY
+    // inside enable(), inline, with conditional assignments — each
+    // field only updated if the corresponding `info.*` was present.
+    //
+    // That left a stale-state hole: if a previous song (e.g. a bass
+    // arrangement) had set currentArrangement='bass', and a new song
+    // loaded with `info.arrangement` briefly falsy / null at enable
+    // time, the `if (info && info.arrangement)` line wouldn't fire
+    // and the bass arrangement carried over into a guitar chart. The
+    // smoking-gun symptom in real-session diagnostics: strings 4-5 of
+    // a 6-string guitar chart show 0/N hits with `expectedMidi: null`
+    // (because the 4-string bass MIDI base array has no entries at
+    // [4] / [5]), and strings 0-3 score wildly off-pitch because
+    // they're being compared against bass-octave MIDI values.
+    //
+    // Fixes here:
+    //   1) Reset to a known-good 6-string-guitar default BEFORE
+    //      reading info, so a partial / missing payload can't leave
+    //      stale fields in place.
+    //   2) Wire `song:loaded` + `arrangement:changed` listeners so
+    //      mid-session song or arrangement switches re-sync state
+    //      instead of waiting for the next enable() (which may never
+    //      come if Detect was left on).
+    function _syncChartStateFromHw() {
+        currentArrangement = 'guitar';
+        currentStringCount = 6;
+        tuningOffsets = [0, 0, 0, 0, 0, 0];
+        capo = 0;
+        const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : null;
+        if (!info) return;
+        if (info.arrangement) currentArrangement = _ndArrangementKindFromName(info.arrangement);
+        if (Array.isArray(info.tuning)) {
+            tuningOffsets = info.tuning;
+            // Slopsmith core exposes the arrangement string count directly.
+            // Prefer it over tuning.length because RS XML pads bass tunings
+            // to six entries; fall back to tuning length for older cores.
+            const stringCount = hw && hw.getStringCount ? hw.getStringCount() : undefined;
+            currentStringCount = Number.isFinite(stringCount)
+                ? stringCount
+                : tuningOffsets.length;
+        }
+        if (Number.isFinite(info.capo)) capo = info.capo;
+    }
+
+    let _chartStateSubscribed = false;
+    let _chartStateOnChange = null;
+    function _chartStateBindEvents() {
+        if (_chartStateSubscribed) return;
+        if (!window.slopsmith
+            || typeof window.slopsmith.on !== 'function'
+            || typeof window.slopsmith.off !== 'function') return;
+        const onChange = () => { _syncChartStateFromHw(); };
+        try {
+            window.slopsmith.on('song:loaded',          onChange);
+            window.slopsmith.on('arrangement:changed',  onChange);
+        } catch (e) {
+            if (typeof window.slopsmith.off === 'function') {
+                try { window.slopsmith.off('song:loaded',         onChange); } catch (_) {}
+                try { window.slopsmith.off('arrangement:changed', onChange); } catch (_) {}
+            }
+            return;
+        }
+        _chartStateOnChange = onChange;
+        _chartStateSubscribed = true;
+    }
+    function _chartStateUnbindEvents() {
+        if (!_chartStateSubscribed) return;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function' && _chartStateOnChange) {
+            try { window.slopsmith.off('song:loaded',         _chartStateOnChange); } catch (_) {}
+            try { window.slopsmith.off('arrangement:changed', _chartStateOnChange); } catch (_) {}
+        }
+        _chartStateOnChange = null;
+        _chartStateSubscribed = false;
+    }
+
     function _drillUnbindEvents() {
         if (!drillSubscribed) return;
         // destroy() calls this on teardown — a misbehaving host
@@ -4258,27 +4337,8 @@ function createNoteDetector(options = {}) {
         attachInstanceRoot();
         updateButton();
 
-        const info = hw.getSongInfo ? hw.getSongInfo() : null;
-        if (info && info.tuning) {
-            tuningOffsets = info.tuning;
-            // Slopsmith core exposes the arrangement string count directly.
-            // Prefer it over tuning.length because RS XML pads bass tunings
-            // to six entries; fall back to tuning length for older cores.
-            const stringCount = hw.getStringCount ? hw.getStringCount() : undefined;
-            currentStringCount = Number.isFinite(stringCount)
-                ? stringCount
-                : tuningOffsets.length;
-        } else {
-            // No tuning info — reset to 6-string zero-offset default.
-            // Reassign to a fresh array rather than mutate in place: the
-            // current `tuningOffsets` reference may point at the previous
-            // song's `info.tuning` (assigned in the `if` branch above), so
-            // `.length = 6 / .fill(0)` would clobber the highway's data.
-            currentStringCount = 6;
-            tuningOffsets = [0, 0, 0, 0, 0, 0];
-        }
-        if (info && info.capo !== undefined) capo = info.capo;
-        if (info && info.arrangement) currentArrangement = _ndArrangementKindFromName(info.arrangement);
+        _syncChartStateFromHw();
+        _chartStateBindEvents();
 
         resetScoring();
 
@@ -4384,6 +4444,7 @@ function createNoteDetector(options = {}) {
         // on re-enable); destroy is the right teardown point.
         _drillUnbindEvents();
         _endOfSongUnbindEvents();
+        _chartStateUnbindEvents();
         _recUnbindEvents();
         _liveUnbindEvents();
         // Discard any unsaved recording state — destroying the instance
