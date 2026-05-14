@@ -193,17 +193,11 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.8.2';
+const _ND_VERSION = '1.9.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
-// ScriptProcessor buffer size. The YIN analysis buffer is a separate
-// _ND_MIN_YIN_SAMPLES (4096) that accumulates across callbacks, so
-// shrinking the audio-callback granularity here doesn't reduce
-// detection resolution — it only halves the input-side buffering
-// latency (1024/48000 ≈ 21 ms vs 2048/48000 ≈ 43 ms). Matches the
-// headless harness's default --frame-size.
-const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size
+const _ND_FRAME_SIZE = 2048;       // ScriptProcessor buffer size
 
 // Tuning tables — standard-tuning MIDI base per (arrangement, stringCount).
 //
@@ -1215,6 +1209,15 @@ function createNoteDetector(options = {}) {
     // string strums. Users who want stricter scoring can raise via
     // the slider.
     let chordHitRatio = 0.40;
+    // Minimum YIN/HPS/CREPE confidence to accept a detection. Below
+    // this, the per-frame result is discarded and the note retires
+    // as a "pure" miss. Previously hardcoded to 0.30 at every gate
+    // (5 sites in this file); real-rig diagnostics on a healthy
+    // signal showed ~47% of frames falling below that floor on CREPE
+    // — most of the "pure" miss bucket. Default lowered to 0.20 +
+    // exposed as a UI slider (gear popover) so users with quieter
+    // / noisier signals can tune. Range 0.05–0.50 clamped on load.
+    let detectionConfidenceMin = 0.20;
 
     try {
         const raw = localStorage.getItem(_ND_STORAGE_KEY);
@@ -1251,6 +1254,13 @@ function createNoteDetector(options = {}) {
             // (older build, manual edit) can't put scoring in a state the
             // UI can't represent.
             if (s.chordHitRatio !== undefined) chordHitRatio = Math.max(0.25, Math.min(1, s.chordHitRatio));
+            // Detection confidence floor — clamp to a sensible range.
+            // Below 0.05, even pure noise becomes a "detection"; above
+            // 0.50, even confident YIN/CREPE frames get rejected on
+            // typical guitar signals.
+            if (s.detectionConfidenceMin !== undefined) {
+                detectionConfidenceMin = Math.max(0.05, Math.min(0.50, s.detectionConfidenceMin));
+            }
         }
     } catch (e) { /* localStorage unavailable */ }
 
@@ -1356,6 +1366,7 @@ function createNoteDetector(options = {}) {
                 pitch_tolerance_cents: pitchTolerance,
                 pitch_hit_threshold_cents: pitchHitThreshold,
                 chord_hit_ratio: chordHitRatio,
+                detection_confidence_min: detectionConfidenceMin,
                 latency_offset_s: latencyOffset,
                 input_gain: inputGain,
                 channel: selectedChannel,
@@ -1587,6 +1598,7 @@ function createNoteDetector(options = {}) {
                 inputGain,
                 latencyOffset,
                 chordHitRatio,
+                detectionConfidenceMin,
             }));
         } catch (e) { /* unavailable */ }
     }
@@ -1670,7 +1682,7 @@ function createNoteDetector(options = {}) {
                             const p = await desktop.audio.getPitchDetection();
                             if (!enabled || gen !== sessionGen) return;
                             if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
-                                && typeof p.confidence === 'number' && p.confidence >= 0.3) {
+                                && typeof p.confidence === 'number' && p.confidence >= detectionConfidenceMin) {
                                 detectedMidi = p.midiNote;
                                 detectedConfidence = p.confidence;
                             } else {
@@ -1736,16 +1748,7 @@ function createNoteDetector(options = {}) {
 
             // Acquire the context independently — a caller can supply
             // just one of {stream, context} and we create the other.
-            // `latencyHint: 'interactive'` asks the browser for the
-            // lowest-latency input/output config the platform supports —
-            // Chromium otherwise picks platform-defaults that can add
-            // 10-30 ms of buffer for no reason. Real-time pitch-detect
-            // is exactly the case the hint exists for. Falls back
-            // gracefully if a host hands us an externalAudioCtx that's
-            // already constructed.
-            audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)({
-                latencyHint: 'interactive',
-            });
+            audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
 
             sourceNode = audioCtx.createMediaStreamSource(stream);
             const streamChannels = sourceNode.channelCount;
@@ -2083,7 +2086,7 @@ function createNoteDetector(options = {}) {
                 if (_ndShared.model) {
                     result = await _ndCrepeDetect(buffer);
                     detectorUsed = 'crepe';
-                    if (result.freq <= 0 || result.confidence < 0.3) {
+                    if (result.freq <= 0 || result.confidence < detectionConfidenceMin) {
                         result = _ndYinDetect(buffer, sr);
                         detectorUsed = 'yin';
                     }
@@ -2107,7 +2110,7 @@ function createNoteDetector(options = {}) {
         // floor — don't touch detection state or fire events.
         if (!enabled || gen !== sessionGen) return;
 
-        if (result.freq <= 0 || result.confidence < 0.3) {
+        if (result.freq <= 0 || result.confidence < detectionConfidenceMin) {
             if (result.underBuffered && !underBufferWarned) {
                 console.warn(`[note_detect] ${detectorUsed} received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.`);
                 underBufferWarned = true;
@@ -2247,7 +2250,7 @@ function createNoteDetector(options = {}) {
     function _sustainStillHeld(key, note) {
         const nowMs = (typeof performance !== 'undefined' && performance.now)
             ? performance.now() : Date.now();
-        if (detectedMidi >= 0 && detectedConfidence > 0.3) {
+        if (detectedMidi >= 0 && detectedConfidence > detectionConfidenceMin) {
             const expectedMidi = _ndMidiFromStringFret(
                 note.s, note.f, currentArrangement, currentStringCount, tuningOffsets, capo
             );
@@ -3255,6 +3258,13 @@ function createNoteDetector(options = {}) {
             <input type="range" min="5" max="${pitchTolerance}" value="${pitchHitThreshold}"
                    class="nd-pitch-hit-slider w-full accent-blue-400 mb-3">
 
+            <label class="block text-gray-400 text-xs mb-1">Detection Confidence: <span class="nd-conf-val">${Math.round(detectionConfidenceMin * 100)}</span>%</label>
+            <input type="range" min="5" max="50" value="${Math.round(detectionConfidenceMin * 100)}"
+                   class="nd-conf-slider w-full accent-purple-400 mb-2">
+            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+                Minimum confidence to accept a YIN/HPS/CREPE frame. Lower this if too many notes register as "pure miss" with no detection — at the cost of more false positives on quiet/noisy signals.
+            </div>
+
             <label class="flex items-center gap-2 text-gray-400 text-xs mb-2">
                 <input type="checkbox" class="nd-show-timing accent-green-400" ${showTimingErrors ? 'checked' : ''}>
                 Show early/late labels
@@ -3401,6 +3411,12 @@ function createNoteDetector(options = {}) {
         panel.querySelector('.nd-pitch-hit-slider').oninput = (e) => {
             pitchHitThreshold = +e.target.value;
             panel.querySelector('.nd-pitch-hit-val').textContent = e.target.value;
+            saveSettings();
+        };
+        panel.querySelector('.nd-conf-slider').oninput = (e) => {
+            // Slider is in percent (5-50); state is the 0.05-0.50 fraction.
+            detectionConfidenceMin = (+e.target.value) / 100;
+            panel.querySelector('.nd-conf-val').textContent = e.target.value;
             saveSettings();
         };
         panel.querySelector('.nd-show-timing').onchange = (e) => {
@@ -3580,7 +3596,7 @@ function createNoteDetector(options = {}) {
         }
 
         if (detectedEl) {
-            if (detectedString >= 0 && detectedConfidence > 0.3) {
+            if (detectedString >= 0 && detectedConfidence > detectionConfidenceMin) {
                 // Use the chart-corrected display MIDI when available;
                 // otherwise use the raw detected MIDI. Bass, 7-string guitar,
                 // non-standard tuning, and capo all still route through the
@@ -3791,7 +3807,7 @@ function createNoteDetector(options = {}) {
             }
         }
 
-        if (detectedString >= 0 && detectedConfidence > 0.3) {
+        if (detectedString >= 0 && detectedConfidence > detectionConfidenceMin) {
             if (nowPoint) {
                 const x = hw.fretX(detectedFret, nowPoint.scale, W);
                 const y = nowPoint.y * H;
@@ -4565,6 +4581,7 @@ function createNoteDetector(options = {}) {
                 pitch_tolerance_cents: pitchTolerance,
                 pitch_hit_threshold_cents: pitchHitThreshold,
                 chord_hit_ratio: chordHitRatio,
+                detection_confidence_min: detectionConfidenceMin,
                 latency_offset_s: latencyOffset,
                 input_gain: inputGain,
                 channel: selectedChannel,
@@ -5057,6 +5074,51 @@ function createNoteDetector(options = {}) {
         downloadDiagnostic: _downloadDiagnostic,
         getDiagnostic: _buildDiagnosticPayload,
         resetDiagnostic: resetScoring,
+        // Public setter for the Auto-tune-from-session panel — applies
+        // a partial settings object with the same clamps the storage
+        // loader uses, then persists via saveSettings(). Each field is
+        // optional; unknown / non-finite values are ignored so callers
+        // can pass only the rows they want to apply. Returns the
+        // post-clamp object so the caller can update the UI without a
+        // separate get round-trip.
+        applySettings: (partial) => {
+            partial = partial || {};
+            if (typeof partial.method === 'string' && ['yin', 'hps', 'crepe'].includes(partial.method)) {
+                detectionMethod = partial.method;
+            }
+            if (Number.isFinite(partial.timingTolerance)) {
+                timingTolerance = Math.max(0.03, Math.min(0.3, partial.timingTolerance));
+            }
+            if (Number.isFinite(partial.pitchTolerance)) {
+                pitchTolerance = Math.max(10, Math.min(100, partial.pitchTolerance));
+            }
+            if (Number.isFinite(partial.timingHitThreshold)) {
+                timingHitThreshold = Math.max(0.03, Math.min(timingTolerance, partial.timingHitThreshold));
+            }
+            if (Number.isFinite(partial.pitchHitThreshold)) {
+                pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, partial.pitchHitThreshold));
+            }
+            if (Number.isFinite(partial.chordHitRatio)) {
+                chordHitRatio = Math.max(0.25, Math.min(1, partial.chordHitRatio));
+            }
+            if (Number.isFinite(partial.detectionConfidenceMin)) {
+                detectionConfidenceMin = Math.max(0.05, Math.min(0.50, partial.detectionConfidenceMin));
+            }
+            if (Number.isFinite(partial.latencyOffset)) {
+                latencyOffset = partial.latencyOffset;
+            }
+            saveSettings();
+            return {
+                method: detectionMethod,
+                timingTolerance,
+                pitchTolerance,
+                timingHitThreshold,
+                pitchHitThreshold,
+                chordHitRatio,
+                detectionConfidenceMin,
+                latencyOffset,
+            };
+        },
         // Narrower reset for A/V calibrate — clears only the timing
         // samples that feed the next calibration suggestion, leaving
         // hits/misses/streak/sectionStats/eventLog intact. Use this
@@ -5101,36 +5163,6 @@ function createNoteDetector(options = {}) {
         discardRecording,
         saveRecordingNow,
         getRecordingState,
-        // Diagnostic accessor — surfaces the AudioContext's own
-        // latency self-report. Both fields describe the *output/render*
-        // side of the graph, not the microphone-capture path:
-        //   - `baseLatency` is the processing latency the AudioContext
-        //     incurs while rendering audio (typically a render quantum
-        //     or two of buffering on the output side). It is NOT a
-        //     measured input-capture delay and does NOT include the
-        //     ScriptProcessor frame buffering on top of it.
-        //   - `outputLatency` is the total downstream latency from the
-        //     destination node to actually-audible — also output-side.
-        // For input-chain latency you have to combine these with the
-        // ScriptProcessor frame size and the OS capture buffer (which
-        // the browser does not expose). What this accessor IS good for:
-        // verifying that the `latencyHint: 'interactive'` opt-in
-        // produced a smaller `baseLatency` than the platform default
-        // (a useful proxy for "the browser took the hint"). Returns
-        // null when audio hasn't been started yet (enable() not yet
-        // called or running in the desktop-bridge path that doesn't
-        // own an AudioContext).
-        getAudioLatencyInfo: () => {
-            if (!audioCtx) return null;
-            return {
-                baseLatency:   Number.isFinite(audioCtx.baseLatency)   ? audioCtx.baseLatency   : null,
-                outputLatency: Number.isFinite(audioCtx.outputLatency) ? audioCtx.outputLatency : null,
-                sampleRate:    audioCtx.sampleRate,
-                frameSize:     _ND_FRAME_SIZE,
-                yinBufferSize: _ND_MIN_YIN_SAMPLES,
-                state:         audioCtx.state,
-            };
-        },
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
