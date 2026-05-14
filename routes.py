@@ -16,18 +16,23 @@ POST /api/plugins/note_detect/live-judgment
     play has zero overhead. Each line is a self-contained record —
     safe to tail / read partially / replay.
 
-Both endpoints write under ``static/note_detect_recordings/`` (the
-slopsmith static tree, bind-mounted in the dev container). That means
-contributors on the host see the files appear in real time without
-docker cp / drag-and-drop. The directory is created on demand.
+Both endpoints write under ``<static>/note_detect_recordings/``, where
+``<static>`` is resolved as ``$STATIC_DIR`` (set by native uvicorn
+launches and the desktop bundle) and falls back to ``/app/static``
+(the in-container bind mount). The directory is created lazily on the
+first write so route registration can never fail on a host where the
+static tree doesn't exist yet — the route stays mounted, and a real
+filesystem problem turns into a clean 500 on save.
 
 We deliberately don't write to ``config_dir`` here even though it's the
 "correct" home for plugin state — config_dir is a named Docker volume in
 the dev compose, so the host can't reach files inside it from outside
-the container. ``static/`` IS bind-mounted, which is what we need.
+the container. The static tree IS bind-mounted (or repo-relative on
+native / desktop runs), which is what we need.
 """
 
 import json
+import os
 import re
 import secrets
 import time
@@ -75,8 +80,31 @@ def _sanitize_slug(s: str, default: str = "recording") -> str:
 
 def setup(app, context):
     log = context["log"]
-    out_dir = Path("/app/static") / _RECORDINGS_REL
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Resolve the slopsmith static tree from $STATIC_DIR (set by native
+    # uvicorn launches that don't see the Docker `/app` mount) and fall
+    # back to the in-container path so this keeps working in compose.
+    # The mkdir is deferred to the request handler so a missing/un-
+    # writable static dir at plugin-load time can't take down route
+    # registration — `_api/plugins/note_detect/recording` would 404 and
+    # the in-app save would silently fail.
+    static_dir = Path(os.environ.get("STATIC_DIR", "/app/static"))
+    out_dir = static_dir / _RECORDINGS_REL
+
+    def _ensure_out_dir() -> Path:
+        # Resolve + create on every request rather than at setup() time
+        # so the handlers behave the same in Docker, native uvicorn, and
+        # the desktop bundle — each of which surfaces the static tree at
+        # a different path. mkdir is idempotent (`exist_ok=True`), and
+        # an un-writable directory turns into a clean 500 from the
+        # caller rather than a load-time crash that 404s the route.
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise HTTPException(
+                500,
+                f"could not create recordings directory ({out_dir}): {e}",
+            )
+        return out_dir
 
     @app.post("/api/plugins/note_detect/recording")
     async def save_recording(request: Request):
@@ -102,7 +130,7 @@ def setup(app, context):
         ms = int((now - int(now)) * 1000)
         suffix = secrets.token_hex(3)
         filename = f"note_detect_{slug}_{ts}_{ms:03d}_{suffix}.wav"
-        path = out_dir / filename
+        path = _ensure_out_dir() / filename
         # Use a `.tmp` then rename so a crashed write doesn't leave a
         # truncated WAV that the harness might pick up next time.
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -148,7 +176,7 @@ def setup(app, context):
             raise HTTPException(400, "judgment body must be a JSON object")
 
         session = _sanitize_slug(request.query_params.get("session", "default"), default="default")
-        path = out_dir / f"live_{session}.jsonl"
+        path = _ensure_out_dir() / f"live_{session}.jsonl"
 
         # Hard cap on file size — refuse the append rather than truncating
         # existing data, so a buggy client can't lose history. NOTE: the
