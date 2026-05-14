@@ -87,7 +87,7 @@ def setup(app, context):
     # writable static dir at plugin-load time can't take down route
     # registration — `/api/plugins/note_detect/recording` would 404 and
     # the in-app save would silently fail.
-    static_dir = Path(os.environ.get("STATIC_DIR", "/app/static"))
+    static_dir = Path(os.environ.get("STATIC_DIR") or "/app/static")
     out_dir = static_dir / _RECORDINGS_REL
 
     def _ensure_out_dir() -> Path:
