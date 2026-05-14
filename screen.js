@@ -3143,7 +3143,9 @@ function createNoteDetector(options = {}) {
         if (panel) { panel.remove(); return; }
 
         panel = document.createElement('div');
-        panel.className = 'nd-settings-panel fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 shadow-2xl text-sm';
+        // Bound panel height to available viewport space below `top-16`
+        // (with a small bottom gap) and let the panel scroll internally.
+        panel.className = 'nd-settings-panel fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 max-h-[calc(100vh-4rem-1rem)] overflow-y-auto shadow-2xl text-sm';
         panel.style.pointerEvents = 'auto';
         panel.innerHTML = `
             <div class="flex justify-between items-center mb-3">
