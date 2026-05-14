@@ -378,7 +378,11 @@ async function main() {
     // arithmetic vs production). Crossing a 0.1 s boundary fires
     // exactly one tick.
     const TICK_INTERVAL_S = 0.1;
-    let nextTickT = 0;
+    // Match production: checkMisses fires AFTER its first 100 ms wait
+    // (setInterval starts the clock on enable). Starting at 0 would
+    // tick at t=0 because `currentTimeS >= nextTickT` is immediately
+    // true — schedule the first tick at TICK_INTERVAL_S instead.
+    let nextTickT = TICK_INTERVAL_S;
 
     for (let i = 0; i < totalFrames; i++) {
         currentTimeS = (i * frameSize) / sampleRate;

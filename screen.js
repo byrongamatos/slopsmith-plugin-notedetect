@@ -868,19 +868,17 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
     // showed ~50% of misses landing in exactly this 1-2-of-N regime,
     // while having clean timing and ringing the root every time.
     //
-    // Add a parallel hit path: the chord ALSO counts as a hit if the
-    // chart's lowest string (the bass note / root, by convention for
-    // every common rhythm-guitar voicing) rang AND at least one OTHER
-    // chord string rang. This rewards the voicing-reduction style
-    // without rewarding random-string noise:
-    //   • Single string alone (root only) → still a miss
-    //   • Any 2 strings WITHOUT the root → still a miss
-    //   • Root + any 1+ other → hit
+    // Add a parallel hit path: the chord ALSO counts as a hit if at
+    // least 2 of the chord's strings rang at their expected pitches
+    // (pitch-verified, not energy-only). This rewards reduced
+    // voicings without rewarding random-string noise:
+    //   • Single string alone → still a miss
+    //   • Any ≥2 pitch-verified chord strings (in any combination) → hit
     //   • Full voicing → hit via ratio (the original path)
     //
     // Strict players who want "all strings must ring" can dial cr up
-    // to 1.0; voicing-reduction is gated on the chord's expected bass
-    // note specifically and won't trip on incidental string noise.
+    // to 1.0. The pitch-verified gate (vs. raw energy) keeps incidental
+    // noise from tripping the rescue path.
     //
     // Surface `voicingHit` separately from `isHit` so analytics /
     // diagnostics can see WHY a chord was credited.
@@ -1194,7 +1192,7 @@ function createNoteDetector(options = {}) {
     // Fraction of a chord's strings that must register energy for the
     // chord to count as a hit (0.0–1.0). Was 0.6 historically, but
     // harness measurements against real-guitar recordings showed
-    // chord scoring scoring near 0/16 at that gate even for clean
+    // chord scoring near 0/16 at that gate even for clean
     // playing. Dropping to 0.40 lets typical open/power-chord
     // voicings score multi-string hits without rewarding single-
     // string strums. Users who want stricter scoring can raise via
@@ -2753,12 +2751,12 @@ function createNoteDetector(options = {}) {
                     //
                     //   • voicingHit — STICKY. Once ANY frame in this
                     //     chord's window registered as voicing-eligible
-                    //     (bass + ≥1 other, verified pitch), remember
-                    //     it forever for this chord. A subsequent frame
-                    //     where the bass momentarily failed pitch (the
-                    //     bass note decayed below threshold while the
-                    //     rest still rang, audio bleed shifted things,
-                    //     etc.) MUST NOT retroactively cancel a
+                    //     (≥2 chord strings rang at their expected
+                    //     pitches), remember it forever for this chord.
+                    //     A subsequent frame where some of those strings
+                    //     momentarily failed pitch (decay below threshold
+                    //     while the rest still rang, audio bleed shifted
+                    //     things, etc.) MUST NOT retroactively cancel a
                     //     previously-eligible voicing. Earlier logic
                     //     here had a "higher score wins" rule that
                     //     accidentally demoted voicingHit:true frames
@@ -2970,8 +2968,8 @@ function createNoteDetector(options = {}) {
                 const cachedChord = _chordLastResult.get(chordKey);
                 // Voicing-reduction rescue: if matchNotes never found a
                 // strict-ratio frame but the chord was voicing-eligible
-                // at some point (`bass + ≥1 other` with verified bass
-                // pitch), record this retire as a HIT instead of a miss.
+                // at some point (≥2 chord strings rang at their expected
+                // pitches), record this retire as a HIT instead of a miss.
                 // This is the "punk-rock power-chord interpretation of a
                 // full-chord chart" path — see _ndScoreChord for the
                 // detailed rationale and the trade-off vs eager-commit
@@ -4504,10 +4502,12 @@ function createNoteDetector(options = {}) {
                 saveRecordingNow().catch(() => {});
             } else if (_recArmed) {
                 // Armed but never captured anything (Detect was off, or
-                // song:play never fired). Disarm so the next song doesn't
-                // start an unintended recording.
+                // song:play never fired). Disarm + release the bus
+                // listeners so the next song doesn't start an unintended
+                // recording and we don't keep flipping _recSongPlaying.
                 _recArmed = false;
                 _recLastSaveError = 'no audio captured before song:ended';
+                _recUnbindEvents();
             }
         };
         try {

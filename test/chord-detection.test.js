@@ -250,10 +250,12 @@ test('scoreChord: harmonic flag bypasses pitch check so off-pitch in-band energy
 // playing power-chord voicings (root + fifth on the bottom 2 strings)
 // of full-chord charts and scoring "miss" because score = 2/6 = 0.33 fell
 // below the default cr = 0.40. The voicing-reduction path in
-// _ndScoreChord credits those as hits when the bass string's pitch is
-// verified AND at least one other chord string rings. These tests pin
-// the conditions: hit when bass + ≥1 other; miss when bass alone or
-// non-bass-only; off when pitch checking is disabled (energy-only path).
+// _ndScoreChord credits those as hits whenever ≥2 of the chord's
+// strings ring at their expected pitches — no bass requirement, so
+// non-bass two-string combinations (e.g. string skipping or muted-root
+// strums) also qualify. These tests pin the conditions: hit on any
+// 2 pitch-verified chord strings; miss on a single string alone; off
+// when pitch checking is disabled (energy-only path).
 
 function _summed(amps) {
     // Sum multiple sine() outputs into one buffer (truncate to shortest).

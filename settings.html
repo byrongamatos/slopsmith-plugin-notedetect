@@ -197,6 +197,7 @@
     // point. From a very wrong starting offset, reset to 0 first.
     const _MIN_HITS_FOR_SUGGESTION = 5;
     const _MIN_DELTA_TO_SUGGEST_MS = 20;  // smaller skew isn't worth applying
+    const _APPLY_BTN_DEFAULT_LABEL = 'Apply suggested A/V offset';
     function renderAvCalibrate(nd) {
         const stateEl = _q('nd-av-state');
         const curEl   = _q('nd-av-current');
@@ -215,6 +216,7 @@
             if (cntEl) cntEl.textContent = '(0 hits)';
             if (sugEl) sugEl.textContent = '—';
             btn.disabled = true;
+            btn.textContent = _APPLY_BTN_DEFAULT_LABEL;
             return;
         }
         const d = nd.getDiagnostic();
@@ -231,6 +233,7 @@
                 ? 'play a few notes first'
                 : `need ${_MIN_HITS_FOR_SUGGESTION - count} more hit${(_MIN_HITS_FOR_SUGGESTION - count) === 1 ? '' : 's'}`;
             btn.disabled = true;
+            btn.textContent = _APPLY_BTN_DEFAULT_LABEL;
             return;
         }
         // Sign math: timingError = (judgedAt − chartTime) × 1000, where
