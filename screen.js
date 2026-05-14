@@ -197,7 +197,13 @@ const _ND_VERSION = '1.7.1';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
-const _ND_FRAME_SIZE = 2048;       // ScriptProcessor buffer size
+// ScriptProcessor buffer size. The YIN analysis buffer is a separate
+// _ND_MIN_YIN_SAMPLES (4096) that accumulates across callbacks, so
+// shrinking the audio-callback granularity here doesn't reduce
+// detection resolution — it only halves the input-side buffering
+// latency (1024/48000 ≈ 21 ms vs 2048/48000 ≈ 43 ms). Matches the
+// headless harness's default --frame-size.
+const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size
 
 // Tuning tables — standard-tuning MIDI base per (arrangement, stringCount).
 //
@@ -1722,7 +1728,16 @@ function createNoteDetector(options = {}) {
 
             // Acquire the context independently — a caller can supply
             // just one of {stream, context} and we create the other.
-            audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
+            // `latencyHint: 'interactive'` asks the browser for the
+            // lowest-latency input/output config the platform supports —
+            // Chromium otherwise picks platform-defaults that can add
+            // 10-30 ms of buffer for no reason. Real-time pitch-detect
+            // is exactly the case the hint exists for. Falls back
+            // gracefully if a host hands us an externalAudioCtx that's
+            // already constructed.
+            audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)({
+                latencyHint: 'interactive',
+            });
 
             sourceNode = audioCtx.createMediaStreamSource(stream);
             const streamChannels = sourceNode.channelCount;
@@ -4991,6 +5006,26 @@ function createNoteDetector(options = {}) {
         discardRecording,
         saveRecordingNow,
         getRecordingState,
+        // Diagnostic accessor — surfaces the AudioContext's own
+        // latency self-report (`baseLatency` is the platform's
+        // input-callback delay; `outputLatency` includes downstream
+        // playback buffering — irrelevant for the input side but
+        // useful when debugging mixed input/output chains). Returns
+        // null when audio hasn't been started yet (enable() not yet
+        // called or running in the desktop-bridge path that doesn't
+        // own an AudioContext). Use this from DevTools to verify the
+        // `latencyHint: 'interactive'` opt-in actually took effect.
+        getAudioLatencyInfo: () => {
+            if (!audioCtx) return null;
+            return {
+                baseLatency:   Number.isFinite(audioCtx.baseLatency)   ? audioCtx.baseLatency   : null,
+                outputLatency: Number.isFinite(audioCtx.outputLatency) ? audioCtx.outputLatency : null,
+                sampleRate:    audioCtx.sampleRate,
+                frameSize:     _ND_FRAME_SIZE,
+                yinBufferSize: _ND_MIN_YIN_SAMPLES,
+                state:         audioCtx.state,
+            };
+        },
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
