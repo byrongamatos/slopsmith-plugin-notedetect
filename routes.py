@@ -91,12 +91,13 @@ def setup(app, context):
     out_dir = static_dir / _RECORDINGS_REL
 
     def _ensure_out_dir() -> Path:
-        # Resolve + create on every request rather than at setup() time
-        # so the handlers behave the same in Docker, native uvicorn, and
-        # the desktop bundle — each of which surfaces the static tree at
-        # a different path. mkdir is idempotent (`exist_ok=True`), and
-        # an un-writable directory turns into a clean 500 from the
-        # caller rather than a load-time crash that 404s the route.
+        # Create the recordings directory on first write rather than at
+        # setup() time. `static_dir` and `out_dir` are fixed at
+        # registration time (changes to $STATIC_DIR after route
+        # registration are NOT picked up). mkdir is idempotent
+        # (`exist_ok=True`), and an un-writable directory turns into a
+        # clean 500 from the caller rather than a load-time crash that
+        # 404s the route.
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -201,6 +202,12 @@ def setup(app, context):
             )
         # Append-mode write — POSIX `O_APPEND` makes this atomic per-line
         # even under concurrent requests from a split-screen scenario.
-        with path.open("ab") as f:
-            f.write(line_bytes)
+        try:
+            with path.open("ab") as f:
+                f.write(line_bytes)
+        except OSError as e:
+            raise HTTPException(
+                500,
+                f"could not write to live-judgment file ({path}): {e}",
+            )
         return {"ok": True, "appended": len(line_bytes), "file": f"static/{_RECORDINGS_REL}/{path.name}"}
