@@ -216,11 +216,40 @@ const NUM = (v, k) => {
     }
     return n;
 };
+// Stronger numeric validators. NUM accepts any finite value, but a few
+// flags must be positive integers (anything else corrupts frame math
+// downstream and silently confuses tuning runs) or live in a known
+// range. Validate at CLI parse time so the verbose banner matches the
+// actual detector configuration.
+const POS_INT = (v, k) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+        process.stderr.write(`bad --${k}: ${v} (must be a positive integer)\n`);
+        process.exit(2);
+    }
+    return n;
+};
+const RATIO_01 = (v, k) => {
+    const n = NUM(v, k);
+    if (n < 0 || n > 1) {
+        process.stderr.write(`bad --${k}: ${v} (must be in [0, 1])\n`);
+        process.exit(2);
+    }
+    return n;
+};
+// Detector hook only honours these three; anything else silently falls
+// back to the default while the verbose banner still claims the bogus
+// value. Fail fast instead.
+const ALLOWED_METHODS = new Set(['yin', 'hps', 'crepe']);
+if (!ALLOWED_METHODS.has(args.method)) {
+    process.stderr.write(`bad --method: ${args.method} (must be one of: ${[...ALLOWED_METHODS].join(', ')})\n`);
+    process.exit(2);
+}
 const method        = args.method;
-const sampleRate    = NUM(args['sample-rate'], 'sample-rate');
-const frameSize     = NUM(args['frame-size'], 'frame-size');
+const sampleRate    = POS_INT(args['sample-rate'], 'sample-rate');
+const frameSize     = POS_INT(args['frame-size'], 'frame-size');
 const arrangement   = args.arrangement;
-const stringCount   = NUM(args['string-count'], 'string-count');
+const stringCount   = POS_INT(args['string-count'], 'string-count');
 const avOffsetMs    = NUM(args['av-offset-ms'], 'av-offset-ms');
 const settings = {
     method,
@@ -228,7 +257,7 @@ const settings = {
     pitchHitThreshold:  NUM(args['pitch-hit-threshold'], 'pitch-hit-threshold'),
     timingTolerance:    NUM(args['timing-tolerance'], 'timing-tolerance'),
     timingHitThreshold: NUM(args['timing-hit-threshold'], 'timing-hit-threshold'),
-    chordHitRatio:      NUM(args['chord-hit-ratio'], 'chord-hit-ratio'),
+    chordHitRatio:      RATIO_01(args['chord-hit-ratio'], 'chord-hit-ratio'),
     latencyOffset:      NUM(args['latency'], 'latency'),
 };
 

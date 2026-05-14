@@ -61,7 +61,14 @@ if (!fs.existsSync(fixturesPath)) {
     process.stderr.write(`             Create one — see tools/regression-fixtures.example.json for shape.\n`);
     process.exit(2);
 }
-const fixtures = JSON.parse(fs.readFileSync(fixturesPath, 'utf8'));
+let fixtures;
+try {
+    fixtures = JSON.parse(fs.readFileSync(fixturesPath, 'utf8'));
+} catch (e) {
+    process.stderr.write(`[regression] fixtures file is not valid JSON: ${fixturesPath}\n`);
+    process.stderr.write(`             ${e.message}\n`);
+    process.exit(2);
+}
 if (!Array.isArray(fixtures) || fixtures.length === 0) {
     process.stderr.write(`[regression] fixtures file has no entries\n`);
     process.exit(2);
