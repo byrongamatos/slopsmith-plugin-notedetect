@@ -193,7 +193,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.7.0';
+const _ND_VERSION = '1.8.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -1420,6 +1420,14 @@ function createNoteDetector(options = {}) {
     // identity that matches the original .on registration.
     let drillOnLoopRestartFn = null;
     let drillOnSongChangedFn = null;
+    // End-of-song summary subscription. Bound from enableImpl() so the
+    // drill-mode listener count test (which calls _bindDrillEvents()
+    // directly without going through enable) keeps seeing exactly the
+    // drill listener it expects. The handler runs only when `enabled`
+    // is still true at song:ended, gated to the default singleton so a
+    // splitscreen with N detecting panels doesn't pop N modals.
+    let endOfSongSubscribed = false;
+    let endOfSongOnEndedFn = null;
     // Bounds at iteration start; if slopsmith.getLoop() returns
     // different bounds mid-drill (user picked another saved loop or
     // edited A/B) we clear iterations because they're no longer
@@ -4027,6 +4035,57 @@ function createNoteDetector(options = {}) {
         drillOnSongChangedFn = null;
     }
 
+    // End-of-song summary. Fire showSummary() when the audio reaches
+    // its natural end with detection still on. The playSong wrapper
+    // silent-disables on song-switch so this only runs for genuine
+    // end-of-track 'ended' events (the wrapper's silent disable
+    // happens via stopAudio() which doesn't emit song:ended). Default
+    // singleton only — splitscreen panels each have their own
+    // instance and a per-panel modal would be visually noisy.
+    //
+    // After surfacing the summary we silent-disable: detection has
+    // nothing to listen to with the song stopped, and leaving it on
+    // would mean a follow-up manual Detect-toggle-off pops a second
+    // summary (showSummary publishes notedetect:session, so a duplicate
+    // also doubles the journal event). The user re-enables for the
+    // next track the same way they already do today — the playSong
+    // wrapper silent-disables on song-switch regardless.
+    function _endOfSongOnEnded() {
+        if (!isDefault) return;
+        if (!enabled) return;
+        // showSummary() has its own `total < 5` guard, so a song that
+        // ended before the user played anything meaningful is silently
+        // skipped. Calling it here is otherwise unconditional.
+        try { showSummary(); } catch (e) {
+            console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
+        }
+        try { disable({ silent: true }); } catch (e) {}
+    }
+
+    function _endOfSongBindEvents() {
+        if (endOfSongSubscribed) return;
+        if (!window.slopsmith
+            || typeof window.slopsmith.on !== 'function'
+            || typeof window.slopsmith.off !== 'function') return;
+        const fn = _endOfSongOnEnded;
+        try {
+            window.slopsmith.on('song:ended', fn);
+        } catch (e) {
+            return;
+        }
+        endOfSongOnEndedFn = fn;
+        endOfSongSubscribed = true;
+    }
+
+    function _endOfSongUnbindEvents() {
+        if (!endOfSongSubscribed) return;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function' && endOfSongOnEndedFn) {
+            try { window.slopsmith.off('song:ended', endOfSongOnEndedFn); } catch (e) {}
+        }
+        endOfSongSubscribed = false;
+        endOfSongOnEndedFn = null;
+    }
+
     // Render the drill HUD panel — current iteration header (live
     // counter + accuracy) plus the last 5 completed iterations with
     // best/worst highlighting. Hides itself entirely when drill is
@@ -4183,6 +4242,10 @@ function createNoteDetector(options = {}) {
         // survive disable() (so re-enable resumes the same drill state)
         // and only get torn down by destroy().
         _drillBindEvents();
+        // Subscribe to song:ended so a finished song with detection on
+        // surfaces the end-of-song summary modal. Idempotent and
+        // self-gated (handler bails when not enabled / not default).
+        _endOfSongBindEvents();
         // Sync drill state once at enable so a user enabling detection
         // while a loop is already active starts counting iterations
         // from the very next judgment, not after the first HUD tick.
@@ -4320,6 +4383,7 @@ function createNoteDetector(options = {}) {
         // unmount cycles. disable() leaves them alone (resumes drill state
         // on re-enable); destroy is the right teardown point.
         _drillUnbindEvents();
+        _endOfSongUnbindEvents();
         _recUnbindEvents();
         _liveUnbindEvents();
         // Discard any unsaved recording state — destroying the instance
@@ -4844,6 +4908,13 @@ function createNoteDetector(options = {}) {
             accuracy: (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0,
             sectionStats: sectionStats.map(s => ({ name: s.name, hits: s.hits, misses: s.misses })),
         }),
+        // The user's most-recently-expressed preference: did they last
+        // click Detect to turn it ON? Distinct from isEnabled(), which
+        // is the live runtime state and goes false on every song-switch
+        // (the playSong wrapper silent-disables to clear stale stats).
+        // The wrapper itself reads this to decide whether to auto-
+        // re-enable for the next song.
+        wantsDetect: () => !!detectPreference,
         // Drill-mode read-only state. `current` reflects the
         // in-progress iteration (zeroed when no drill is active).
         // `iterations` is a snapshot copy of completed iterations so
@@ -4949,6 +5020,13 @@ function createNoteDetector(options = {}) {
         _unbindDrillEvents: _drillUnbindEvents,
         _drillSyncFromLoopState: _drillSyncFromLoopState,
         _recordJudgment: recordJudgment,
+        // End-of-song summary hooks. Exposed alongside the drill hooks
+        // so tests can pin the song:ended listener-count contract
+        // (drill alone = 1; drill + end-of-song = 2) without going
+        // through enable(). Production code never calls these — they
+        // bind from enableImpl() and unbind from destroy().
+        _bindEndOfSongEvents: _endOfSongBindEvents,
+        _unbindEndOfSongEvents: _endOfSongUnbindEvents,
 
         // Internal — headless-harness hooks. Lets a Node CLI tool
         // (plugins/note_detect/tools/harness.js) drive the exact same
@@ -5099,6 +5177,31 @@ function _ndInstallPlaySongHook() {
         // hw.getSongInfo(); no need to refresh them eagerly here.
         if (window.noteDetect) {
             window.noteDetect.injectButton();
+        }
+        // Honour the user's standing preference: if they had Detect
+        // turned on, keep it on across song switches. Without this,
+        // every song requires another button press because the loop
+        // above silent-disables the instance. The end-of-song summary
+        // path also silent-disables, so this is the single re-arm
+        // point that covers both "user picked next song" and "song
+        // finished, user picked next" flows. Default singleton only
+        // — splitscreen panels are opt-in surfaces the user mounts
+        // per session, and reclaiming the mic for every panel on
+        // every song change would be surprising. There's no public
+        // isDefault() accessor; the singleton is the one anchored on
+        // window.noteDetect.
+        const def = window.noteDetect;
+        if (def
+            && typeof def.wantsDetect === 'function' && def.wantsDetect()
+            && !def.isEnabled()) {
+            // Fire-and-forget — enable() awaits getUserMedia which we
+            // don't want to block playSong on. If the user denied mic
+            // permission previously the failure surfaces through the
+            // button text the same way it does for a manual click.
+            def.enable().catch((e) => {
+                console.warn('[note_detect] auto-re-enable on playSong failed:',
+                    e && e.message ? e.message : e);
+            });
         }
         return ret;
     };
