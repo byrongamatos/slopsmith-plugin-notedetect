@@ -5182,15 +5182,12 @@ function _ndInstallPlaySongHook() {
         // above silent-disables the instance. The end-of-song summary
         // path also silent-disables, so this is the single re-arm
         // point that covers both "user picked next song" and "song
-        // finished, user picked next" flows. Splitscreen panels are
-        // intentionally NOT auto-re-enabled — they're opt-in surfaces
-        // the user mounts per session, and reclaiming the mic for
-        // every panel on every song change would be surprising.
-        // Default singleton only — splitscreen panels are opt-in
-        // surfaces the user mounts per session, and reclaiming the
-        // mic for every panel on every song change would be
-        // surprising. There's no public isDefault() accessor; the
-        // singleton is the one anchored on window.noteDetect.
+        // finished, user picked next" flows. Default singleton only
+        // — splitscreen panels are opt-in surfaces the user mounts
+        // per session, and reclaiming the mic for every panel on
+        // every song change would be surprising. There's no public
+        // isDefault() accessor; the singleton is the one anchored on
+        // window.noteDetect.
         const def = window.noteDetect;
         if (def
             && typeof def.wantsDetect === 'function' && def.wantsDetect()
