@@ -99,6 +99,15 @@ for (const [idx, fx] of fixtures.entries()) {
         results.push({ name: fxName, status: 'skipped', reason: 'invalid-fixture' });
         continue;
     }
+    // Each element must be a string — spawnSync throws TypeError on a
+    // non-string in argv and would abort the whole regression run. A
+    // contributor writing `"--frame-size", 4096` (number instead of
+    // string) in the fixtures JSON is the realistic case.
+    if (Array.isArray(fx.args) && !fx.args.every(a => typeof a === 'string')) {
+        process.stdout.write(`[skip] ${fxName}  (fixture 'args' must be an array of strings)\n`);
+        results.push({ name: fxName, status: 'skipped', reason: 'invalid-fixture' });
+        continue;
+    }
     const audio = path.resolve(repoRoot, fx.audio);
     const chart = path.resolve(repoRoot, fx.chart);
     if (!fs.existsSync(audio)) {
