@@ -237,10 +237,12 @@ const RATIO_01 = (v, k) => {
     }
     return n;
 };
-// Detector hook only honours these three; anything else silently falls
-// back to the default while the verbose banner still claims the bogus
-// value. Fail fast instead.
-const ALLOWED_METHODS = new Set(['yin', 'hps', 'crepe']);
+// Detector hook only honours these two in the headless path; CREPE
+// needs WebGL + TensorFlow.js model load and is intentionally not
+// wired up here (see the file header). Accepting `crepe` would
+// silently fall back to YIN while the verbose banner claimed CREPE
+// — misleading any tuning / regression run. Fail fast instead.
+const ALLOWED_METHODS = new Set(['yin', 'hps']);
 if (!ALLOWED_METHODS.has(args.method)) {
     process.stderr.write(`bad --method: ${args.method} (must be one of: ${[...ALLOWED_METHODS].join(', ')})\n`);
     process.exit(2);
