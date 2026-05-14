@@ -299,12 +299,23 @@
     // confidence floor is probably too strict for this signal. The
     // reverse case (low pure rate + lots of pitch-error spread) means
     // false positives — raise the floor.
+    // Pitch-spread threshold for the "raise the floor" branch — if the
+    // detector is finding pitches confidently AND those detections
+    // cluster tight around the expected note, the signal is clean
+    // enough that we can afford a stricter gate. A WIDE distribution
+    // at low pure rate suggests the detector is happily emitting
+    // wrong-octave / wrong-string detections (still "confident", just
+    // wrong), and tightening the floor will catch some of those.
+    const _PITCH_SPREAD_FOR_TIGHTER_FLOOR = 40;  // cents (p90 - p10)
     function _suggestConfidence(d, nd) {
         if (typeof nd.applySettings !== 'function') return null;
         const total = (d.summary && d.summary.total) || 0;
         const pure  = (d.miss_breakdown && d.miss_breakdown.pure) || 0;
         const cur   = (d.settings && Number.isFinite(d.settings.detection_confidence_min))
             ? d.settings.detection_confidence_min : 0.20;
+        const pe    = d.pitch_error_cents || {};
+        const pitchSpread = (pe.p10 != null && pe.p90 != null)
+            ? Math.abs(pe.p90 - pe.p10) : null;
         const enough = total >= _MIN_EVENTS_FOR_WINDOW;
         if (!enough) {
             return {
@@ -325,11 +336,15 @@
             // Lower the floor by 5 percentage points, but not below 10%.
             suggested = Math.max(0.10, cur - 0.05);
             reasoning = `${Math.round(pureRate * 100)}% of frames dropped on confidence — lower the floor`;
-        } else if (pureRate < 0.15 && cur < 0.30) {
-            // Detector hits well — try tightening the floor a notch to
-            // reduce false-positive matches on background noise.
+        } else if (pureRate < 0.15 && cur < 0.30
+                   && pitchSpread != null && pitchSpread > _PITCH_SPREAD_FOR_TIGHTER_FLOOR) {
+            // Detector hits well but spread is wide → likely confident-
+            // but-wrong detections. Try tightening the floor a notch.
+            // The pitchSpread check guards against a "low pure + tight
+            // distribution" case where the detector is genuinely doing
+            // its job and we shouldn't second-guess it.
             suggested = Math.min(0.30, cur + 0.05);
-            reasoning = `only ${Math.round(pureRate * 100)}% pure-miss rate — try a stricter floor`;
+            reasoning = `${Math.round(pureRate * 100)}% pure-miss but pitch spread ${Math.round(pitchSpread)} c — try a stricter floor`;
         }
         const actionable = Math.abs(suggested - cur) >= 0.01;
         return {
@@ -507,10 +522,12 @@
 
     // Detection method — if pure-miss rate is high and we've collected
     // enough events to trust the signal, suggest flipping method.
-    // CREPE is the default on a fresh install, so the most useful
-    // direction is CREPE → YIN (better at note onsets, no model
-    // confidence gate). YIN → CREPE is the reverse case (lots of
-    // false positives, want CREPE's stronger gating).
+    // YIN is the default on a fresh install (see `detectionMethod` in
+    // screen.js); CREPE is the upgrade path for users with quiet /
+    // ambiguous signals where YIN's autocorrelation gate is too
+    // strict. The reverse case — CREPE → YIN — fires when CREPE's
+    // model confidence drops too many frames, leaving YIN's lighter
+    // gate as the better fit for that rig.
     function _suggestMethod(d, nd) {
         if (typeof nd.applySettings !== 'function') return null;
         const total = (d.summary && d.summary.total) || 0;

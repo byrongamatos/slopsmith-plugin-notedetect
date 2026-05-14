@@ -1212,7 +1212,9 @@ function createNoteDetector(options = {}) {
     // Minimum YIN/HPS/CREPE confidence to accept a detection. Below
     // this, the per-frame result is discarded and the note retires
     // as a "pure" miss. Previously hardcoded to 0.30 at every gate
-    // (5 sites in this file); real-rig diagnostics on a healthy
+    // (6 sites in this file: two YIN/HPS result gates, three
+    // detectedMidi-on-confidence gates, and the desktop-bridge pitch
+    // detection gate); real-rig diagnostics on a healthy
     // signal showed ~47% of frames falling below that floor on CREPE
     // — most of the "pure" miss bucket. Default lowered to 0.20 +
     // exposed as a UI slider (gear popover) so users with quieter
@@ -5105,7 +5107,14 @@ function createNoteDetector(options = {}) {
                 detectionConfidenceMin = Math.max(0.05, Math.min(0.50, partial.detectionConfidenceMin));
             }
             if (Number.isFinite(partial.latencyOffset)) {
-                latencyOffset = partial.latencyOffset;
+                // Clamp to the same range as the gear-popover slider
+                // (0–0.250 s). The storage loader doesn't clamp this
+                // field on read, but the writer should — letting a
+                // caller (auto-tune, DevTools experiment, stale code)
+                // park latency at 5 s would render the matching
+                // window unreachable until the user manually drags
+                // the slider back into range.
+                latencyOffset = Math.max(0, Math.min(0.25, partial.latencyOffset));
             }
             saveSettings();
             return {
