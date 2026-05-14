@@ -2771,11 +2771,22 @@ function createNoteDetector(options = {}) {
                     const prev = _chordLastResult.get(chordKey);
                     const voicingEver = !!((prev && prev.voicingHit) || chordResult.voicingHit);
                     const useNewSnapshot = !prev || chordResult.score > (prev.score || 0);
+                    // Capture the frame time of the FIRST voicing-eligible
+                    // frame for this chord. checkMisses uses this as the
+                    // judgment's `judgedAt` so the resulting timingError
+                    // reflects when voicing was actually satisfied — not
+                    // the retire-tick time (which is by definition past
+                    // the chord's match window and would classify the
+                    // rescued judgment as LATE, defeating the rescue).
+                    const voicingT = (prev && prev.voicingT)
+                        ? prev.voicingT
+                        : (chordResult.voicingHit ? t : null);
                     _chordLastResult.set(chordKey, {
                         score:        useNewSnapshot ? chordResult.score        : prev.score,
                         hitStrings:   useNewSnapshot ? chordResult.hitStrings   : prev.hitStrings,
                         totalStrings: useNewSnapshot ? chordResult.totalStrings : prev.totalStrings,
                         voicingHit:   voicingEver,
+                        voicingT,
                     });
                     // Do not lock in a miss while the chord is still within
                     // its timing window. Chords can enter candidateNotes as
@@ -2964,9 +2975,24 @@ function createNoteDetector(options = {}) {
                 // in matchNotes (which we explicitly avoid to keep
                 // strict-ratio frames' timing winning when they exist).
                 const voicingRescue = !!(cachedChord && cachedChord.voicingHit);
+                // Pass the cached voicing-eligible frame time as the
+                // judgment's `judgedAt`, not the current retire-tick
+                // time. The retire tick fires AFTER the chord window
+                // has closed by 2 × timingTolerance + lateGrace, so
+                // using `t` here would produce a timingError of
+                // hundreds of milliseconds, the timingState would be
+                // LATE, and the chord-branch hit calc
+                // (`matched && timingState === 'OK'`) would flip the
+                // rescue back to a miss — defeating the entire path.
+                // The cached voicingT is the actual moment voicing
+                // was first satisfied, which is by definition inside
+                // the chord's match window.
+                const judgedAtForRescue = (voicingRescue && Number.isFinite(cachedChord.voicingT))
+                    ? cachedChord.voicingT
+                    : t;
                 const chordJudgment = voicingRescue
                     ? makeMatchedJudgment(
-                        liveNotes[0], c.t, t, expectedMidi,
+                        liveNotes[0], c.t, judgedAtForRescue, expectedMidi,
                         null,    // no monophonic detection at retire time
                         0,       // no pitch confidence to claim
                         {
