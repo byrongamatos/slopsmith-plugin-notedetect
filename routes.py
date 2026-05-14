@@ -85,7 +85,7 @@ def setup(app, context):
     # back to the in-container path so this keeps working in compose.
     # The mkdir is deferred to the request handler so a missing/un-
     # writable static dir at plugin-load time can't take down route
-    # registration — `_api/plugins/note_detect/recording` would 404 and
+    # registration — `/api/plugins/note_detect/recording` would 404 and
     # the in-app save would silently fail.
     static_dir = Path(os.environ.get("STATIC_DIR", "/app/static"))
     out_dir = static_dir / _RECORDINGS_REL
@@ -135,8 +135,14 @@ def setup(app, context):
         # Use a `.tmp` then rename so a crashed write doesn't leave a
         # truncated WAV that the harness might pick up next time.
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_bytes(body)
-        tmp.replace(path)
+        try:
+            tmp.write_bytes(body)
+            tmp.replace(path)
+        except OSError as e:
+            raise HTTPException(
+                500,
+                f"could not write recording ({tmp}): {e}",
+            )
 
         rel = f"static/{_RECORDINGS_REL}/{filename}"
         log.info(
@@ -193,6 +199,11 @@ def setup(app, context):
             existing = path.stat().st_size
         except FileNotFoundError:
             existing = 0
+        except OSError as e:
+            raise HTTPException(
+                500,
+                f"could not stat live-judgment file ({path}): {e}",
+            )
         line = json.dumps(obj, separators=(",", ":")) + "\n"
         line_bytes = line.encode("utf-8")
         if existing + len(line_bytes) > _LIVE_FILE_MAX_BYTES:
