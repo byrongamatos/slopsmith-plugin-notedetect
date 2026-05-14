@@ -61,10 +61,16 @@ _LIVE_JUDGMENT_MAX_BYTES = 8 * 1024
 _LIVE_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 
-def _sanitize_slug(s: str) -> str:
+def _sanitize_slug(s: str, default: str = "recording") -> str:
+    # `default` is parameterised because the same sanitiser feeds the
+    # recording-filename slug (where "recording" is the obvious fallback)
+    # AND the live-judgment session id (where each route's docstring
+    # promises its own fallback — "default" for /live-judgment). If an
+    # input sanitises to empty, fall back to the caller's chosen tag
+    # rather than coalescing two unrelated routes onto the same name.
     s = (s or "").strip()
     s = _SLUG_RE.sub("_", s)[:_SLUG_MAX].strip("_")
-    return s or "recording"
+    return s or default
 
 
 def setup(app, context):
@@ -141,7 +147,7 @@ def setup(app, context):
         if not isinstance(obj, dict):
             raise HTTPException(400, "judgment body must be a JSON object")
 
-        session = _sanitize_slug(request.query_params.get("session", "default"))
+        session = _sanitize_slug(request.query_params.get("session", "default"), default="default")
         path = out_dir / f"live_{session}.jsonl"
 
         # Hard cap on file size — refuse the append rather than truncating

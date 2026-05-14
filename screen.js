@@ -4962,7 +4962,14 @@ function createNoteDetector(options = {}) {
             },
             setSettings: (s) => {
                 s = s || {};
-                if (typeof s.method === 'string' && ['yin', 'hps', 'crepe'].includes(s.method))
+                // _harness is a Node-only entrypoint and CREPE's
+                // TensorFlow.js model isn't wired in this path (see the
+                // file header on tools/harness.js). Accepting 'crepe'
+                // here would let a programmatic caller drive a value
+                // that the harness CLI explicitly rejects — and the
+                // detector would silently fall back to YIN at runtime.
+                // Keep the internal API aligned with the CLI's whitelist.
+                if (typeof s.method === 'string' && ['yin', 'hps'].includes(s.method))
                     detectionMethod = s.method;
                 if (Number.isFinite(s.pitchTolerance))      pitchTolerance      = s.pitchTolerance;
                 if (Number.isFinite(s.pitchHitThreshold))   pitchHitThreshold   = s.pitchHitThreshold;
