@@ -4050,17 +4050,44 @@ function createNoteDetector(options = {}) {
         const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : null;
         if (!info) return;
         if (info.arrangement) currentArrangement = _ndArrangementKindFromName(info.arrangement);
-        if (Array.isArray(info.tuning)) {
-            tuningOffsets = info.tuning;
-            // Slopsmith core exposes the arrangement string count directly.
-            // Prefer it over tuning.length because RS XML pads bass tunings
-            // to six entries; fall back to tuning length for older cores.
-            const stringCount = hw && hw.getStringCount ? hw.getStringCount() : undefined;
-            currentStringCount = Number.isFinite(stringCount)
-                ? stringCount
-                : tuningOffsets.length;
-        }
+        if (Array.isArray(info.tuning)) tuningOffsets = info.tuning;
         if (Number.isFinite(info.capo)) capo = info.capo;
+
+        // String-count resolution, in precedence order:
+        //   1. hw.getStringCount() — host's authoritative count. Asked
+        //      independently of info.tuning because the host may know
+        //      the count even when no tuning array shipped, and because
+        //      RS XML pads bass tunings to six entries so tuning.length
+        //      alone can't distinguish bass-4 from a real 6-string.
+        //   2. tuning.length when it's consistent with the arrangement
+        //      — bass-4/5 or guitar-6/7/8. This preserves the older-host
+        //      path for 7/8-string guitars and 5-string basses, while
+        //      rejecting the RS-XML bass-padded-to-6 shape (which
+        //      falls through to (3) below for the correct bass-4).
+        //   3. Per-arrangement default — 4 for bass, 6 for guitar.
+        //      Closes the regression a bass chart hit when it had no
+        //      tuning array AND no host count: currentStringCount used
+        //      to stay at 6, then _ndStandardMidiFor('bass', 6) returned
+        //      the 4-entry _ND_TUNING_BASS_4 and strings 4/5 retired
+        //      with expectedMidi: null.
+        //   4. tuning.length — last-resort fallback when no arrangement
+        //      is known.
+        const hostStringCount = (hw && hw.getStringCount) ? hw.getStringCount() : undefined;
+        if (Number.isFinite(hostStringCount)) {
+            currentStringCount = hostStringCount;
+        } else if (info.arrangement) {
+            const tuneLen = Array.isArray(info.tuning) ? info.tuning.length : null;
+            const consistent = currentArrangement === 'bass'
+                ? (tuneLen === 4 || tuneLen === 5)
+                : (tuneLen === 6 || tuneLen === 7 || tuneLen === 8);
+            if (consistent) {
+                currentStringCount = tuneLen;
+            } else {
+                currentStringCount = currentArrangement === 'bass' ? 4 : 6;
+            }
+        } else if (Array.isArray(info.tuning)) {
+            currentStringCount = info.tuning.length;
+        }
     }
 
     let _chartStateSubscribed = false;
@@ -5088,6 +5115,19 @@ function createNoteDetector(options = {}) {
         // bind from enableImpl() and unbind from destroy().
         _bindEndOfSongEvents: _endOfSongBindEvents,
         _unbindEndOfSongEvents: _endOfSongUnbindEvents,
+        // Chart-state sync test hooks — same rationale as the drill
+        // hooks. _getChartState lets tests assert the closure-private
+        // currentArrangement/currentStringCount/tuningOffsets/capo
+        // fields after a synthetic song:loaded.
+        _bindChartStateEvents: _chartStateBindEvents,
+        _unbindChartStateEvents: _chartStateUnbindEvents,
+        _syncChartStateFromHw: _syncChartStateFromHw,
+        _getChartState: () => ({
+            arrangement: currentArrangement,
+            stringCount: currentStringCount,
+            tuningOffsets: tuningOffsets.slice(),
+            capo,
+        }),
 
         // Internal — headless-harness hooks. Lets a Node CLI tool
         // (plugins/note_detect/tools/harness.js) drive the exact same
