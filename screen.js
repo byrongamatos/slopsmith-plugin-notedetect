@@ -3143,12 +3143,9 @@ function createNoteDetector(options = {}) {
         if (panel) { panel.remove(); return; }
 
         panel = document.createElement('div');
-        // `max-h-[88vh] overflow-y-auto` so the popover scrolls instead of
-        // running off the bottom of the viewport. Without it the Clean
-        // Timing / Clean Pitch sliders + Reference Recording block sit
-        // below the fold on short displays and the user can't reach them
-        // (the panel is fixed-positioned, so page scroll doesn't move it).
-        panel.className = 'nd-settings-panel fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 max-h-[88vh] overflow-y-auto shadow-2xl text-sm';
+        // Bound panel height to available viewport space below `top-16`
+        // (with a small bottom gap) and let the panel scroll internally.
+        panel.className = 'nd-settings-panel fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 max-h-[calc(100vh-4rem-1rem)] overflow-y-auto shadow-2xl text-sm';
         panel.style.pointerEvents = 'auto';
         panel.innerHTML = `
             <div class="flex justify-between items-center mb-3">
