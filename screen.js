@@ -3282,9 +3282,17 @@ function createNoteDetector(options = {}) {
             const stateEl = recBlock.querySelector('.nd-rec-state');
             const infoEl  = recBlock.querySelector('.nd-rec-info');
             const savedEl = recBlock.querySelector('.nd-rec-saved');
+            // Declared up-front (vs. `const` after setInterval below) so
+            // the bail-out branch in renderRec can call clearInterval
+            // even if it fires on the very first synchronous call before
+            // the interval has been installed — e.g., when instanceRoot
+            // isn't attached to document.body in some host/test context.
+            // Without this, the early bail-out would hit the temporal
+            // dead zone and ReferenceError-out instead of cleaning up.
+            let tick = null;
 
             function renderRec() {
-                if (!document.body.contains(panel)) { clearInterval(tick); return; }
+                if (!document.body.contains(panel)) { if (tick != null) clearInterval(tick); return; }
                 const r = getRecordingState();
                 const hasBuffer = r.samples > 0;
                 let label, info;
@@ -3323,7 +3331,7 @@ function createNoteDetector(options = {}) {
             };
             if (discBtn) discBtn.onclick = () => { discardRecording(); renderRec(); };
             renderRec();
-            const tick = setInterval(renderRec, 1000);
+            tick = setInterval(renderRec, 1000);
         }
         panel.querySelector('.nd-device-select').onchange = (e) => onDeviceChange(e.target.value);
         panel.querySelector('.nd-channel-select').onchange = (e) => onChannelChange(e.target.value);
