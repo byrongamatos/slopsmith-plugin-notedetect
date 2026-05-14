@@ -151,8 +151,18 @@ for (const [idx, fx] of fixtures.entries()) {
             results.push({ name: fxName, status: 'error', reason: `parse: ${e.message}` });
             continue;
         }
-        const hits = diag.summary.hits;
-        const total = diag.summary.total;
+        // Treat a missing/malformed `summary` the same way as a parse
+        // failure — schema drift, truncated-but-still-parseable writes,
+        // or a future harness build that renames fields would otherwise
+        // throw a TypeError mid-loop and abort the entire run.
+        const summary = diag && diag.summary;
+        if (!summary || !Number.isFinite(summary.hits) || !Number.isFinite(summary.total)) {
+            process.stdout.write(`[fail] ${fxName}  (harness output missing summary.hits/total)\n`);
+            results.push({ name: fxName, status: 'error', reason: 'invalid-summary' });
+            continue;
+        }
+        const hits = summary.hits;
+        const total = summary.total;
         const pure = (diag.miss_breakdown || {}).pure || 0;
         const chord = (diag.miss_breakdown || {}).chordPartial || 0;
         results.push({

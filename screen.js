@@ -2789,8 +2789,8 @@ function createNoteDetector(options = {}) {
                 );
 
                 if (!chordResult.isHit) {
-                    // Stash the latest chordResult before bailing so that
-                    // when checkMisses() retires this chord as a miss, the
+                    // Stash the chordResult before bailing so that when
+                    // checkMisses() retires this chord as a miss, the
                     // miss judgment can carry the scorer's per-string
                     // diagnostic data (hitStrings / totalStrings / score).
                     // Without this we were blind on missed chords — the
@@ -2799,9 +2799,12 @@ function createNoteDetector(options = {}) {
                     // 5 strings — was that just the user's playing, or is
                     // the energy threshold too strict?" impossible to
                     // answer from data alone. The map is keyed by chord
-                    // key and overwrites every frame so the FINAL frame's
-                    // result is what lands in the miss — that's the
-                    // "best the scorer got" snapshot.
+                    // key and the snapshot lands the BEST-SCORE frame
+                    // seen during the chord's match window (see the
+                    // `useNewSnapshot` predicate below) — gives the
+                    // reader "best the scorer got at any point in the
+                    // window" rather than an arbitrary final frame which
+                    // may be tail-end decay.
                     // Cache for checkMisses to consume on retire.
                     //
                     // Two pieces tracked separately:
@@ -5024,9 +5027,13 @@ function createNoteDetector(options = {}) {
             || typeof window.webkitAudioContext === 'function');
     if (isDefault && detectPreference && _hasAudio) {
         setTimeout(() => {
-            // Re-check enabled — a fast user click during the timeout
-            // could have already enabled (or explicitly disabled) us.
-            if (!enabled) enable().catch((e) => {
+            // Re-check BOTH enabled and detectPreference. A fast user
+            // click could have already enabled us (`enabled`), and
+            // another surface (settings sync, headless toggle) could
+            // have flipped detectPreference to false during the
+            // timeout — in that case we'd be honouring a stale-by-now
+            // preference and enabling against the user's wishes.
+            if (!enabled && detectPreference) enable().catch((e) => {
                 console.warn('[note_detect] auto-enable failed:', e && e.message ? e.message : e);
             });
         }, 0);

@@ -442,7 +442,6 @@ async function main() {
     let nextTickT = TICK_INTERVAL_S;
 
     for (let i = 0; i < totalFrames; i++) {
-        currentTimeS = (i * frameSize) / sampleRate;
         const start = i * frameSize;
         // Copy the slice — processFrame may keep references through
         // async detection methods (CREPE), and reusing the typed view
@@ -455,6 +454,12 @@ async function main() {
         for (let j = 0; start + j < stop; j++) frame[j] = samples[start + j];
         // eslint-disable-next-line no-await-in-loop
         await detector._harness.feedFrame(frame, sampleRate);
+        // Advance the playhead to the END of the frame we just fed
+        // BEFORE checking tick boundaries. The earlier formulation used
+        // the start-of-frame time, which delayed any 0.1 s boundary
+        // landing inside the frame by one whole frame — measurably
+        // shifting checkMisses retirement vs production setInterval.
+        currentTimeS = ((i + 1) * frameSize) / sampleRate;
         // Tick on every 100 ms boundary the playhead has just crossed.
         // A while-loop handles the (unlikely) case where frameSize is
         // larger than TICK_INTERVAL_S worth of samples and the playhead
