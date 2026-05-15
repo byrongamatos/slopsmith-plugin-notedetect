@@ -3492,7 +3492,13 @@ function createNoteDetector(options = {}) {
             // already prevent inversion, but a stale DOM state during fast
             // drag can momentarily produce values below the current
             // single-note threshold. Clamp here to be safe.
-            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
+            const clamped = chordTimingHitThreshold < timingHitThreshold;
+            if (clamped) chordTimingHitThreshold = timingHitThreshold;
+            // When we clamped up, the variable + persisted setting have
+            // moved past the slider's current `value` — sync the slider's
+            // value back to the clamped position so the thumb doesn't
+            // sit below the actual setting.
+            if (clamped) e.target.value = Math.round(chordTimingHitThreshold * 1000);
             panel.querySelector('.nd-chord-timing-val').textContent = Math.round(chordTimingHitThreshold * 1000);
             saveSettings();
         };
