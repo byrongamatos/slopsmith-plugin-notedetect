@@ -119,14 +119,21 @@ test('makeJudgment (chord): -130ms timing error misses at single-note threshold 
     assert.equal(j.hit, false, 'chord at -130 ms must miss when threshold is 100 ms');
 });
 
-test('makeJudgment (chord): chord threshold does not loosen single-note judgments', () => {
-    // Single-note judgment with the same -130 ms error and a 150 ms
-    // threshold also passes — _ndMakeJudgment is threshold-agnostic about
-    // chord vs single-note. The chord-only widening lives at the call
-    // site (createNoteDetector's makeMatchedJudgment / makeMissJudgment
-    // closures), which select the right threshold based on extra.chord.
-    // This test pins that the function itself doesn't treat chord/non-
-    // chord any differently for timing classification.
+test('makeJudgment: timing classification is threshold-agnostic for chord vs single-note', () => {
+    // _ndMakeJudgment itself does not branch on `chord` for the timing
+    // classification — it honours whatever `timingThresholdMs` the
+    // caller passed. The chord-only widening lives at the call site
+    // (createNoteDetector's makeMatchedJudgment / makeMissJudgment
+    // closures), which select chordTimingHitThreshold vs
+    // timingHitThreshold based on extra.chord. End-to-end coverage of
+    // that selection is via the harness regression fixture (Bad Habit)
+    // — the harness drives the closures and a divergence between chord
+    // and single-note thresholds shows up directly in the hit count.
+    // What this test pins is the unit-level contract: when a caller
+    // hands _ndMakeJudgment a 150 ms threshold (chord-typical) for a
+    // single-note judgment, the classifier still accepts -130 ms — so
+    // the wider threshold isn't silently capped by some chord-specific
+    // gate inside the function.
     const j = core.makeJudgment({
         matched: true,
         chord: false,

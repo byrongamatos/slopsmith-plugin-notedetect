@@ -165,7 +165,9 @@ note_detect headless harness
   --pitch-hit-threshold  <c>    cents, clean  (default: 20)
   --timing-tolerance     <s>    seconds, outer (default: 0.150)
   --timing-hit-threshold <s>    seconds, single-note clean (default: 0.100)
-  --chord-timing-hit-threshold <s>  seconds, chord clean — chord strums need a wider window than single notes (default: 0.150)
+  --chord-timing-hit-threshold <s>  seconds, chord clean — chord strums need a wider window than single notes
+                                    (default: 0.150 clamped into [timing-hit-threshold, timing-tolerance];
+                                     i.e. with --timing-tolerance 0.120 the effective default is 0.120, not 0.150)
   --chord-hit-ratio      <r>    0..1           (default: 0.40)
   --latency              <s>    detector latency comp (default: 0.080)
   --frame-size           <n>    samples per frame (default: 1024)

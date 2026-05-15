@@ -2340,6 +2340,17 @@ function createNoteDetector(options = {}) {
         emitSlopsmithJudgment(judgment);
     }
 
+    // The `extra.chord ? chordTimingHitThreshold : timingHitThreshold`
+    // selector below is the chord-vs-single-note threshold split for
+    // issue #38. _ndMakeJudgment is threshold-agnostic — it honours
+    // whatever `timingThresholdMs` we pass — so the entire chord-window
+    // policy lives at THIS call site (and its sibling `makeMissJudgment`
+    // below). End-to-end coverage of the selector lives in
+    // tools/regression-fixtures.json (Bad Habit): if this ternary ever
+    // inverts or drops chord-judgment widening, the fixture score
+    // collapses by ~10pp on a fixed input. Unit-level coverage of
+    // _ndMakeJudgment's threshold handling itself is in
+    // test/judgment.test.js.
     function makeMatchedJudgment(cn, noteTime, t, expectedMidi, detectedMidiForJudgment, confidence, extra = {}) {
         const hasExplicitPitchError = Object.prototype.hasOwnProperty.call(extra, 'pitchError');
         const pitchError = hasExplicitPitchError
