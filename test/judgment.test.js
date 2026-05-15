@@ -63,6 +63,93 @@ test('makeJudgment preserves independent timing and pitch failures', () => {
     assert.equal(j.pitchError, -35);
 });
 
+// ── Chord-specific timing threshold (issue #38) ──────────────────────────
+//
+// Chord events get a wider timing-OK window than single notes — chord
+// strums span 5–10 ms across strings, the per-string FFT analysis smears
+// strike timing by another 50–100 ms, and fast power-chord punk players
+// anticipate the beat by 80–120 ms. The pipeline pipes a separate
+// `chordTimingHitThreshold` setting through to `_ndMakeJudgment` via
+// `timingThresholdMs` for chord judgments; these tests pin the contract
+// that `_ndMakeJudgment` honors whatever threshold the caller passed.
+
+test('makeJudgment (chord): -130ms timing error hits at chord threshold 150ms', () => {
+    // Player anticipated the chord by 130 ms (well outside the 100 ms
+    // single-note window). Chord scorer cleared isHit, so the per-string
+    // score is fine; only the timing classification is in doubt. With
+    // chord threshold 150 ms, this should classify OK and the judgment
+    // should be a hit.
+    const j = core.makeJudgment({
+        matched: true,
+        chord: true,
+        notes: [{ s: 0, f: 5 }, { s: 1, f: 7 }, { s: 2, f: 7 }],
+        noteTime: 10,
+        judgedAt: 9.87,    // 130 ms early
+        expectedMidi: 45,
+        timingThresholdMs: 150,
+        pitchError: null,  // chord judgments don't carry a monophonic pitch
+        score: 0.667,
+        hitStrings: 2,
+        totalStrings: 3,
+    });
+    assert.equal(j.timingError, -130);
+    assert.equal(j.timingState, 'OK', 'chord threshold 150 ms should accept -130 ms');
+    assert.equal(j.hit, true, 'chord with OK timing and no pitch state must hit');
+});
+
+test('makeJudgment (chord): -130ms timing error misses at single-note threshold 100ms', () => {
+    // Same chord scenario but with the old single-note 100 ms threshold —
+    // this is the pre-fix behavior. Confirms the wider threshold is what's
+    // actually doing the rescuing, not some other tweak in the judgment
+    // path.
+    const j = core.makeJudgment({
+        matched: true,
+        chord: true,
+        notes: [{ s: 0, f: 5 }, { s: 1, f: 7 }, { s: 2, f: 7 }],
+        noteTime: 10,
+        judgedAt: 9.87,    // 130 ms early
+        expectedMidi: 45,
+        timingThresholdMs: 100,
+        pitchError: null,
+        score: 0.667,
+        hitStrings: 2,
+        totalStrings: 3,
+    });
+    assert.equal(j.timingState, 'EARLY');
+    assert.equal(j.hit, false, 'chord at -130 ms must miss when threshold is 100 ms');
+});
+
+test('makeJudgment: timing classification is threshold-agnostic for chord vs single-note', () => {
+    // _ndMakeJudgment itself does not branch on `chord` for the timing
+    // classification — it honours whatever `timingThresholdMs` the
+    // caller passed. The chord-only widening lives at the call site
+    // (createNoteDetector's makeMatchedJudgment / makeMissJudgment
+    // closures), which select chordTimingHitThreshold vs
+    // timingHitThreshold based on extra.chord. End-to-end coverage of
+    // that selection is via the harness regression fixture (Bad Habit)
+    // — the harness drives the closures and a divergence between chord
+    // and single-note thresholds shows up directly in the hit count.
+    // What this test pins is the unit-level contract: when a caller
+    // hands _ndMakeJudgment a 150 ms threshold (chord-typical) for a
+    // single-note judgment, the classifier still accepts -130 ms — so
+    // the wider threshold isn't silently capped by some chord-specific
+    // gate inside the function.
+    const j = core.makeJudgment({
+        matched: true,
+        chord: false,
+        note: { s: 0, f: 5 },
+        noteTime: 10,
+        judgedAt: 9.87,
+        expectedMidi: 45,
+        detectedMidi: 45,
+        pitchError: 0,
+        timingThresholdMs: 150,
+        pitchThresholdCents: 20,
+    });
+    assert.equal(j.timingState, 'OK');
+    assert.equal(j.hit, true);
+});
+
 test('makeJudgment represents an unmatched pure miss without pitch labels', () => {
     const j = core.makeJudgment({
         matched: false,

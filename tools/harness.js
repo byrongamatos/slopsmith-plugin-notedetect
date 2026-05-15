@@ -164,7 +164,10 @@ note_detect headless harness
   --pitch-tolerance      <c>    cents, outer  (default: 50)
   --pitch-hit-threshold  <c>    cents, clean  (default: 20)
   --timing-tolerance     <s>    seconds, outer (default: 0.150)
-  --timing-hit-threshold <s>    seconds, clean (default: 0.100)
+  --timing-hit-threshold <s>    seconds, single-note clean (default: 0.100)
+  --chord-timing-hit-threshold <s>  seconds, chord clean — chord strums need a wider window than single notes
+                                    (default: 0.150 clamped into [timing-hit-threshold, timing-tolerance];
+                                     i.e. with --timing-tolerance 0.120 the effective default is 0.120, not 0.150)
   --chord-hit-ratio      <r>    0..1           (default: 0.40)
   --latency              <s>    detector latency comp (default: 0.080)
   --frame-size           <n>    samples per frame (default: 1024)
@@ -187,6 +190,11 @@ try {
             'pitch-hit-threshold':   { type: 'string', default: '20' },
             'timing-tolerance':      { type: 'string', default: '0.150' },
             'timing-hit-threshold':  { type: 'string', default: '0.100' },
+            // No CLI default — the runtime default is derived after the
+            // timing-tolerance + timing-hit-threshold args are parsed, so
+            // a user passing `--timing-tolerance 0.120` doesn't fail
+            // validation against a baked-in chord default of 0.150.
+            'chord-timing-hit-threshold': { type: 'string' },
             'chord-hit-ratio':       { type: 'string', default: '0.40' },
             'latency':               { type: 'string', default: '0.080' },
             'frame-size':            { type: 'string', default: '1024' },
@@ -279,12 +287,26 @@ const pitchTolerance    = RANGE(args['pitch-tolerance'], 'pitch-tolerance', 10, 
 const pitchHitThreshold = RANGE(args['pitch-hit-threshold'], 'pitch-hit-threshold', 5, pitchTolerance);
 const timingTolerance    = RANGE(args['timing-tolerance'], 'timing-tolerance', 0.03, 0.3);
 const timingHitThreshold = RANGE(args['timing-hit-threshold'], 'timing-hit-threshold', 0.03, timingTolerance);
+// Chord threshold is bounded below by the single-note threshold (chord
+// scoring should never be stricter than single-note) and above by the
+// outer timing tolerance (the candidate window). When the user didn't
+// pass --chord-timing-hit-threshold, derive a runtime default from the
+// just-parsed timing args: prefer 0.150 (the in-app default), but clamp
+// into [timingHitThreshold, timingTolerance] so `--timing-tolerance` /
+// `--timing-hit-threshold` sweeps don't fail argument validation on the
+// fixed default. Explicit user values still go through the strict
+// RANGE() check so a CLI typo like 999 is rejected loudly.
+const _CHORD_TIMING_DEFAULT_S = 0.150;
+const chordTimingHitThreshold = args['chord-timing-hit-threshold'] !== undefined
+    ? RANGE(args['chord-timing-hit-threshold'], 'chord-timing-hit-threshold', timingHitThreshold, timingTolerance)
+    : Math.max(timingHitThreshold, Math.min(timingTolerance, _CHORD_TIMING_DEFAULT_S));
 const settings = {
     method,
     pitchTolerance,
     pitchHitThreshold,
     timingTolerance,
     timingHitThreshold,
+    chordTimingHitThreshold,
     chordHitRatio:      RATIO_01(args['chord-hit-ratio'], 'chord-hit-ratio'),
     latencyOffset:      RANGE(args['latency'], 'latency', 0, 1),
 };
