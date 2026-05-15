@@ -1173,6 +1173,18 @@ function createNoteDetector(options = {}) {
     let timingTolerance = 0.150;
     let pitchTolerance = 50;
     let timingHitThreshold = 0.100;
+    // Chord-specific timing-OK window. Wider than the single-note
+    // threshold because a chord strum spans 5–10 ms across strings and
+    // the per-string FFT analysis window itself smears chord-strike
+    // timing by another 50–100 ms — so the inherent jitter on a chord
+    // event is closer to ±150 ms than the single-note ±100 ms. Fast
+    // punk / pop-rock rhythm players also anticipate the beat by 80–
+    // 120 ms (issue #38 — "Bad Habit", "American Jesus"), and the strict
+    // 100 ms window cuts off most of that bias even when the chord was
+    // scored as a strict-ratio hit. Default 150 ms; clamped >=
+    // timingHitThreshold at load so chord scoring is never stricter
+    // than single notes.
+    let chordTimingHitThreshold = 0.150;
     let pitchHitThreshold = 20;
     let showTimingErrors = true;
     let showPitchErrors = true;
@@ -1246,6 +1258,11 @@ function createNoteDetector(options = {}) {
             if (s.timingTolerance !== undefined) timingTolerance = Math.max(0.03, Math.min(0.3, s.timingTolerance));
             if (s.pitchTolerance !== undefined) pitchTolerance = Math.max(10, Math.min(100, s.pitchTolerance));
             if (s.timingHitThreshold !== undefined) timingHitThreshold = Math.max(0.03, Math.min(timingTolerance, s.timingHitThreshold));
+            // Chord threshold clamp: at least the single-note strict threshold
+            // (chords shouldn't be stricter than single notes), at most the
+            // outer timing tolerance (we're widening within the existing
+            // candidate window, not pushing past it).
+            if (s.chordTimingHitThreshold !== undefined) chordTimingHitThreshold = Math.max(timingHitThreshold, Math.min(timingTolerance, s.chordTimingHitThreshold));
             if (s.pitchHitThreshold !== undefined) pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, s.pitchHitThreshold));
             if (s.showTimingErrors !== undefined) showTimingErrors = !!s.showTimingErrors;
             if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
@@ -1271,6 +1288,14 @@ function createNoteDetector(options = {}) {
             }
         }
     } catch (e) { /* localStorage unavailable */ }
+    // Chord window invariant — single-note strict can't exceed chord
+    // (a stored chord value smaller than the loaded strict threshold
+    // would invert the relationship); and chord can't exceed the outer
+    // tolerance (we're widening within the candidate window, not past
+    // it). The latter trips when a user has a stored timingTolerance
+    // below the chord default and no chordTimingHitThreshold yet.
+    if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
+    if (chordTimingHitThreshold > timingTolerance)    chordTimingHitThreshold = timingTolerance;
 
     // opts.channel overrides the persisted channel for this instance
     // (used by splitscreen to force left/right per panel).
@@ -1371,6 +1396,7 @@ function createNoteDetector(options = {}) {
                 method: detectionMethod,
                 timing_tolerance_s: timingTolerance,
                 timing_hit_threshold_s: timingHitThreshold,
+                chord_timing_hit_threshold_s: chordTimingHitThreshold,
                 pitch_tolerance_cents: pitchTolerance,
                 pitch_hit_threshold_cents: pitchHitThreshold,
                 chord_hit_ratio: chordHitRatio,
@@ -1595,6 +1621,7 @@ function createNoteDetector(options = {}) {
                 timingTolerance,
                 pitchTolerance,
                 timingHitThreshold,
+                chordTimingHitThreshold,
                 pitchHitThreshold,
                 showTimingErrors,
                 showPitchErrors,
@@ -2336,7 +2363,7 @@ function createNoteDetector(options = {}) {
             pitchError,
             expectedFreq,
             detectedFreq,
-            timingThresholdMs: timingHitThreshold * 1000,
+            timingThresholdMs: (extra.chord ? chordTimingHitThreshold : timingHitThreshold) * 1000,
             pitchThresholdCents: pitchHitThreshold,
             hitStrings: extra.hitStrings,
             totalStrings: extra.totalStrings,
@@ -2356,7 +2383,7 @@ function createNoteDetector(options = {}) {
             noteTime,
             judgedAt: t,
             expectedMidi,
-            timingThresholdMs: timingHitThreshold * 1000,
+            timingThresholdMs: (extra.chord ? chordTimingHitThreshold : timingHitThreshold) * 1000,
             pitchThresholdCents: pitchHitThreshold,
             hitStrings: extra.hitStrings,
             totalStrings: extra.totalStrings,
@@ -2946,6 +2973,15 @@ function createNoteDetector(options = {}) {
                         const stringExpectedMidi = _ndMidiFromStringFret(
                             cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                         );
+                        // Per-string constituent stays as a single-note
+                        // judgment (no chord:true flag): _ndMakeJudgment
+                        // treats `chord: true` as timing-only for the
+                        // hit calc, which would flip per-string SHARP /
+                        // FLAT pitch misses into spurious hits. The
+                        // chord-level judgment (which owns the wider
+                        // timing window) is already recorded separately
+                        // above — this entry only feeds per-string
+                        // diagnostics, where pitch correctness matters.
                         const stringMiss = makeMissJudgment(cn, cn.t, t, stringExpectedMidi);
                         noteResults.set(key, stringMiss);
                         _recordPerStringForChord(stringMiss);
@@ -3271,6 +3307,13 @@ function createNoteDetector(options = {}) {
             <input type="range" min="30" max="${Math.round(timingTolerance * 1000)}" value="${Math.round(timingHitThreshold * 1000)}"
                    class="nd-timing-hit-slider w-full accent-blue-400 mb-2">
 
+            <label class="block text-gray-400 text-xs mb-1">Chord Timing Window: <span class="nd-chord-timing-val">${Math.round(chordTimingHitThreshold * 1000)}</span>ms</label>
+            <input type="range" min="${Math.round(timingHitThreshold * 1000)}" max="${Math.round(timingTolerance * 1000)}" value="${Math.round(chordTimingHitThreshold * 1000)}"
+                   class="nd-chord-timing-slider w-full accent-blue-400 mb-1">
+            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+                Chord strums have more inherent timing jitter than single notes (multi-string strike spread + analysis-window smearing). Fast power-chord punk also anticipates the beat. Wider than Clean Timing; pinned >= it.
+            </div>
+
             <label class="block text-gray-400 text-xs mb-1">Clean Pitch: <span class="nd-pitch-hit-val">${pitchHitThreshold}</span> cents</label>
             <input type="range" min="5" max="${pitchTolerance}" value="${pitchHitThreshold}"
                    class="nd-pitch-hit-slider w-full accent-blue-400 mb-3">
@@ -3399,12 +3442,21 @@ function createNoteDetector(options = {}) {
         panel.querySelector('.nd-timing-slider').oninput = (e) => {
             timingTolerance = e.target.value / 1000;
             timingHitThreshold = Math.min(timingHitThreshold, timingTolerance);
+            chordTimingHitThreshold = Math.min(chordTimingHitThreshold, timingTolerance);
+            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
             panel.querySelector('.nd-timing-val').textContent = e.target.value;
             const hitSlider = panel.querySelector('.nd-timing-hit-slider');
             if (hitSlider) {
                 hitSlider.max = e.target.value;
                 hitSlider.value = Math.round(timingHitThreshold * 1000);
                 panel.querySelector('.nd-timing-hit-val').textContent = hitSlider.value;
+            }
+            const chordSlider = panel.querySelector('.nd-chord-timing-slider');
+            if (chordSlider) {
+                chordSlider.max = e.target.value;
+                chordSlider.min = Math.round(timingHitThreshold * 1000);
+                chordSlider.value = Math.round(chordTimingHitThreshold * 1000);
+                panel.querySelector('.nd-chord-timing-val').textContent = chordSlider.value;
             }
             saveSettings();
         };
@@ -3423,6 +3475,25 @@ function createNoteDetector(options = {}) {
         panel.querySelector('.nd-timing-hit-slider').oninput = (e) => {
             timingHitThreshold = e.target.value / 1000;
             panel.querySelector('.nd-timing-hit-val').textContent = e.target.value;
+            // Keep the chord-timing slider's lower bound + value in sync —
+            // chord threshold can never be stricter than single-note.
+            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
+            const chordSlider = panel.querySelector('.nd-chord-timing-slider');
+            if (chordSlider) {
+                chordSlider.min = e.target.value;
+                chordSlider.value = Math.round(chordTimingHitThreshold * 1000);
+                panel.querySelector('.nd-chord-timing-val').textContent = chordSlider.value;
+            }
+            saveSettings();
+        };
+        panel.querySelector('.nd-chord-timing-slider').oninput = (e) => {
+            chordTimingHitThreshold = e.target.value / 1000;
+            // Enforce the invariant on direct edits too — slider min should
+            // already prevent inversion, but a stale DOM state during fast
+            // drag can momentarily produce values below the current
+            // single-note threshold. Clamp here to be safe.
+            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
+            panel.querySelector('.nd-chord-timing-val').textContent = Math.round(chordTimingHitThreshold * 1000);
             saveSettings();
         };
         panel.querySelector('.nd-pitch-hit-slider').oninput = (e) => {
@@ -4595,6 +4666,7 @@ function createNoteDetector(options = {}) {
                 method: detectionMethod,
                 timing_tolerance_s: timingTolerance,
                 timing_hit_threshold_s: timingHitThreshold,
+                chord_timing_hit_threshold_s: chordTimingHitThreshold,
                 pitch_tolerance_cents: pitchTolerance,
                 pitch_hit_threshold_cents: pitchHitThreshold,
                 chord_hit_ratio: chordHitRatio,
@@ -5112,6 +5184,11 @@ function createNoteDetector(options = {}) {
             if (Number.isFinite(partial.timingHitThreshold)) {
                 timingHitThreshold = Math.max(0.03, Math.min(timingTolerance, partial.timingHitThreshold));
             }
+            if (Number.isFinite(partial.chordTimingHitThreshold)) {
+                chordTimingHitThreshold = Math.max(timingHitThreshold, Math.min(timingTolerance, partial.chordTimingHitThreshold));
+            }
+            // Maintain the chord >= single-note invariant after either side moved.
+            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
             if (Number.isFinite(partial.pitchHitThreshold)) {
                 pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, partial.pitchHitThreshold));
             }
@@ -5131,12 +5208,24 @@ function createNoteDetector(options = {}) {
                 // the slider back into range.
                 latencyOffset = Math.max(0, Math.min(0.25, partial.latencyOffset));
             }
+            // Re-enforce timing-threshold invariants at the END of the
+            // setter. A partial that lowers `timingTolerance` alone (and
+            // doesn't supply new hit thresholds) would otherwise leave
+            // `timingHitThreshold` and/or `chordTimingHitThreshold`
+            // above the new tolerance ceiling — a state the UI sliders
+            // can't represent and that drifts judgment classification
+            // until the user touches another knob. Same pattern as the
+            // storage-load invariant at the top of createNoteDetector.
+            if (timingHitThreshold > timingTolerance) timingHitThreshold = timingTolerance;
+            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
+            if (chordTimingHitThreshold > timingTolerance)    chordTimingHitThreshold = timingTolerance;
             saveSettings();
             return {
                 method: detectionMethod,
                 timingTolerance,
                 pitchTolerance,
                 timingHitThreshold,
+                chordTimingHitThreshold,
                 pitchHitThreshold,
                 chordHitRatio,
                 detectionConfidenceMin,
@@ -5298,9 +5387,28 @@ function createNoteDetector(options = {}) {
                 if (Number.isFinite(s.pitchHitThreshold))   pitchHitThreshold   = s.pitchHitThreshold;
                 if (Number.isFinite(s.timingTolerance))     timingTolerance     = s.timingTolerance;
                 if (Number.isFinite(s.timingHitThreshold))  timingHitThreshold  = s.timingHitThreshold;
+                if (Number.isFinite(s.chordTimingHitThreshold)) {
+                    // Clamp here too — _harness is a Node-only entrypoint
+                    // (harness.js + regression.js drive scoring through it)
+                    // and a regression sweep can legitimately pass a chord
+                    // threshold outside [timingHitThreshold, timingTolerance]
+                    // (e.g. when sweeping timing alone without re-clamping
+                    // the chord value). Clamp instead of accepting blindly
+                    // so headless scoring matches in-app behavior.
+                    chordTimingHitThreshold = Math.max(timingHitThreshold, Math.min(timingTolerance, s.chordTimingHitThreshold));
+                }
                 if (Number.isFinite(s.chordHitRatio))       chordHitRatio       = s.chordHitRatio;
                 if (Number.isFinite(s.latencyOffset))       latencyOffset       = s.latencyOffset;
                 if (Number.isFinite(s.inputGain))           inputGain           = s.inputGain;
+                // Re-enforce timing-threshold invariants at the END of the
+                // setter. A harness caller can legitimately update only
+                // `timingHitThreshold` or `timingTolerance` between scoring
+                // runs; without this re-clamp the chord threshold can
+                // become stricter than single-note OR exceed the outer
+                // tolerance, both of which diverge from in-app behavior.
+                if (timingHitThreshold > timingTolerance) timingHitThreshold = timingTolerance;
+                if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
+                if (chordTimingHitThreshold > timingTolerance)    chordTimingHitThreshold = timingTolerance;
             },
         },
     };
