@@ -161,6 +161,15 @@ No extra dependencies — the FFT is an inline radix-2 Cooley-Tukey, ~80 lines o
 
 TensorFlow.js neural network model (~20MB, loaded lazily on first use). More robust with heavily distorted or effected signals. Uses WebGL acceleration when available. If the model fails to load (network / WebGL), YIN is used as a transparent runtime fallback.
 
+### ML note detection (Slopsmith Desktop only)
+
+On **Slopsmith Desktop**, when the native audio engine has the Spotify **Basic Pitch** model loaded, detection is upgraded transparently — no setting to flip. The plugin's desktop bridge consumes the engine's polyphonic transcription:
+
+- **Single notes** — the dominant pitch comes from the ML detector instead of YIN/HPS/CREPE.
+- **Chords** — when the engine exposes `audio.detectNotes`, the chord branch judges each chart note against the *full set of pitches the model actually transcribed* (`_ndScoreChordViaDetectNotes`). This is genuine polyphonic transcription: a **wrong** note is simply absent from the set, where the constraint scorer's per-string energy band would false-positive on a neighbour's bleed.
+
+This path is fully feature-detected and fail-soft: a desktop build without `detectNotes` falls back to the `audio.scoreChord` IPC (native scorer), and a build without the ML model falls back to YIN/`ChordScorer`. The browser build is unaffected and keeps the JS YIN/HPS/CREPE + constraint path. See `slopsmith-desktop/src/audio/MlNoteDetector.*`.
+
 ## Requirements
 
 - Browser with `getUserMedia` support (all modern browsers)

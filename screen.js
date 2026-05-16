@@ -945,6 +945,65 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
     return { score, hitStrings, totalStrings, results, isHit, voicingHit };
 }
 
+// Score a chord against the desktop ML detector's raw transcription — the
+// "true TST" path. `detection` is the `{ notes: [{ midi, confidence, onset }],
+// sampleRate }` payload from `audio.detectNotes()`; a chord note counts as a
+// hit when its expected MIDI pitch is in that active set. This is genuine
+// polyphonic transcription: a wrong note (say G# played for G) is simply
+// absent from the set, where the constraint scorer's per-string energy band
+// would false-positive on the neighbour's bleed.
+//
+// Returns the same shape as `_ndScoreChord` so the chord branch in
+// matchNotes() consumes it unchanged. Pitch-class membership replaces the
+// cents measurement, so per-string `centsDiff` / `centsError` are null.
+function _ndScoreChordViaDetectNotes(detection, chordNotes, arrangement, stringCount, offsets, capo, minHitRatio = 0.6) {
+    const active = new Set();
+    if (detection && Array.isArray(detection.notes)) {
+        for (const n of detection.notes)
+            if (n && typeof n.midi === 'number') active.add(n.midi);
+    }
+
+    const results = [];
+    let hitStrings = 0;
+    let exactHits = 0;
+    for (const cn of chordNotes) {
+        const expectedMidi = _ndMidiFromStringFret(
+            cn.s, cn.f, arrangement, stringCount, offsets, capo
+        );
+        // Plain (exact) match — the chart pitch is sounding.
+        let hit = active.has(expectedMidi);
+        let exact = hit;
+        // Bend / slide: the sounding pitch is in motion — accept a ±2
+        // semitone window around the expected note.
+        if (!hit && (cn.b || cn.sl)) {
+            for (let d = -2; d <= 2 && !hit; d++)
+                if (d !== 0) hit = active.has(expectedMidi + d);
+        }
+        // Harmonic: the fretted fundamental is suppressed and an overtone
+        // sounds — accept the octave or octave+fifth above.
+        if (!hit && cn.hm) {
+            hit = active.has(expectedMidi + 12) || active.has(expectedMidi + 19);
+        }
+        if (hit) hitStrings++;
+        if (exact) exactHits++;
+        results.push({
+            s: cn.s, f: cn.f, hit,
+            bandEnergy: 0,        // ML path measures no per-string energy
+            centsDiff: null,      // pitch-class membership, not a cents check
+            centsError: null,
+        });
+    }
+
+    const totalStrings = chordNotes.length;
+    const score = totalStrings > 0 ? hitStrings / totalStrings : 0;
+    // Voicing-reduction credit: ≥2 strings sounding at their exact expected
+    // pitch. Every ML hit is pitch-verified, so exact matches are the gate
+    // (technique-widened hits don't count, mirroring _ndScoreChord).
+    const voicingHit = exactHits >= 2;
+    const isHit = score >= minHitRatio;
+    return { score, hitStrings, totalStrings, results, isHit, voicingHit };
+}
+
 // ── Pitch Detection: CREPE (shared model) ──────────────────────────────────
 
 async function _ndLoadCrepe() {
@@ -1566,6 +1625,15 @@ function createNoteDetector(options = {}) {
     // chord branch can dispatch `audio.scoreChord(ctx)` without
     // re-resolving from window on every tick. Cleared by stopAudio().
     let bridgeDesktop = null;
+    // Latest raw polyphonic transcription from the desktop ML note detector
+    // (Basic Pitch), refreshed each bridge poll when `audio.detectNotes` is
+    // available. `{ notes: [{ midi, confidence, onset }], sampleRate }` or
+    // null when the ML detector isn't active — in which case the chord branch
+    // falls back to the `audio.scoreChord` IPC and single notes to the
+    // dominant `getPitchDetection` pitch. This is the "true TST" path: the
+    // full active-pitch set lets us judge a chart note against real
+    // transcription, distinguishing a wrong note from a missed one.
+    let bridgeDetectedNotes = null;
 
     // Visual-feedback tracking
     let lastHitCount = 0;
@@ -1709,33 +1777,71 @@ function createNoteDetector(options = {}) {
                         } catch (_) { /* keep the 48000 default */ }
                     }
 
+                    // Whether this desktop build exposes the raw polyphonic
+                    // transcription API. Captured once — the addon's method
+                    // set is fixed for the session.
+                    const hasDetectNotes = typeof desktop.audio.detectNotes === 'function';
+
                     detectInterval = setInterval(async () => {
                         if (!enabled || processingFrame) return;
                         processingFrame = true;
                         const gen = sessionGen;
                         try {
-                            const p = await desktop.audio.getPitchDetection();
-                            if (!enabled || gen !== sessionGen) return;
-                            if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
-                                && typeof p.confidence === 'number' && p.confidence >= detectionConfidenceMin) {
-                                detectedMidi = p.midiNote;
-                                detectedConfidence = p.confidence;
-                            } else {
-                                detectedMidi = -1;
-                                detectedConfidence = 0;
-                                detectedString = -1;
-                                detectedFret = -1;
+                            // Prefer the raw polyphonic transcription: one
+                            // detectNotes() call yields the full active-pitch
+                            // set (consumed by the chord branch) and the
+                            // dominant pitch (the single-note path). Resolves
+                            // null on a downlevel addon or when the ML
+                            // detector is inactive — then fall back to the
+                            // monophonic getPitchDetection.
+                            let detection = null;
+                            if (hasDetectNotes) {
+                                try { detection = await desktop.audio.detectNotes(); }
+                                catch (_) { detection = null; }
+                                if (!enabled || gen !== sessionGen) return;
                             }
-                            // The chord branch in matchNotes() now
-                            // dispatches through audio:scoreChord IPC
-                            // when usingDesktopBridge is set, so we
-                            // no longer need to thread a raw audio
-                            // buffer here — the engine reads from its
-                            // own input ring inside scoreChord. Pass
+                            bridgeDetectedNotes = detection;
+
+                            if (detection && Array.isArray(detection.notes)) {
+                                // Dominant pitch = highest-confidence note in
+                                // the active set.
+                                let best = null;
+                                for (const n of detection.notes) {
+                                    if (n && typeof n.midi === 'number'
+                                        && (best === null || n.confidence > best.confidence)) {
+                                        best = n;
+                                    }
+                                }
+                                if (best && best.confidence >= detectionConfidenceMin) {
+                                    detectedMidi = best.midi;
+                                    detectedConfidence = best.confidence;
+                                } else {
+                                    detectedMidi = -1;
+                                    detectedConfidence = 0;
+                                    detectedString = -1;
+                                    detectedFret = -1;
+                                }
+                            } else {
+                                const p = await desktop.audio.getPitchDetection();
+                                if (!enabled || gen !== sessionGen) return;
+                                if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
+                                    && typeof p.confidence === 'number' && p.confidence >= detectionConfidenceMin) {
+                                    detectedMidi = p.midiNote;
+                                    detectedConfidence = p.confidence;
+                                } else {
+                                    detectedMidi = -1;
+                                    detectedConfidence = 0;
+                                    detectedString = -1;
+                                    detectedFret = -1;
+                                }
+                            }
+                            // The chord branch in matchNotes() scores from
+                            // bridgeDetectedNotes (or the audio:scoreChord
+                            // IPC fallback) — no raw audio buffer is threaded
+                            // here, the engine reads its own input ring. Pass
                             // null; the single-note path is gated on
-                            // detectedMidi >= 0 and skips itself
-                            // regardless, and checkMisses() is
-                            // independent.
+                            // detectedMidi >= 0 and skips itself regardless,
+                            // and checkMisses() is independent.
                             await matchNotes(null);
                         } catch (e) {
                             console.warn('[note_detect] bridge poll failed:', e && e.message ? e.message : e);
@@ -1890,6 +1996,7 @@ function createNoteDetector(options = {}) {
         // enable re-resolves window.slopsmithDesktop fresh.
         usingDesktopBridge = false;
         bridgeDesktop = null;
+        bridgeDetectedNotes = null;
         // Disconnect the full node chain in reverse-connect order.
         // Critical in borrower mode (external audioCtx): we leave the
         // caller's context open, and any node we don't disconnect
@@ -2756,6 +2863,23 @@ function createNoteDetector(options = {}) {
                 //    the previous frameless guard).
                 let chordResult;
                 if (usingDesktopBridge) {
+                    // True-transcription path: when the desktop ML detector
+                    // published an active-pitch set this tick, score the
+                    // chord against it directly — real polyphonic
+                    // transcription, no IPC round-trip.
+                    if (bridgeDetectedNotes) {
+                        chordResult = _ndScoreChordViaDetectNotes(
+                            bridgeDetectedNotes, group,
+                            currentArrangement, currentStringCount,
+                            tuningOffsets, capo, chordHitRatio
+                        );
+                    }
+                }
+                if (usingDesktopBridge && !chordResult) {
+                    // Fallback: dispatch the scoreChord IPC. The native
+                    // scorer is ML-backed when a model is loaded, else the
+                    // constraint scorer — used here when detectNotes is
+                    // absent/inactive on this desktop build.
                     if (!bridgeDesktop || !bridgeDesktop.audio
                         || typeof bridgeDesktop.audio.scoreChord !== 'function') {
                         continue;
@@ -2800,7 +2924,7 @@ function createNoteDetector(options = {}) {
                     // skips this group; later groups are still valid.
                     if (!enabled || gen !== sessionGen) return;
                     if (noteResults.has(chordKey)) continue;
-                } else {
+                } else if (!usingDesktopBridge) {
                     // Browser path needs the just-analysed buffer.
                     // Skip if no audio buffer was passed in (e.g.
                     // instance restart while a stale processFrame is

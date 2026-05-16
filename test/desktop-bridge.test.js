@@ -458,6 +458,132 @@ test('bridge path: destroy mid-scoreChord does not throw and does not record a l
     await flushPendingAsync();
 });
 
+// ── Phase 2: raw polyphonic transcription via audio.detectNotes ──────────────
+
+// Build a bridge sandbox whose audio mock exposes detectNotes (the ML
+// transcription API). `detectNotesImpl` controls what detectNotes resolves.
+function bridgeWithDetectNotes(detectNotesImpl) {
+    const calls = {
+        detectNotes: 0, getPitchDetection: 0, scoreChord: 0, getUserMedia: 0,
+    };
+    const intervalCallbacks = [];
+    const { createNoteDetector } = loadDetectionCore({
+        sandboxBeforeRun(sandbox) {
+            sandbox.navigator.mediaDevices.getUserMedia = () => {
+                calls.getUserMedia++;
+                return Promise.reject(new Error('getUserMedia should not be called on the bridge path'));
+            };
+            sandbox.setInterval = (cb) => {
+                if (typeof cb === 'function') intervalCallbacks.push(cb);
+                return intervalCallbacks.length;
+            };
+            // Standard-tuning guitar: string 0/1/2 open = E2(40) A2(45) D3(50).
+            sandbox.highway.getChords = () => ([
+                { t: 0, notes: [{ s: 0, f: 0 }, { s: 1, f: 0 }, { s: 2, f: 0 }] },
+            ]);
+            sandbox.window.slopsmithDesktop = {
+                isDesktop: true,
+                platform: 'linux',
+                audio: {
+                    isAvailable: async () => true,
+                    isAudioRunning: async () => true,
+                    startAudio: async () => {},
+                    getLevels: async () => ({ inputLevel: 0, inputPeak: 0, outputLevel: 0, outputPeak: 0 }),
+                    getSampleRate: async () => 48000,
+                    getPitchDetection: async () => {
+                        calls.getPitchDetection++;
+                        return { midiNote: -1, confidence: 0, frequency: -1, cents: 0, noteName: '' };
+                    },
+                    scoreChord: async (ctx) => {
+                        calls.scoreChord++;
+                        return {
+                            score: 0, hitStrings: 0, totalStrings: ctx.notes.length,
+                            isHit: false,
+                            results: ctx.notes.map(n => ({
+                                s: n.s, f: n.f, hit: false,
+                                bandEnergy: 0, centsDiff: null, centsError: null,
+                            })),
+                        };
+                    },
+                    detectNotes: async () => {
+                        calls.detectNotes++;
+                        return detectNotesImpl();
+                    },
+                },
+            };
+        },
+    });
+    return { createNoteDetector, calls, intervalCallbacks };
+}
+
+async function driveDetectTick(intervalCallbacks, calls) {
+    // The detect tick is the interval that calls detectNotes (the ML path)
+    // or getPitchDetection (the fallback). Pick it by behaviour.
+    for (const cb of intervalCallbacks) {
+        const before = calls.detectNotes + calls.getPitchDetection;
+        // eslint-disable-next-line no-await-in-loop
+        await cb();
+        // eslint-disable-next-line no-await-in-loop
+        await flushPendingAsync();
+        if (calls.detectNotes + calls.getPitchDetection > before) return cb;
+    }
+    return null;
+}
+
+test('detectNotes path: chord scored from the transcription set, scoreChord IPC not called', async () => {
+    // When the desktop exposes audio.detectNotes and it returns an active
+    // pitch set, the chord branch judges the chord against that set directly
+    // — no scoreChord IPC, no getUserMedia, no getPitchDetection.
+    const { createNoteDetector, calls, intervalCallbacks } = bridgeWithDetectNotes(
+        () => ({
+            notes: [
+                { midi: 40, confidence: 0.82, onset: 0.7 },
+                { midi: 45, confidence: 0.78, onset: 0.6 },
+                { midi: 50, confidence: 0.71, onset: 0.5 },
+            ],
+            sampleRate: 48000,
+        }),
+    );
+    const det = createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    const detectTick = await driveDetectTick(intervalCallbacks, calls);
+    assert.equal(typeof detectTick, 'function', 'a detect tick should be registered');
+    assert.ok(calls.detectNotes >= 1, 'detectNotes should be polled on the ML path');
+    assert.equal(calls.scoreChord, 0, 'scoreChord IPC must not be used when detectNotes is active');
+    assert.equal(calls.getPitchDetection, 0, 'getPitchDetection is replaced by detectNotes on the ML path');
+    assert.equal(calls.getUserMedia, 0, 'getUserMedia must not be called on the bridge path');
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
+test('detectNotes path: null result falls back to the scoreChord IPC', async () => {
+    // detectNotes resolves null when the desktop ML detector is inactive
+    // (no model / ONNX support absent). The chord branch must then fall
+    // back to the scoreChord IPC, and the monophonic path to
+    // getPitchDetection — exactly the Phase 1 behaviour.
+    const { createNoteDetector, calls, intervalCallbacks } = bridgeWithDetectNotes(
+        () => null,
+    );
+    const det = createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    const detectTick = await driveDetectTick(intervalCallbacks, calls);
+    assert.equal(typeof detectTick, 'function');
+    assert.ok(calls.detectNotes >= 1, 'detectNotes is still probed');
+    assert.ok(calls.getPitchDetection >= 1,
+        'null detectNotes falls back to getPitchDetection for the monophonic path');
+    assert.equal(calls.scoreChord, 1,
+        'null detectNotes falls back to the scoreChord IPC for the chord');
+    assert.equal(calls.getUserMedia, 0, 'still no getUserMedia');
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
 test('bridge path: downlevel desktop without scoreChord — chord branch silently skips, monophonic still works', async () => {
     // Compatibility guard: an older slopsmith-desktop build can
     // expose getPitchDetection (monophonic path) without yet shipping
