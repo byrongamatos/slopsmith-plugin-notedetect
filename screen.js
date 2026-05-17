@@ -193,7 +193,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.9.0';
+const _ND_VERSION = '1.10.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -1634,6 +1634,13 @@ function createNoteDetector(options = {}) {
     // full active-pitch set lets us judge a chart note against real
     // transcription, distinguishing a wrong note from a missed one.
     let bridgeDetectedNotes = null;
+    // Age (ms) of the freshest single-note ML detection from the last bridge
+    // poll — i.e. how long ago that note's audio actually onset. The desktop
+    // ML detector measures this from the onset posteriorgram frame, so the
+    // single-note path can back-date its judgment to the true onset instead
+    // of poll time (the ML pipeline lags ~100 ms, and a sustained note would
+    // otherwise match at the timing-window edge). null = no fresh onset.
+    let bridgeDetectionAgeMs = null;
 
     // Visual-feedback tracking
     let lastHitCount = 0;
@@ -1803,25 +1810,41 @@ function createNoteDetector(options = {}) {
                             bridgeDetectedNotes = detection;
 
                             if (detection && Array.isArray(detection.notes)) {
-                                // Dominant pitch = highest-confidence note in
-                                // the active set.
+                                // Single-note pick = the FRESHEST-onset note in
+                                // the active set (smallest onsetMs), not just
+                                // the loudest. The ML detector reports a pitch
+                                // for its whole ring; keying off the freshest
+                                // onset makes the single-note path edge-
+                                // triggered (fires at the new note) instead of
+                                // matching a still-ringing note at the timing-
+                                // window edge. Ties / missing onsetMs fall back
+                                // to confidence.
                                 let best = null;
                                 for (const n of detection.notes) {
-                                    if (n && typeof n.midi === 'number'
-                                        && (best === null || n.confidence > best.confidence)) {
+                                    if (!n || typeof n.midi !== 'number') continue;
+                                    if (best === null) { best = n; continue; }
+                                    const na = Number.isFinite(n.onsetMs) ? n.onsetMs : Infinity;
+                                    const ba = Number.isFinite(best.onsetMs) ? best.onsetMs : Infinity;
+                                    if (na < ba || (na === ba && n.confidence > best.confidence)) {
                                         best = n;
                                     }
                                 }
                                 if (best && best.confidence >= detectionConfidenceMin) {
                                     detectedMidi = best.midi;
                                     detectedConfidence = best.confidence;
+                                    bridgeDetectionAgeMs = Number.isFinite(best.onsetMs)
+                                        ? best.onsetMs : null;
                                 } else {
                                     detectedMidi = -1;
                                     detectedConfidence = 0;
                                     detectedString = -1;
                                     detectedFret = -1;
+                                    bridgeDetectionAgeMs = null;
                                 }
                             } else {
+                                // Downlevel desktop without detectNotes — no
+                                // onset age available, so no back-dating.
+                                bridgeDetectionAgeMs = null;
                                 const p = await desktop.audio.getPitchDetection();
                                 if (!enabled || gen !== sessionGen) return;
                                 if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
@@ -1997,6 +2020,7 @@ function createNoteDetector(options = {}) {
         usingDesktopBridge = false;
         bridgeDesktop = null;
         bridgeDetectedNotes = null;
+        bridgeDetectionAgeMs = null;
         // Disconnect the full node chain in reverse-connect order.
         // Critical in borrower mode (external audioCtx): we leave the
         // caller's context open, and any node we don't disconnect
@@ -2718,6 +2742,15 @@ function createNoteDetector(options = {}) {
     async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
+        // Single-note judged-at time. On the desktop ML bridge a detection
+        // carries the real age of its audio onset (onsetMs), so back-date the
+        // judgment to that true onset instead of using the fixed latencyOffset
+        // guess — this removes both the ML pipeline lag and the ringing-note
+        // timing-window-edge bias. Falls back to `t` on the web / downlevel
+        // paths (bridgeDetectionAgeMs null). Chords still use `t`.
+        const tSingle = (usingDesktopBridge && bridgeDetectionAgeMs != null)
+            ? hw.getTime() + avOffsetSec - (bridgeDetectionAgeMs / 1000)
+            : t;
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
         // raw audio buffer and doesn't need a confident monophonic pitch.
         // The single-note path below is gated on detectedMidi >= 0 and
@@ -2839,8 +2872,10 @@ function createNoteDetector(options = {}) {
                 const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
 
                 if (Math.abs(detectedCents) <= centsTolerance) {
+                    // tSingle back-dates to the true audio onset on the ML
+                    // bridge path (== t on web / downlevel).
                     const judgment = makeMatchedJudgment(
-                        cn, cn.t, t, expectedMidi, detectedMidi, detectedConfidence,
+                        cn, cn.t, tSingle, expectedMidi, detectedMidi, detectedConfidence,
                         { pitchError: detectedCents }
                     );
                     recordJudgment(key, judgment);

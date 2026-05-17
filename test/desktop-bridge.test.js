@@ -537,9 +537,9 @@ test('detectNotes path: chord scored from the transcription set, scoreChord IPC 
     const { createNoteDetector, calls, intervalCallbacks } = bridgeWithDetectNotes(
         () => ({
             notes: [
-                { midi: 40, confidence: 0.82, onset: 0.7 },
-                { midi: 45, confidence: 0.78, onset: 0.6 },
-                { midi: 50, confidence: 0.71, onset: 0.5 },
+                { midi: 40, confidence: 0.82, onsetMs: 60 },
+                { midi: 45, confidence: 0.78, onsetMs: 55 },
+                { midi: 50, confidence: 0.71, onsetMs: 50 },
             ],
             sampleRate: 48000,
         }),
