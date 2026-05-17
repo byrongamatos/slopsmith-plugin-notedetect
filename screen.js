@@ -2817,10 +2817,6 @@ function createNoteDetector(options = {}) {
 
         for (const [, group] of byTime) {
             if (group.length === 1) {
-                // ── Single note: use the detected MIDI from YIN/HPS/CREPE ──
-                // Skip when monophonic detection wasn't confident; the chord
-                // path below doesn't need detectedMidi and still runs.
-                if (detectedMidi < 0) continue;
                 const cn = group[0];
                 const key = noteKey(cn, cn.t);
                 if (noteResults.has(key)) continue;
@@ -2828,14 +2824,49 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
-                const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
 
-                if (Math.abs(detectedCents) <= centsTolerance) {
-                    const judgment = makeMatchedJudgment(
-                        cn, cn.t, t, expectedMidi, detectedMidi, detectedConfidence,
-                        { pitchError: detectedCents }
-                    );
-                    recordJudgment(key, judgment);
+                if (usingDesktopBridge && bridgeOnsetPrimed) {
+                    // ── ML bridge: per-pitch onset matching ──
+                    // Ask "did THIS note's pitch just onset?" against the
+                    // detected-onset set — not "is one global dominant pitch
+                    // == expected". The detector fires ~4 onsets/note (the
+                    // fundamental + harmonics); collapsing to one dominant
+                    // pitch lost most matches. Edge-triggered on a fresh
+                    // onset, so a ringing note can't drag the match early.
+                    let onset = bridgeNewOnsets.get(expectedMidi);
+                    if (!onset && (cn.b || cn.sl)) {
+                        // Bend / slide: the sounding pitch is in motion.
+                        for (let d = -2; d <= 2 && !onset; d++)
+                            if (d !== 0) onset = bridgeNewOnsets.get(expectedMidi + d);
+                    }
+                    if (!onset && cn.hm) {
+                        // Harmonic: an overtone sounds, not the fundamental.
+                        onset = bridgeNewOnsets.get(expectedMidi + 12)
+                             || bridgeNewOnsets.get(expectedMidi + 19);
+                    }
+                    if (onset) {
+                        // Timestamp at poll time (`t`), NOT back-dated by the
+                        // onset age — back-dating mixed the engine audio clock
+                        // with the song clock and exposed their drift. Poll
+                        // time gives a flat ~+30 ms offset instead.
+                        const judgment = makeMatchedJudgment(
+                            cn, cn.t, t, expectedMidi, expectedMidi, onset.conf,
+                            { pitchError: 0 }
+                        );
+                        recordJudgment(key, judgment);
+                    }
+                } else {
+                    // ── Web / downlevel: monophonic detectedMidi from
+                    //    YIN/HPS/CREPE (or getPitchDetection) ──
+                    if (detectedMidi < 0) continue;
+                    const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
+                    if (Math.abs(detectedCents) <= centsTolerance) {
+                        const judgment = makeMatchedJudgment(
+                            cn, cn.t, t, expectedMidi, detectedMidi, detectedConfidence,
+                            { pitchError: detectedCents }
+                        );
+                        recordJudgment(key, judgment);
+                    }
                 }
             } else {
                 // ── Chord path: constraint-based per-string band analysis ──
