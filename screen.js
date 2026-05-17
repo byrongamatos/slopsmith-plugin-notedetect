@@ -1571,6 +1571,11 @@ function createNoteDetector(options = {}) {
     // model failed to load (the engine then runs the YIN fallback). Stamped
     // into the diagnostic export so a session can be tied to its detector.
     let bridgeMlActive = false;
+    // Detector identity captured DURING detection (not read at diagnostic-
+    // export time, when usingDesktopBridge has already been reset by a Detect
+    // toggle — that mislabelled bridge sessions as web). Set each tick by
+    // whichever path actually ran.
+    let _diagDetector = null;
     // Onset-event state for the desktop ML bridge — used to gate CHORD timing.
     // Each detectNotes note carries a per-pitch `onsetSeq` counter; when it
     // increases, that pitch was struck anew. A chord commits a hit only on a
@@ -1825,6 +1830,14 @@ function createNoteDetector(options = {}) {
                                     detectedFret = -1;
                                 }
                             }
+                            // Stamp the detector identity from the path that
+                            // actually ran this tick (read back by the
+                            // diagnostic export).
+                            _diagDetector = {
+                                desktop_bridge: true,
+                                ml: bridgeMlActive,
+                                path: bridgeMlActive ? 'desktop-ml-basicpitch' : 'desktop-yin',
+                            };
                             // The chord branch in matchNotes() dispatches the
                             // audio:scoreChord IPC — no raw audio buffer is
                             // threaded here, the engine reads its own input
@@ -2273,6 +2286,9 @@ function createNoteDetector(options = {}) {
             detectedMidi = _ndFreqToMidi(result.freq);
             detectedConfidence = result.confidence;
         }
+
+        // Stamp the detector identity for the diagnostic — web JS-DSP path.
+        _diagDetector = { desktop_bridge: false, ml: false, path: 'web-' + detectionMethod };
 
         // Pass the current frame's buffer through to matchNotes so the
         // chord scorer can run on the same audio that was just analysed
@@ -4831,14 +4847,12 @@ function createNoteDetector(options = {}) {
             schema: 'note_detect.diagnostic.v1',
             timestamp: new Date().toISOString(),
             plugin_version: _ND_VERSION,
-            // Which detector actually produced this session — so a diagnostic
-            // is unambiguously tied to ML vs the web/YIN paths.
-            detector: {
-                desktop_bridge: usingDesktopBridge,
-                ml: usingDesktopBridge && bridgeMlActive,
-                path: usingDesktopBridge
-                    ? (bridgeMlActive ? 'desktop-ml-basicpitch' : 'desktop-yin')
-                    : ('web-' + detectionMethod),
+            // Which detector actually produced this session — captured by the
+            // detection tick itself (see _diagDetector), so it stays correct
+            // even when the diagnostic is exported after Detect is toggled
+            // off. null only if detection never ran this session.
+            detector: _diagDetector || {
+                desktop_bridge: false, ml: false, path: 'none',
             },
             benchmark_hint: {
                 title: info.title || null,
