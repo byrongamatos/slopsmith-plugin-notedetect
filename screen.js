@@ -1760,10 +1760,13 @@ function createNoteDetector(options = {}) {
                             // we last consumed means that pitch was struck
                             // anew. Consuming each onset once makes the
                             // single-note path edge-triggered (fires at the
-                            // attack, back-dated to the true onset) instead of
-                            // matching a pitch for its whole ring. Chords are
-                            // scored separately via the scoreChord IPC, gated
-                            // on a fresh chord-pitch onset in bridgeNewOnsets.
+                            // attack) instead of matching a pitch for its
+                            // whole ring. The matched judgment is timestamped
+                            // at the current playhead — not back-dated by the
+                            // onset age, which is not a reliable per-onset
+                            // duration. Chords are scored separately via the
+                            // scoreChord IPC, gated on a fresh chord-pitch
+                            // onset in bridgeNewOnsets.
                             let detection = null;
                             if (hasDetectNotes) {
                                 try { detection = await desktop.audio.detectNotes(); }

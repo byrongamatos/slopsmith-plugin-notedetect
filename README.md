@@ -165,10 +165,10 @@ TensorFlow.js neural network model (~20MB, loaded lazily on first use). More rob
 
 On **Slopsmith Desktop**, when the native audio engine has the Spotify **Basic Pitch** model loaded, detection is upgraded transparently — no setting to flip. The plugin's desktop bridge consumes the engine's polyphonic transcription:
 
-- **Single notes** — the dominant pitch comes from the ML detector instead of YIN/HPS/CREPE.
-- **Chords** — when the engine exposes `audio.detectNotes`, the chord branch judges each chart note against the *full set of pitches the model actually transcribed* (`_ndScoreChordViaDetectNotes`). This is genuine polyphonic transcription: a **wrong** note is simply absent from the set, where the constraint scorer's per-string energy band would false-positive on a neighbour's bleed.
+- **Single notes** — when the engine exposes `audio.detectNotes`, each fresh per-pitch onset from the ML detector is matched to the nearest chart note; otherwise the dominant pitch comes from `audio.getPitchDetection` (ML-backed when a model is loaded, else YIN).
+- **Chords** — judged by the native `audio.scoreChord` IPC, gated on a fresh chord-pitch onset. When the ML model is loaded the engine's scorer checks each chart note's expected pitch against the model's active pitch set — genuine polyphonic transcription, where a **wrong** note is simply absent from the set rather than false-positiving on a neighbour's energy-band bleed; without the model it uses the constraint-based per-string scorer.
 
-This path is fully feature-detected and fail-soft: a desktop build without `detectNotes` falls back to the `audio.scoreChord` IPC (native scorer), and a build without the ML model falls back to YIN/`ChordScorer`. The browser build is unaffected and keeps the JS YIN/HPS/CREPE + constraint path. See `slopsmith-desktop/src/audio/MlNoteDetector.*`.
+This path is fully feature-detected and fail-soft: a desktop build without `detectNotes` still scores single notes via `getPitchDetection`; one without the `scoreChord` IPC skips chord scoring; and a build without the ML model falls back to YIN/`ChordScorer`. The browser build is unaffected and keeps the JS YIN/HPS/CREPE + constraint path. See `slopsmith-desktop/src/audio/MlNoteDetector.*`.
 
 ## Requirements
 
