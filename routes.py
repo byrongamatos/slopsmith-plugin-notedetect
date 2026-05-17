@@ -110,8 +110,11 @@ def setup(app, context):
             try:
                 cand.mkdir(parents=True, exist_ok=True)
                 # A directory can exist but be read-only (packaged bundle) —
-                # confirm with a probe file before committing to it.
-                probe = cand / ".write_test"
+                # confirm with a probe file before committing to it. The probe
+                # name is unique per call (pid + random) so two requests racing
+                # this lazy init can't unlink each other's probe and spuriously
+                # fail a directory that is in fact writable.
+                probe = cand / f".write_test_{os.getpid()}_{secrets.token_hex(6)}"
                 probe.write_bytes(b"")
                 probe.unlink()
             except OSError as e:
