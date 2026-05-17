@@ -1571,21 +1571,19 @@ function createNoteDetector(options = {}) {
     // model failed to load (the engine then runs the YIN fallback). Stamped
     // into the diagnostic export so a session can be tied to its detector.
     let bridgeMlActive = false;
-    // Onset-event matching state for the desktop ML bridge. Each detectNotes
-    // note carries a per-pitch `onsetSeq` counter; when it increases, that
-    // pitch was struck anew. We consume each onset once — making detection
-    // edge-triggered (fires at the attack) instead of matching a pitch for
-    // the whole time it rings, which dragged fast/repeated/chord notes early.
+    // Onset-event state for the desktop ML bridge — used to gate CHORD timing.
+    // Each detectNotes note carries a per-pitch `onsetSeq` counter; when it
+    // increases, that pitch was struck anew. A chord commits a hit only on a
+    // poll where one of its pitches has a fresh onset, so the chord's pitches
+    // ringing on through the riff don't drag the match early.
     //   bridgeOnsetSeqSeen — last consumed onsetSeq per MIDI pitch
     //   bridgeNewOnsets    — onsets first seen on the current poll:
     //                        midi -> { ageMs, conf }
     //   bridgeOnsetPrimed  — false until the first poll has recorded a seq
     //                        baseline (so pre-existing onsets aren't replayed)
-    //   detectedOnsetAgeMs — onset age of the single-note pick, for back-dating
     let bridgeOnsetSeqSeen = new Map();
     let bridgeNewOnsets = new Map();
     let bridgeOnsetPrimed = false;
-    let detectedOnsetAgeMs = null;
 
     // Visual-feedback tracking
     let lastHitCount = 0;
@@ -1790,28 +1788,30 @@ function createNoteDetector(options = {}) {
                                 }
                                 bridgeOnsetPrimed = true;
 
-                                // Single-note pick = the highest-confidence
-                                // NEW onset this poll (-1 when none fired).
-                                let bestMidi = -1, bestConf = 0, bestAge = null;
-                                for (const [midi, o] of bridgeNewOnsets) {
-                                    if (o.conf > bestConf) {
-                                        bestConf = o.conf; bestMidi = midi; bestAge = o.ageMs;
+                                // Single-note pick = highest-confidence active
+                                // note (level-triggered). Edge-triggering the
+                                // single-note path on the onset posteriorgram
+                                // alone proved too sparse for fast guitar and
+                                // dropped notes; the onset events above are
+                                // used only to gate chord timing.
+                                let best = null;
+                                for (const n of detection.notes) {
+                                    if (n && typeof n.midi === 'number'
+                                        && (best === null || n.confidence > best.confidence)) {
+                                        best = n;
                                     }
                                 }
-                                if (bestMidi >= 0) {
-                                    detectedMidi = bestMidi;
-                                    detectedConfidence = bestConf;
-                                    detectedOnsetAgeMs = bestAge;
+                                if (best && best.confidence >= detectionConfidenceMin) {
+                                    detectedMidi = best.midi;
+                                    detectedConfidence = best.confidence;
                                 } else {
                                     detectedMidi = -1;
                                     detectedConfidence = 0;
                                     detectedString = -1;
                                     detectedFret = -1;
-                                    detectedOnsetAgeMs = null;
                                 }
                             } else {
                                 bridgeNewOnsets.clear();
-                                detectedOnsetAgeMs = null;
                                 const p = await desktop.audio.getPitchDetection();
                                 if (!enabled || gen !== sessionGen) return;
                                 if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
@@ -1989,7 +1989,6 @@ function createNoteDetector(options = {}) {
         bridgeOnsetSeqSeen = new Map();
         bridgeNewOnsets = new Map();
         bridgeOnsetPrimed = false;
-        detectedOnsetAgeMs = null;
         // Disconnect the full node chain in reverse-connect order.
         // Critical in borrower mode (external audioCtx): we leave the
         // caller's context open, and any node we don't disconnect
@@ -2711,13 +2710,6 @@ function createNoteDetector(options = {}) {
     async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
-        // Back-dated judged-at time for ML-bridge onset events: the detection
-        // carries the real age of its audio onset, so place the judgment at
-        // the true onset rather than the fixed latencyOffset guess. == t on
-        // the web / downlevel paths (detectedOnsetAgeMs null).
-        const tSingle = (usingDesktopBridge && detectedOnsetAgeMs != null)
-            ? hw.getTime() + avOffsetSec - (detectedOnsetAgeMs / 1000)
-            : t;
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
         // raw audio buffer and doesn't need a confident monophonic pitch.
         // The single-note path below is gated on detectedMidi >= 0 and
@@ -2839,10 +2831,8 @@ function createNoteDetector(options = {}) {
                 const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
 
                 if (Math.abs(detectedCents) <= centsTolerance) {
-                    // tSingle back-dates to the onset event's true time on the
-                    // ML bridge (== t on web / downlevel).
                     const judgment = makeMatchedJudgment(
-                        cn, cn.t, tSingle, expectedMidi, detectedMidi, detectedConfidence,
+                        cn, cn.t, t, expectedMidi, detectedMidi, detectedConfidence,
                         { pitchError: detectedCents }
                     );
                     recordJudgment(key, judgment);
