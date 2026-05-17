@@ -16,19 +16,15 @@ POST /api/plugins/note_detect/live-judgment
     play has zero overhead. Each line is a self-contained record —
     safe to tail / read partially / replay.
 
-Both endpoints write under ``<static>/note_detect_recordings/``, where
-``<static>`` is resolved as ``$STATIC_DIR`` (set by native uvicorn
-launches and the desktop bundle) and falls back to ``/app/static``
-(the in-container bind mount). The directory is created lazily on the
-first write so route registration can never fail on a host where the
-static tree doesn't exist yet — the route stays mounted, and a real
-filesystem problem turns into a clean 500 on save.
-
-We deliberately don't write to ``config_dir`` here even though it's the
-"correct" home for plugin state — config_dir is a named Docker volume in
-the dev compose, so the host can't reach files inside it from outside
-the container. The static tree IS bind-mounted (or repo-relative on
-native / desktop runs), which is what we need.
+Both endpoints write under ``<base>/note_detect_recordings/``, where
+``<base>`` is the first writable directory among ``$STATIC_DIR``,
+``$CONFIG_DIR``, and ``/app/static``. In Docker, ``$STATIC_DIR`` (or the
+``/app/static`` bind mount) is host-reachable, so recordings land there.
+In the packaged desktop bundle ``$STATIC_DIR`` is unset and the bundled
+static tree is read-only, so recordings fall back to ``$CONFIG_DIR`` —
+the user's writable data directory. The base is resolved lazily on the
+first write (and cached) so route registration never fails; a host with
+no writable candidate at all turns into a clean 500 on save.
 """
 
 import json
@@ -87,25 +83,48 @@ def setup(app, context):
     # writable static dir at plugin-load time can't take down route
     # registration — `/api/plugins/note_detect/recording` would 404 and
     # the in-app save would silently fail.
-    static_dir = Path(os.environ.get("STATIC_DIR") or "/app/static")
-    out_dir = static_dir / _RECORDINGS_REL
+    # Recordings need a WRITABLE, user-reachable directory. Try, in order:
+    #   STATIC_DIR  — Docker (bind-mounted, host-reachable) / native dev runs
+    #   CONFIG_DIR  — desktop bundle: STATIC_DIR is unset there and the
+    #                 bundled static tree is read-only, but CONFIG_DIR is the
+    #                 user's writable data directory
+    #   /app/static — last-resort Docker default
+    # The first base that can actually be created AND written wins. It is
+    # resolved lazily on the first write and cached, so a read-only candidate
+    # turns into a clean fallback (and only an all-candidates-fail case 500s)
+    # rather than a load-time crash that 404s the route.
+    _candidate_dirs = []
+    if os.environ.get("STATIC_DIR"):
+        _candidate_dirs.append(Path(os.environ["STATIC_DIR"]) / _RECORDINGS_REL)
+    if os.environ.get("CONFIG_DIR"):
+        _candidate_dirs.append(Path(os.environ["CONFIG_DIR"]) / _RECORDINGS_REL)
+    _candidate_dirs.append(Path("/app/static") / _RECORDINGS_REL)
+
+    _resolved_dir: list = [None]  # mutable cell — set on first successful probe
 
     def _ensure_out_dir() -> Path:
-        # Create the recordings directory on first write rather than at
-        # setup() time. `static_dir` and `out_dir` are fixed at
-        # registration time (changes to $STATIC_DIR after route
-        # registration are NOT picked up). mkdir is idempotent
-        # (`exist_ok=True`), and an un-writable directory turns into a
-        # clean 500 from the caller rather than a load-time crash that
-        # 404s the route.
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            raise HTTPException(
-                500,
-                f"could not create recordings directory ({out_dir}): {e}",
-            )
-        return out_dir
+        if _resolved_dir[0] is not None:
+            return _resolved_dir[0]
+        errors = []
+        for cand in _candidate_dirs:
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                # A directory can exist but be read-only (packaged bundle) —
+                # confirm with a probe file before committing to it.
+                probe = cand / ".write_test"
+                probe.write_bytes(b"")
+                probe.unlink()
+            except OSError as e:
+                errors.append(f"{cand}: {e}")
+                continue
+            _resolved_dir[0] = cand
+            log.info("note_detect recordings directory: %s", cand)
+            return cand
+        raise HTTPException(
+            500,
+            "could not find a writable recordings directory (tried: "
+            + "; ".join(errors) + ")",
+        )
 
     @app.post("/api/plugins/note_detect/recording")
     async def save_recording(request: Request):
@@ -147,7 +166,7 @@ def setup(app, context):
         rel = f"static/{_RECORDINGS_REL}/{filename}"
         log.info(
             "saved recording (%d bytes, slug=%s) to %s",
-            len(body), slug, rel,
+            len(body), slug, str(path),
         )
         return {
             "path_in_container": str(path),
