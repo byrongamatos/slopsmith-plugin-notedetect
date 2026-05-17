@@ -530,10 +530,10 @@ async function driveDetectTick(intervalCallbacks, calls) {
     return null;
 }
 
-test('detectNotes path: chord scored from the transcription set, scoreChord IPC not called', async () => {
-    // When the desktop exposes audio.detectNotes and it returns an active
-    // pitch set, the chord branch judges the chord against that set directly
-    // — no scoreChord IPC, no getUserMedia, no getPitchDetection.
+test('detectNotes path: detectNotes drives single-note detection, chords via scoreChord IPC', async () => {
+    // When the desktop exposes audio.detectNotes, the bridge poll uses it for
+    // single-note detection (replacing getPitchDetection); chords are still
+    // scored by the native scoreChord IPC, which times them correctly.
     const { createNoteDetector, calls, intervalCallbacks } = bridgeWithDetectNotes(
         () => ({
             notes: [
@@ -550,9 +550,9 @@ test('detectNotes path: chord scored from the transcription set, scoreChord IPC 
 
     const detectTick = await driveDetectTick(intervalCallbacks, calls);
     assert.equal(typeof detectTick, 'function', 'a detect tick should be registered');
-    assert.ok(calls.detectNotes >= 1, 'detectNotes should be polled on the ML path');
-    assert.equal(calls.scoreChord, 0, 'scoreChord IPC must not be used when detectNotes is active');
+    assert.ok(calls.detectNotes >= 1, 'detectNotes should be polled for single-note detection');
     assert.equal(calls.getPitchDetection, 0, 'getPitchDetection is replaced by detectNotes on the ML path');
+    assert.equal(calls.scoreChord, 1, 'the 3-note chord is scored once via the scoreChord IPC');
     assert.equal(calls.getUserMedia, 0, 'getUserMedia must not be called on the bridge path');
 
     det.destroy();
